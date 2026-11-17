@@ -2,6 +2,8 @@
 // @name         Steam Store Enhancer
 // @namespace   https://github.com/linyaocrush/Steam-Store-Enhancer
 // @homepageURL  https://github.com/linyaocrush/Steam-Store-Enhancer
+// @downloadURL  https://raw.githubusercontent.com/linyaocrush/Steam-Store-Enhancer/main/Steam%20Store%20Enhancer.user.js
+// @updateURL    https://raw.githubusercontent.com/linyaocrush/Steam-Store-Enhancer/main/Steam%20Store%20Enhancer.user.js
 // @version      1.1.0
 // @description  Steam 额外地区价格、汇率转换、快速加购与购物车批量管理。
 // @author       linyaocrush, marioplus, Chr_
