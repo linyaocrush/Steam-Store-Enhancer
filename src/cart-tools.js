@@ -1,4 +1,16 @@
+  function placeWishlistCartButton(row, control) {
+    // Keep React-owned controls in place; hide them only while our replacement is adjacent.
+    const nativeButton = row.querySelector('.E4PXslhR-fI- > button:not(.sse-quick-add), button.LrqeL6o22aQ-:not(.sse-quick-add), .purchase_area .btnv6_green_white_innerfade:not(.sse-quick-add), .purchase_area .btn_addtocart:not(.sse-quick-add)');
+    if (!nativeButton) return false;
+    control.classList.add('sse-wishlist-cart');
+    nativeButton.classList.add('sse-wishlist-native-cart');
+    if (nativeButton.previousElementSibling !== control) nativeButton.before(control);
+    return true;
+  }
+
   function initializeCartTools() {
+    const log = createLogger('购物车');
+    log.info('快速加购与购物车管理已启用');
     const page = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
     const english = GM_getValue('sse_cart_language', 'ZH') === 'EN';
     const text = (zh, en) => english ? en : zh;
@@ -13,6 +25,8 @@
       .sse-cart-status{white-space:pre-wrap;font-size:12px;color:#67c1f5;margin-top:8px}
       .sse-cart-panel label{font-size:12px}.sse-cart-panel input{accent-color:#67c1f5}
       .sse-quick-add{position:relative;z-index:10;margin:4px;display:inline-block}
+      .sse-quick-add.sse-wishlist-cart{position:static;margin:0}
+      .sse-wishlist-cart + .sse-wishlist-native-cart{display:none!important}
       .game_purchase_action .sse-native-cart{position:static;margin:0;padding:0;border:0;cursor:pointer;display:inline-block}
       .sse-cart-dialog{position:fixed;inset:0;background:#000b;z-index:2147483646;display:grid;place-items:center;padding:12px}
       .sse-cart-dialog>div{width:min(500px,90vw);max-height:80vh;overflow:auto;background:#1b2838;border:1px solid #34465a;border-radius:6px;padding:18px;color:#c6d4df}
@@ -29,21 +43,24 @@
     }
 
     async function context() {
-      if (!contextPromise) contextPromise = (async () => {
-        let result = readContext(document, page);
-        if (!result.token || !result.country) {
-          const html = await gmGet('https://store.steampowered.com/cart/');
-          const remote = new DOMParser().parseFromString(html, 'text/html');
-          const fallback = readContext(remote);
-          result = { ...result, token: result.token || fallback.token, country: result.country || fallback.country };
-        }
-        if (!result.token || !result.country) throw new Error(text('无法读取账号信息，请先登录 Steam 商店并刷新页面。', 'Sign in to the Steam store and refresh this page.'));
-        return result;
-      })().catch(error => { contextPromise = null; throw error; });
+      if (!contextPromise) {
+        contextPromise = (async () => {
+          let result = readContext(document, page);
+          if (!result.token || !result.country) {
+            const html = await gmGet('https://store.steampowered.com/cart/');
+            const remote = new DOMParser().parseFromString(html, 'text/html');
+            const fallback = readContext(remote);
+            result = { ...result, token: result.token || fallback.token, country: result.country || fallback.country };
+          }
+          if (!result.token || !result.country) throw new Error(text('无法读取账号信息，请先登录 Steam 商店并刷新页面。', 'Sign in to the Steam store and refresh this page.'));
+          return result;
+        })().catch(error => { contextPromise = null; throw error; });
+      }
       return contextPromise;
     }
 
     async function account(method, payload) {
+      log.debug('请求购物车操作', { method });
       const current = await context();
       const url = new URL('https://api.steampowered.com/IAccountCartService/' + method + '/v1/');
       url.searchParams.set('access_token', current.token);
@@ -57,6 +74,7 @@
         throw new Error(text('Steam 拒绝了购物车操作。', 'Steam rejected the cart operation.'));
       }
       if (!data.response) throw new Error(text('Steam 返回了无效结果。', 'Invalid Steam response.'));
+      log.debug('购物车操作完成', { method });
       return data.response;
     }
 
@@ -122,6 +140,7 @@
       const items = options.map(option => ({ ...(option.packageid ? { packageid: option.packageid } : { bundleid: option.bundleid }), flags: { is_gift: false, is_private: false } }));
       if (!items.length) return;
       for (let offset = 0; offset < items.length; offset += 50) await account('AddItemsToCart', { items: items.slice(offset, offset + 50) });
+      log.info('已提交加购', { count: items.length });
     }
 
     function button(label, action) {
@@ -134,8 +153,8 @@
         event.stopPropagation();
         if (element.disabled) return;
         element.disabled = true;
-        try { await action(); }
-        catch (error) { window.alert(error.message || String(error)); }
+        try { log.debug('执行操作', { action: label }); await action(); }
+        catch (error) { log.error('操作失败', { action: label, message: error.message }); window.alert(error.message || String(error)); }
         finally { element.disabled = false; }
       });
       return element;
@@ -213,7 +232,7 @@
         panel.querySelectorAll('button').forEach(element => { element.disabled = true; });
         status.textContent = text('操作中……', 'Working…');
         try { await action(); }
-        catch (error) { status.textContent = error.message || String(error); }
+        catch (error) { log.error('批量操作失败', error.message); status.textContent = error.message || String(error); }
         finally { busy = false; panel.querySelectorAll('button').forEach(element => { element.disabled = false; }); }
       };
       toolbar.append(button(text('导入', 'Import'), run(async () => {
@@ -233,7 +252,7 @@
             const purchaseKey = option.packageid ? 'sub/' + option.packageid : 'bundle/' + option.bundleid;
             if (!seen.has(purchaseKey)) { selected.push(option); seen.add(purchaseKey); }
             results.push(purchaseKey + ' # ' + (option.purchase_option_name || data.name || '') + ' ' + (option.formatted_final_price || ''));
-          } catch (error) { results.push(key + ' # ' + error.message); }
+          } catch (error) { log.warn('导入项目失败', { item: key, message: error.message }); results.push(key + ' # ' + error.message); }
         }
         save(results.join('\n'));
         if (!selected.length) { status.textContent = text('没有符合条件的商品。', 'No matching items.'); return; }
@@ -330,7 +349,12 @@
         }
       }
       document.querySelectorAll(quickSelector).forEach(row => {
-        if (row.querySelector('.sse-quick-add')) return;
+        const wishlistRow = row.matches('.wishlist_row, [data-rfd-draggable-id^="WishlistItem-"]');
+        const existing = row.querySelector('.sse-quick-add');
+        if (existing) {
+          if (wishlistRow) placeWishlistCartButton(row, existing);
+          return;
+        }
         const inferred = inferItemFromScope(row);
         if (!inferred) return;
         const item = { type: inferred.type === 'package' ? 'sub' : inferred.type, id: Number(inferred.id) };
@@ -361,7 +385,7 @@
           // Keep purchase IDs available after replacing the native button.
           control.setAttribute(item.type === 'bundle' ? 'data-ds-bundleid' : item.type === 'sub' ? 'data-ds-packageid' : 'data-ds-appid', String(item.id));
           nativeButton.replaceWith(control);
-        } else {
+        } else if (!wishlistRow || !placeWishlistCartButton(row, control)) {
           row.appendChild(control);
         }
       });
@@ -382,5 +406,5 @@
         label.textContent = ' [' + current.country + ']';
         host.appendChild(label);
       }
-    }).catch(error => console.warn('Steam Store Enhancer:', error.message));
+    }).catch(error => log.warn('读取账号地区失败', error.message));
   }

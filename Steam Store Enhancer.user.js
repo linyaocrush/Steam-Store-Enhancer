@@ -5,10 +5,9 @@
 // @homepageURL  https://github.com/linyaocrush/Steam-Store-Enhancer
 // @downloadURL  https://raw.githubusercontent.com/linyaocrush/Steam-Store-Enhancer/main/Steam%20Store%20Enhancer.user.js
 // @updateURL    https://raw.githubusercontent.com/linyaocrush/Steam-Store-Enhancer/main/Steam%20Store%20Enhancer.user.js
-// @version      1.3.0
+// @version      1.3.1
 // @description  Steam 额外地区价格、汇率转换、快速加购、购物车批量管理与家庭库游戏标记。
 // @author       linyaocrush, marioplus, Chr_, Cliencer Goge, Miku39
-// @contributionURL https://github.com/linyaocrush/Steam-Store-Enhancer
 // @license      AGPL-3.0
 // @match        https://store.steampowered.com/*
 // @match        https://steamcommunity.com/*
@@ -96,6 +95,31 @@
   const UI_ROOT_ID = 'sapx-ui-root';
 
   // ---- shared.js ----
+  function createLogger(feature) {
+    const levels = { debug: 0, info: 1, warn: 2, error: 3, off: 4 };
+    const colors = { debug: '#8f98a0', info: '#67c1f5', warn: '#ffc857', error: '#ff8585' };
+    const logger = {};
+    for (const level of ['debug', 'info', 'warn', 'error']) {
+      logger[level] = (...args) => {
+        let configured = 'info';
+        try {
+          const stored = GM_getValue('Storage:Setting', null);
+          const settings = typeof stored === 'string' ? JSON.parse(stored) : stored;
+          configured = settings?.logLevel || 'info';
+        } catch (_) {}
+        if (levels[level] < (levels[configured] ?? levels.info)) return;
+        console[level](
+          `%cSteam Store Enhancer%c ${feature} %c${level.toUpperCase()}%c`,
+          'background:#1b2838;color:#67c1f5;padding:3px 7px;border-radius:4px;font-weight:bold',
+          'color:#c6d4df;font-weight:bold',
+          `color:${colors[level]};font-weight:bold`,
+          'color:inherit;font-weight:normal', ...args
+        );
+      };
+    }
+    return logger;
+  }
+
   function createElement(tag, content, className) {
     const element = document.createElement(tag);
     if (content !== undefined) element.textContent = content;
@@ -130,8 +154,13 @@
       } catch (_) {}
     }
     const account = globals.g_AccountID || globals.UserConfig?.accountid;
-    if (!steamid && account) steamid = (76561197960265728n + BigInt(account)).toString();
-    return { steamid, token, country: settings.COUNTRY, language: settings.LANGUAGE || 'schinese' };
+    if (!steamid && account) {
+      const accountId = Number(account);
+      const steamId64 = 76561197960265728 + accountId;
+      if (Number.isSafeInteger(accountId) && accountId >= 0 && Number.isSafeInteger(steamId64)) steamid = String(steamId64);
+    }
+    const country = settings.COUNTRY || settings.COUNTRY_CODE || settings.country_code || globals.UserConfig?.country || '';
+    return { steamid, token, country: String(country).toUpperCase(), language: settings.LANGUAGE || 'schinese' };
   }
 
   // ---- styles.js ----
@@ -215,6 +244,7 @@
       '<div class="sapx-field"><label class="sapx-check"><input class="sapx-checkbox" id="sse-family-auto" type="checkbox" />每隔 24 小时自动扫描家庭库</label></div>' +
       '<div class="sapx-field"><button class="sapx-btn sapx-btn-ghost" type="button" id="sse-family-open">管理家庭库：扫描、贡献统计与最近购入</button></div>' +
       '<div class="sapx-field"><label class="sapx-label" for="sse-convert-region">价格转换目标地区</label><select class="sapx-select" id="sse-convert-region"></select></div>' +
+      '<div class="sapx-field"><label class="sapx-label" for="sse-log">全局日志等级</label><select class="sapx-select" id="sse-log"><option>debug</option><option>info</option><option>warn</option><option>error</option><option>off</option></select></div>' +
       '<details class="sapx-details" id="sapx-adv">' +
       '<summary>更多设置</summary>' +
       '<div class="sapx-field"><label class="sapx-label" for="sse-cart-language">购物车工具语言</label><select class="sapx-select" id="sse-cart-language"><option value="ZH">中文</option><option value="EN">English</option></select></div>' +
@@ -225,7 +255,6 @@
       '<div class="sapx-row"><label class="sapx-check"><input class="sapx-checkbox" id="sse-custom-enabled" type="checkbox" />使用自定义汇率</label></div>' +
       '<div class="sapx-field"><label class="sapx-label" for="sse-rate">自定义汇率（1 单位目标货币可兑换的原货币数量）</label><input class="sapx-input" id="sse-rate" type="number" min="0.000001" step="any" /></div>' +
       '<div class="sapx-row"><label class="sapx-check"><input class="sapx-checkbox" id="sse-disable-market" type="checkbox" />在市场首页禁用价格转换</label></div>' +
-      '<div class="sapx-field"><label class="sapx-label" for="sse-log">日志等级</label><select class="sapx-select" id="sse-log"><option>debug</option><option>info</option><option>warn</option><option>error</option><option>off</option></select></div>' +
       '<div class="sapx-error" id="sse-error" role="alert"></div>' +
       '<div class="sapx-row">' +
       '<label class="sapx-check">' +
@@ -251,6 +280,8 @@
   }
 
   function openSettingsUI() {
+    const log = createLogger('设置');
+    log.debug('打开设置');
     const root = ensureSettingsUI();
     const select = root.querySelector('#sapx-region-select');
     const showCode = root.querySelector('#sapx-show-code');
@@ -313,6 +344,7 @@
       GM_setValue('sse_cart_country', field('cart-country').checked);
       GM_setValue(STORAGE_KEY_REGION_ID, select.value);
       GM_setValue(STORAGE_KEY_SHOW_CODE, Boolean(showCode.checked));
+      log.info('设置已保存，准备刷新页面');
       location.reload();
     };
     root.classList.add('sapx-open');
@@ -521,9 +553,10 @@
   }
 
   async function fetchPriceForItem(item, region) {
+    const log = createLogger('地区价格');
     const key = item.type + ':' + item.id + ':' + region.id;
     const cached = cacheGet(key);
-    if (cached !== undefined) return cached;
+    if (cached !== undefined) { log.debug('命中价格缓存', { item: key }); return cached; }
     for (const cc of region.ccCandidates) {
       try {
         let res = null;
@@ -533,12 +566,14 @@
         if (res && res.ok) {
           if (item.type === 'bundle' || !res.currency || res.currency === region.currency) {
             cacheSet(key, res);
+            log.debug('地区价格读取成功', { item: key, country: cc });
             return res;
           }
         }
-      } catch (e) {}
+      } catch (e) { log.debug('候选地区价格读取失败', { item: key, country: cc, message: e.message }); }
     }
     cacheSet(key, null);
+    log.debug('没有可用地区价格', { item: key });
     return null;
   }
 
@@ -837,6 +872,7 @@
   }
 
   function startObserver() {
+    createLogger('地区价格').info('地区价格扫描与动态监听已启用');
     const obs = new MutationObserver(mutations => {
       if (mutations.some(mutation => !mutation.target.parentElement?.closest('#' + UI_ROOT_ID + ', .' + EXTRA_CLASS + ', #' + CART_SUMMARY_ID) &&
           !(mutation.target.nodeType === 1 && mutation.target.closest('#' + UI_ROOT_ID + ', .' + EXTRA_CLASS + ', #' + CART_SUMMARY_ID)))) scheduleScan();
@@ -964,84 +1000,7 @@ disableOnMarket = false;
   var _GM_setValue = (() => typeof GM_setValue != "undefined" ? GM_setValue : void 0)();
   var _GM_xmlhttpRequest = (() => typeof GM_xmlhttpRequest != "undefined" ? GM_xmlhttpRequest : void 0)();
   var _unsafeWindow = (() => typeof unsafeWindow != "undefined" ? unsafeWindow : void 0)();
-  function initializeLogTitle() {
-    const isInIFrame = window.parent !== window || window.frames.length > 0;
-    return isInIFrame ? `steam-price-convertor iframe(${( new Date()).getMilliseconds()})` : "steam-price-convertor";
-  }
-  function createLogStyle(color) {
-    return `
-            background: ${color};
-            color: white;
-            padding: 1px 3px;
-            border-radius: 2px;
-        `;
-  }
-  function composeLogHint() {
-    return `%c${initializeLogTitle()}`;
-  }
-  const LogDefinitions = {
-    debug: {
-      index: 0,
-      color: "#009688",
-      label: "debug",
-      bindMethod: console.info
-    },
-    info: {
-      index: 1,
-      color: "#2196f3",
-      label: "info",
-      bindMethod: console.info
-    },
-    warn: {
-      index: 2,
-      color: "#ffc107",
-      label: "warn",
-      bindMethod: console.warn
-    },
-    error: {
-      index: 3,
-      color: "#e91e63",
-      label: "error",
-      bindMethod: console.error
-    },
-    off: {
-      index: 4,
-      color: "",
-      label: "off",
-      bindMethod: () => {
-      }
-    }
-  };
-  const Logger = {
-    debug: noopLog.bind(null),
-    info: noopLog.bind(null),
-    warn: noopLog.bind(null),
-    error: noopLog.bind(null)
-  };
-  function noopLog() {
-  }
-  let currLogLevel = LogDefinitions.info;
-  function refreshBinding() {
-    const hint = composeLogHint();
-    Object.entries(LogDefinitions).forEach(([label, def]) => {
-      if (def.index >= currLogLevel.index) {
-        const logStyle = createLogStyle(def.color);
-        Logger[label.toLowerCase()] = def.bindMethod.bind(console, hint, logStyle);
-      } else {
-        Logger[label.toLowerCase()] = noopLog.bind(null);
-      }
-    });
-  }
-  function setLogLevel(levelLabel) {
-    const newLevel = LogDefinitions[levelLabel];
-    if (newLevel) {
-      currLogLevel = newLevel;
-      refreshBinding();
-    } else {
-      console.error(`Invalid log level: ${levelLabel}`);
-    }
-  }
-  refreshBinding();
+  const Logger = createLogger('汇率转换');
   class Strings {
     static format(format, ...args) {
       args = args || [];
@@ -1216,6 +1175,9 @@ saveSetting(setting) {
     }
     async getCountyCode() {
       const storeDom = await this.getStoreDocument();
+      const sessionGlobals = storeDom === document ? _unsafeWindow : {};
+      const sessionCountry = readStoreSession(storeDom, sessionGlobals).country;
+      if (sessionCountry && /^[A-Z]{2}$/i.test(sessionCountry)) return sessionCountry.toUpperCase();
       try {
         let countyCode = (storeDom === document ? _unsafeWindow.GStoreItemData?.rgNavParams?.__page_default_obj?.countrycode : null);
         if (countyCode) {
@@ -1226,7 +1188,7 @@ saveSetting(setting) {
       }
       const dataConfig = storeDom.querySelector("div#application_config")?.getAttribute("data-config");
       if (dataConfig) {
-        const countyCode = JSON.parse(dataConfig)?.["COUNTRY"];
+        const countyCode = JSON.parse(dataConfig)?.COUNTRY;
         if (countyCode) {
           return countyCode;
         }
@@ -1295,7 +1257,7 @@ saveSetting(setting) {
           Logger.info(`通过[${provider.name()}]获取区域代码成功`);
           return countyCode.toUpperCase();
         } catch (e) {
-          Logger.error(`通过[${provider.name()}]获取区域代码失败`);
+          Logger.debug(`通过[${provider.name()}]获取区域代码失败`, e?.message || e);
         }
       }
       throw new Error("所有获取区域代码策略都获取失败");
@@ -1566,8 +1528,9 @@ static async convertContent(text) {
 static async processTextAsync(text, countryCode, targetSymbol, isBefore, targetCode) {
       if (!/\d/.test(text)) return text;
       const currentRule = countyInfos.find((c) => c.code === targetCode);
+      const isCart = isCartPage();
       const otherRules = SORTED_RULES_TEMPLATE.filter((c) => {
-        return c.code !== countryCode && c.code !== targetCode && c.currencyCode !== countyCode2Info.get(countryCode)?.currencyCode;
+        return c.code !== targetCode && (isCart || (c.code !== countryCode && c.currencyCode !== countyCode2Info.get(countryCode)?.currencyCode));
       });
       const matches = [];
       for (const numMatch of text.matchAll(NUMBER_BLOCK_REGEX)) {
@@ -1740,6 +1703,18 @@ static tryRule(text, numStr, numStart, numEnd, info, matches, relaxedOut) {
       selectors.push(...market);
       selectors.push(...notify);
       selectors.push(...app);
+      if (isCartPage()) {
+        selectors.push(
+          '.StoreOriginalPrice',
+          '.j3jr1YqpBGk- > .-nS4ZC0Bruo-',
+          '.i1XZFikuzME- .n9HLAjXXhvI-',
+          'main [class*="price" i]',
+          'main [class*="Price"]',
+          '[role="main"] [class*="price" i]',
+          '[class*="cart" i] [class*="price" i]',
+          '[data-testid*="price" i]'
+        );
+      }
       return selectors;
     }
     async convert(elementSnap) {
@@ -1802,7 +1777,7 @@ targets = new Map([
             return node;
           }
         } catch (e) {
-          console.debug("获取文本节点失败，但不确定该节点是否一定会出现。selector：" + selector);
+          Logger.debug("获取文本节点失败，但不确定该节点是否一定会出现。selector：" + selector);
         }
       }
       return null;
@@ -1840,13 +1815,7 @@ targets = new Map([
                 converter.afterConvert(elementSnap, elementConverted);
               }
             } catch (e) {
-              console.group("转换失败");
-              console.error(e);
-              console.error("转换失败请将下列内容反馈给开发者，右键 > 复制(copy) > 复制元素(copy element)");
-              console.error("↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓");
-              console.error(element);
-              console.error("↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑");
-              console.groupEnd();
+              Logger.error('价格转换失败', e.message, element);
             }
           })();
           tasks.push(task);
@@ -1857,7 +1826,17 @@ targets = new Map([
   }
   async function initializeConversion() {
     if (!GM_getValue("sse_convert_enabled", true)) return;
-    try { await initContext(); await start(); }
+    try {
+      // SSR text must stay intact until React has adopted the server-rendered cart.
+      if (isCartPage() && _unsafeWindow.SSR) {
+        const deadline = Date.now() + 15000;
+        while (!_unsafeWindow.SSR.hydrated && Date.now() < deadline) {
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+      }
+      await initContext();
+      await start();
+    }
     catch (error) { Logger.error("价格转换初始化失败", error); }
   }
   async function start() {
@@ -1866,7 +1845,7 @@ targets = new Map([
       Logger.info("已开启市场首页禁用，跳过转换");
       return;
     }
-    if (context.currentCountyInfo.code === context.targetCountyInfo.code) {
+    if (context.currentCountyInfo.code === context.targetCountyInfo.code && !isCartPage()) {
       Logger.info(`${context.currentCountyInfo.name}无需转换`);
       return;
     }
@@ -1892,6 +1871,7 @@ targets = new Map([
           }
         } else {
           const target = mutation.target;
+          if (target.matches?.(selector)) uniqueTargets.add(target);
           const priceEls = target.querySelectorAll(selector);
           priceEls.forEach((el) => uniqueTargets.add(el));
         }
@@ -1908,14 +1888,20 @@ targets = new Map([
   }
   async function initContext() {
     const setting = SettingManager.instance.setting;
-    setLogLevel(setting.logLevel);
     let targetCountyInfo = countyCode2Info.get(setting.countyCode);
     if (!targetCountyInfo) {
       Logger.warn(`获取转换后的国家(${setting.countyCode})信息失败，默认为美国：` + setting.countyCode);
       targetCountyInfo = countyCode2Info.get("US");
     }
     Logger.info("目标区域：", targetCountyInfo);
-    const currCountyCode = await CountyCodeProviderManager.instance.getCountyCode();
+    let currCountyCode;
+    try {
+      currCountyCode = await CountyCodeProviderManager.instance.getCountyCode();
+    } catch (error) {
+      if (!isCartPage()) throw error;
+      currCountyCode = 'US';
+      Logger.warn('购物车无法读取账号地区，改按商品价格中的币种符号识别原币种', error.message);
+    }
     if (currCountyCode) {
       Logger.info("区域代码：", currCountyCode);
     }
@@ -1965,11 +1951,13 @@ targets = new Map([
 
   // ---- family-library.js ----
   function initializeFamilyLibrary() {
+    const log = createLogger('家庭库');
     const KEY = 'sse_family_cache_v1';
     const DAY = 86400000;
     const page = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
     const onStore = location.hostname === 'store.steampowered.com';
     const enabled = GM_getValue('sse_family_enabled', true);
+    log.info(enabled ? '家庭库标记已启用' : '家庭库标记已关闭');
     let cache = GM_getValue(KEY, null);
     let scanPromise = null;
     let accountId = '';
@@ -2001,7 +1989,7 @@ targets = new Map([
       return { steamid: session.steamid, token: session.token };
     }
     try { if (onStore) accountId = readIdentity().steamid; }
-    catch (_) { notice = '暂时无法读取登录信息，请刷新 Steam 商店页面。'; }
+    catch (_) { notice = '暂时无法读取登录信息，请刷新 Steam 商店页面。'; log.warn(notice); }
     function validCache() {
       return cache && cache.apps && (!onStore || !accountId || cache.steamid === accountId);
     }
@@ -2023,6 +2011,7 @@ targets = new Map([
     }
     function scan() {
       if (scanPromise) return scanPromise;
+      log.info('开始扫描家庭库');
       scanPromise = (async () => {
         if (!onStore) throw new Error('请在已登录的 Steam 商店页面中扫描家庭库。');
         const identity = readIdentity();
@@ -2046,7 +2035,7 @@ targets = new Map([
           for (const player of players.accounts || []) {
             if (player.public_data?.steamid) names[String(player.public_data.steamid)] = player.public_data.persona_name || String(player.public_data.steamid);
           }
-        } catch (_) { notice = '游戏已读取，部分成员昵称暂时无法获取，将显示 SteamID。'; }
+        } catch (_) { notice = '游戏已读取，部分成员昵称暂时无法获取，将显示 SteamID。'; log.warn(notice); }
         const apps = {};
         for (const app of library.apps) {
           if (Number(app.exclude_reason || 0) !== 0 || !Number.isSafeInteger(Number(app.appid))) continue;
@@ -2056,8 +2045,9 @@ targets = new Map([
         accountId = self;
         GM_setValue(KEY, cache);
         notice = '扫描完成，已缓存 ' + Object.keys(apps).length + ' 个家庭库游戏。';
+        log.info(notice);
         updateMarks();
-      })().catch(error => { notice = error.message || '家庭库扫描失败，原缓存已保留。'; })
+      })().catch(error => { notice = error.message || '家庭库扫描失败，原缓存已保留。'; log.error('家庭库扫描失败，原缓存已保留', error.message); })
         .finally(() => { scanPromise = null; refreshNotice(); });
       refreshNotice();
       return scanPromise;
@@ -2279,7 +2269,19 @@ targets = new Map([
   }
 
   // ---- cart-tools.js ----
+  function placeWishlistCartButton(row, control) {
+    // Keep React-owned controls in place; hide them only while our replacement is adjacent.
+    const nativeButton = row.querySelector('.E4PXslhR-fI- > button:not(.sse-quick-add), button.LrqeL6o22aQ-:not(.sse-quick-add), .purchase_area .btnv6_green_white_innerfade:not(.sse-quick-add), .purchase_area .btn_addtocart:not(.sse-quick-add)');
+    if (!nativeButton) return false;
+    control.classList.add('sse-wishlist-cart');
+    nativeButton.classList.add('sse-wishlist-native-cart');
+    if (nativeButton.previousElementSibling !== control) nativeButton.before(control);
+    return true;
+  }
+
   function initializeCartTools() {
+    const log = createLogger('购物车');
+    log.info('快速加购与购物车管理已启用');
     const page = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
     const english = GM_getValue('sse_cart_language', 'ZH') === 'EN';
     const text = (zh, en) => english ? en : zh;
@@ -2294,6 +2296,8 @@ targets = new Map([
       .sse-cart-status{white-space:pre-wrap;font-size:12px;color:#67c1f5;margin-top:8px}
       .sse-cart-panel label{font-size:12px}.sse-cart-panel input{accent-color:#67c1f5}
       .sse-quick-add{position:relative;z-index:10;margin:4px;display:inline-block}
+      .sse-quick-add.sse-wishlist-cart{position:static;margin:0}
+      .sse-wishlist-cart + .sse-wishlist-native-cart{display:none!important}
       .game_purchase_action .sse-native-cart{position:static;margin:0;padding:0;border:0;cursor:pointer;display:inline-block}
       .sse-cart-dialog{position:fixed;inset:0;background:#000b;z-index:2147483646;display:grid;place-items:center;padding:12px}
       .sse-cart-dialog>div{width:min(500px,90vw);max-height:80vh;overflow:auto;background:#1b2838;border:1px solid #34465a;border-radius:6px;padding:18px;color:#c6d4df}
@@ -2310,21 +2314,24 @@ targets = new Map([
     }
 
     async function context() {
-      if (!contextPromise) contextPromise = (async () => {
-        let result = readContext(document, page);
-        if (!result.token || !result.country) {
-          const html = await gmGet('https://store.steampowered.com/cart/');
-          const remote = new DOMParser().parseFromString(html, 'text/html');
-          const fallback = readContext(remote);
-          result = { ...result, token: result.token || fallback.token, country: result.country || fallback.country };
-        }
-        if (!result.token || !result.country) throw new Error(text('无法读取账号信息，请先登录 Steam 商店并刷新页面。', 'Sign in to the Steam store and refresh this page.'));
-        return result;
-      })().catch(error => { contextPromise = null; throw error; });
+      if (!contextPromise) {
+        contextPromise = (async () => {
+          let result = readContext(document, page);
+          if (!result.token || !result.country) {
+            const html = await gmGet('https://store.steampowered.com/cart/');
+            const remote = new DOMParser().parseFromString(html, 'text/html');
+            const fallback = readContext(remote);
+            result = { ...result, token: result.token || fallback.token, country: result.country || fallback.country };
+          }
+          if (!result.token || !result.country) throw new Error(text('无法读取账号信息，请先登录 Steam 商店并刷新页面。', 'Sign in to the Steam store and refresh this page.'));
+          return result;
+        })().catch(error => { contextPromise = null; throw error; });
+      }
       return contextPromise;
     }
 
     async function account(method, payload) {
+      log.debug('请求购物车操作', { method });
       const current = await context();
       const url = new URL('https://api.steampowered.com/IAccountCartService/' + method + '/v1/');
       url.searchParams.set('access_token', current.token);
@@ -2338,6 +2345,7 @@ targets = new Map([
         throw new Error(text('Steam 拒绝了购物车操作。', 'Steam rejected the cart operation.'));
       }
       if (!data.response) throw new Error(text('Steam 返回了无效结果。', 'Invalid Steam response.'));
+      log.debug('购物车操作完成', { method });
       return data.response;
     }
 
@@ -2403,6 +2411,7 @@ targets = new Map([
       const items = options.map(option => ({ ...(option.packageid ? { packageid: option.packageid } : { bundleid: option.bundleid }), flags: { is_gift: false, is_private: false } }));
       if (!items.length) return;
       for (let offset = 0; offset < items.length; offset += 50) await account('AddItemsToCart', { items: items.slice(offset, offset + 50) });
+      log.info('已提交加购', { count: items.length });
     }
 
     function button(label, action) {
@@ -2415,8 +2424,8 @@ targets = new Map([
         event.stopPropagation();
         if (element.disabled) return;
         element.disabled = true;
-        try { await action(); }
-        catch (error) { window.alert(error.message || String(error)); }
+        try { log.debug('执行操作', { action: label }); await action(); }
+        catch (error) { log.error('操作失败', { action: label, message: error.message }); window.alert(error.message || String(error)); }
         finally { element.disabled = false; }
       });
       return element;
@@ -2494,7 +2503,7 @@ targets = new Map([
         panel.querySelectorAll('button').forEach(element => { element.disabled = true; });
         status.textContent = text('操作中……', 'Working…');
         try { await action(); }
-        catch (error) { status.textContent = error.message || String(error); }
+        catch (error) { log.error('批量操作失败', error.message); status.textContent = error.message || String(error); }
         finally { busy = false; panel.querySelectorAll('button').forEach(element => { element.disabled = false; }); }
       };
       toolbar.append(button(text('导入', 'Import'), run(async () => {
@@ -2514,7 +2523,7 @@ targets = new Map([
             const purchaseKey = option.packageid ? 'sub/' + option.packageid : 'bundle/' + option.bundleid;
             if (!seen.has(purchaseKey)) { selected.push(option); seen.add(purchaseKey); }
             results.push(purchaseKey + ' # ' + (option.purchase_option_name || data.name || '') + ' ' + (option.formatted_final_price || ''));
-          } catch (error) { results.push(key + ' # ' + error.message); }
+          } catch (error) { log.warn('导入项目失败', { item: key, message: error.message }); results.push(key + ' # ' + error.message); }
         }
         save(results.join('\n'));
         if (!selected.length) { status.textContent = text('没有符合条件的商品。', 'No matching items.'); return; }
@@ -2611,7 +2620,12 @@ targets = new Map([
         }
       }
       document.querySelectorAll(quickSelector).forEach(row => {
-        if (row.querySelector('.sse-quick-add')) return;
+        const wishlistRow = row.matches('.wishlist_row, [data-rfd-draggable-id^="WishlistItem-"]');
+        const existing = row.querySelector('.sse-quick-add');
+        if (existing) {
+          if (wishlistRow) placeWishlistCartButton(row, existing);
+          return;
+        }
         const inferred = inferItemFromScope(row);
         if (!inferred) return;
         const item = { type: inferred.type === 'package' ? 'sub' : inferred.type, id: Number(inferred.id) };
@@ -2642,7 +2656,7 @@ targets = new Map([
           // Keep purchase IDs available after replacing the native button.
           control.setAttribute(item.type === 'bundle' ? 'data-ds-bundleid' : item.type === 'sub' ? 'data-ds-packageid' : 'data-ds-appid', String(item.id));
           nativeButton.replaceWith(control);
-        } else {
+        } else if (!wishlistRow || !placeWishlistCartButton(row, control)) {
           row.appendChild(control);
         }
       });
@@ -2663,12 +2677,14 @@ targets = new Map([
         label.textContent = ' [' + current.country + ']';
         host.appendChild(label);
       }
-    }).catch(error => console.warn('Steam Store Enhancer:', error.message));
+    }).catch(error => log.warn('读取账号地区失败', error.message));
   }
 
   // ---- friend-tools.js ----
   function initializeFriendTools() {
     if (location.hostname !== 'steamcommunity.com' || !/\/friends\/?$/i.test(location.pathname)) return;
+    const log = createLogger('好友工具');
+    log.info('留言、分组与统计已启用');
 
     const ROOT_ID = 'sse-friend-tools';
     const style = document.createElement('style');
@@ -2785,7 +2801,7 @@ targets = new Map([
     let groups = GM_getValue(GROUP_STORAGE_KEY, {});
     if (!groups || typeof groups !== 'object' || Array.isArray(groups)) groups = {};
 
-    function saveGroups() { GM_setValue(GROUP_STORAGE_KEY, groups); }
+    function saveGroups() { GM_setValue(GROUP_STORAGE_KEY, groups); log.info('本地分组已保存', { count: Object.keys(groups).length }); }
     function renderGroups() {
       const selectedGroup = groupSelect.value;
       groupSelect.replaceChildren(createElement('option', '选择分组'));
@@ -2916,6 +2932,7 @@ targets = new Map([
       if (!window.confirm(`将向 ${friends.length} 位已选好友的个人主页发送相同评论。此操作无法撤回，继续吗？`)) return;
 
       send.disabled = true;
+      log.info('开始批量留言', { count: friends.length });
       status.textContent = `已确认，准备向 ${friends.length} 位好友发送……`;
       const results = [];
       try {
@@ -2933,14 +2950,18 @@ targets = new Map([
           const result = await response.json();
           if (!response.ok || result.success === false) throw new Error(result.error || `HTTP ${response.status}`);
           results.push(`已发送 ${name}`);
+          log.debug('留言发送成功', { index: index + 1, total: friends.length });
           } catch (error) {
+            log.warn('留言发送失败', { index: index + 1, message: error.message });
             results.push(`发送失败 ${name}：${error.message || '请求失败'}`);
           }
           status.textContent = `${index + 1}/${friends.length}\n${results.slice(-5).join('\n')}`;
           if (index + 1 < friends.length) await new Promise(resolve => setTimeout(resolve, 4000));
         }
         status.textContent = `处理完成：${results.filter(result => result.startsWith('已发送')).length} 成功，${results.filter(result => result.startsWith('发送失败')).length} 失败。\n${results.join('\n')}`;
+        log.info('批量留言完成', { success: results.filter(result => result.startsWith('已发送')).length, failed: results.filter(result => result.startsWith('发送失败')).length });
       } catch (error) {
+        log.error('批量留言中断', error.message);
         status.textContent = `批量发送中断：${error.message || String(error)}`;
       } finally {
         send.disabled = false;
@@ -2950,6 +2971,8 @@ targets = new Map([
 
   // ---- main.js ----
   function initialize() {
+    const log = createLogger('核心');
+    log.info('初始化', { host: location.hostname });
     addStyle();
     GM_registerMenuCommand('设置：Steam Store Enhancer', openSettingsUI);
     if (location.hostname === 'store.steampowered.com' && GM_getValue('sse_extra_enabled', true)) {
@@ -2964,6 +2987,7 @@ targets = new Map([
       initializeCartTools();
     }
     initializeFriendTools();
+    log.info('功能初始化完成');
     return family;
   }
 

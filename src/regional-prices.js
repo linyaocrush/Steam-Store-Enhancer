@@ -199,9 +199,10 @@
   }
 
   async function fetchPriceForItem(item, region) {
+    const log = createLogger('地区价格');
     const key = item.type + ':' + item.id + ':' + region.id;
     const cached = cacheGet(key);
-    if (cached !== undefined) return cached;
+    if (cached !== undefined) { log.debug('命中价格缓存', { item: key }); return cached; }
     for (const cc of region.ccCandidates) {
       try {
         let res = null;
@@ -211,12 +212,14 @@
         if (res && res.ok) {
           if (item.type === 'bundle' || !res.currency || res.currency === region.currency) {
             cacheSet(key, res);
+            log.debug('地区价格读取成功', { item: key, country: cc });
             return res;
           }
         }
-      } catch (e) {}
+      } catch (e) { log.debug('候选地区价格读取失败', { item: key, country: cc, message: e.message }); }
     }
     cacheSet(key, null);
+    log.debug('没有可用地区价格', { item: key });
     return null;
   }
 
@@ -515,6 +518,7 @@
   }
 
   function startObserver() {
+    createLogger('地区价格').info('地区价格扫描与动态监听已启用');
     const obs = new MutationObserver(mutations => {
       if (mutations.some(mutation => !mutation.target.parentElement?.closest('#' + UI_ROOT_ID + ', .' + EXTRA_CLASS + ', #' + CART_SUMMARY_ID) &&
           !(mutation.target.nodeType === 1 && mutation.target.closest('#' + UI_ROOT_ID + ', .' + EXTRA_CLASS + ', #' + CART_SUMMARY_ID)))) scheduleScan();

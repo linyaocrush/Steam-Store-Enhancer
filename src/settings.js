@@ -23,6 +23,7 @@
       '<div class="sapx-field"><label class="sapx-check"><input class="sapx-checkbox" id="sse-family-auto" type="checkbox" />每隔 24 小时自动扫描家庭库</label></div>' +
       '<div class="sapx-field"><button class="sapx-btn sapx-btn-ghost" type="button" id="sse-family-open">管理家庭库：扫描、贡献统计与最近购入</button></div>' +
       '<div class="sapx-field"><label class="sapx-label" for="sse-convert-region">价格转换目标地区</label><select class="sapx-select" id="sse-convert-region"></select></div>' +
+      '<div class="sapx-field"><label class="sapx-label" for="sse-log">全局日志等级</label><select class="sapx-select" id="sse-log"><option>debug</option><option>info</option><option>warn</option><option>error</option><option>off</option></select></div>' +
       '<details class="sapx-details" id="sapx-adv">' +
       '<summary>更多设置</summary>' +
       '<div class="sapx-field"><label class="sapx-label" for="sse-cart-language">购物车工具语言</label><select class="sapx-select" id="sse-cart-language"><option value="ZH">中文</option><option value="EN">English</option></select></div>' +
@@ -33,7 +34,6 @@
       '<div class="sapx-row"><label class="sapx-check"><input class="sapx-checkbox" id="sse-custom-enabled" type="checkbox" />使用自定义汇率</label></div>' +
       '<div class="sapx-field"><label class="sapx-label" for="sse-rate">自定义汇率（1 单位目标货币可兑换的原货币数量）</label><input class="sapx-input" id="sse-rate" type="number" min="0.000001" step="any" /></div>' +
       '<div class="sapx-row"><label class="sapx-check"><input class="sapx-checkbox" id="sse-disable-market" type="checkbox" />在市场首页禁用价格转换</label></div>' +
-      '<div class="sapx-field"><label class="sapx-label" for="sse-log">日志等级</label><select class="sapx-select" id="sse-log"><option>debug</option><option>info</option><option>warn</option><option>error</option><option>off</option></select></div>' +
       '<div class="sapx-error" id="sse-error" role="alert"></div>' +
       '<div class="sapx-row">' +
       '<label class="sapx-check">' +
@@ -59,6 +59,8 @@
   }
 
   function openSettingsUI() {
+    const log = createLogger('设置');
+    log.debug('打开设置');
     const root = ensureSettingsUI();
     const select = root.querySelector('#sapx-region-select');
     const showCode = root.querySelector('#sapx-show-code');
@@ -121,6 +123,7 @@
       GM_setValue('sse_cart_country', field('cart-country').checked);
       GM_setValue(STORAGE_KEY_REGION_ID, select.value);
       GM_setValue(STORAGE_KEY_SHOW_CODE, Boolean(showCode.checked));
+      log.info('设置已保存，准备刷新页面');
       location.reload();
     };
     root.classList.add('sapx-open');

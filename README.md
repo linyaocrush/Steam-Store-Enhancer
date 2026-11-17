@@ -6,7 +6,7 @@
 
 让 Steam 商店、愿望单与购物车中的价格信息更直观。
 
-![Version](https://img.shields.io/badge/version-1.3.0-67c1f5?style=flat-square)
+![Version](https://img.shields.io/badge/version-1.3.1-67c1f5?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Tampermonkey-1b2838?style=flat-square)
 ![License](https://img.shields.io/badge/license-AGPL--3.0-green?style=flat-square)
 
@@ -37,6 +37,8 @@
 ### 💱 价格汇率转换
 
 在原始价格旁追加换算结果，支持 Steam 商店、社区市场和结算页面中的价格元素。
+
+- 购物车价格采用独立扫描，即使账号地区货币与目标货币一致，也会识别购物车中以其他币种标价的商品；若无法读取账号地区，则按价格中的币种符号识别来源货币。
 
 - 自动获取汇率，并按设置的有效期缓存。
 - 支持手动指定汇率。
@@ -122,7 +124,7 @@ npm run build
 
 构建会将 `src/` 中的模块合并，生成可直接安装的 `Steam Store Enhancer.user.js`。请修改 `src/` 中的源码，不要直接编辑生成文件。
 
-运行以下命令检查生成文件是否与源码一致、验证脚本语法并执行测试：
+运行以下命令检查生成文件是否与源码一致、逐个验证仓库内 JavaScript（源码、构建脚本、测试和生成文件）的语法，并执行测试：
 
 ```sh
 npm run check
@@ -150,7 +152,7 @@ npm test
 | 使用自定义汇率 | 开启后使用手动输入的汇率 | 关闭 |
 | 自定义汇率 | 1 单位目标货币可兑换的原货币数量 | `1` |
 | 在市场首页禁用价格转换 | 在社区市场首页暂停换算 | 关闭 |
-| 日志等级 | 控制浏览器控制台中的日志输出 | `info` |
+| 全局日志等级 | 位于设置主区域，统一控制所有功能的控制台日志；`debug` 显示处理细节，`info` 显示常规结果，`warn`／`error` 仅显示相应等级及以上，`off` 关闭日志 | `info` |
 
 ### 自定义汇率示例
 

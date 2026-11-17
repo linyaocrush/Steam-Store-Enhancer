@@ -1,5 +1,7 @@
   function initializeFriendTools() {
     if (location.hostname !== 'steamcommunity.com' || !/\/friends\/?$/i.test(location.pathname)) return;
+    const log = createLogger('好友工具');
+    log.info('留言、分组与统计已启用');
 
     const ROOT_ID = 'sse-friend-tools';
     const style = document.createElement('style');
@@ -116,7 +118,7 @@
     let groups = GM_getValue(GROUP_STORAGE_KEY, {});
     if (!groups || typeof groups !== 'object' || Array.isArray(groups)) groups = {};
 
-    function saveGroups() { GM_setValue(GROUP_STORAGE_KEY, groups); }
+    function saveGroups() { GM_setValue(GROUP_STORAGE_KEY, groups); log.info('本地分组已保存', { count: Object.keys(groups).length }); }
     function renderGroups() {
       const selectedGroup = groupSelect.value;
       groupSelect.replaceChildren(createElement('option', '选择分组'));
@@ -247,6 +249,7 @@
       if (!window.confirm(`将向 ${friends.length} 位已选好友的个人主页发送相同评论。此操作无法撤回，继续吗？`)) return;
 
       send.disabled = true;
+      log.info('开始批量留言', { count: friends.length });
       status.textContent = `已确认，准备向 ${friends.length} 位好友发送……`;
       const results = [];
       try {
@@ -264,14 +267,18 @@
           const result = await response.json();
           if (!response.ok || result.success === false) throw new Error(result.error || `HTTP ${response.status}`);
           results.push(`已发送 ${name}`);
+          log.debug('留言发送成功', { index: index + 1, total: friends.length });
           } catch (error) {
+            log.warn('留言发送失败', { index: index + 1, message: error.message });
             results.push(`发送失败 ${name}：${error.message || '请求失败'}`);
           }
           status.textContent = `${index + 1}/${friends.length}\n${results.slice(-5).join('\n')}`;
           if (index + 1 < friends.length) await new Promise(resolve => setTimeout(resolve, 4000));
         }
         status.textContent = `处理完成：${results.filter(result => result.startsWith('已发送')).length} 成功，${results.filter(result => result.startsWith('发送失败')).length} 失败。\n${results.join('\n')}`;
+        log.info('批量留言完成', { success: results.filter(result => result.startsWith('已发送')).length, failed: results.filter(result => result.startsWith('发送失败')).length });
       } catch (error) {
+        log.error('批量留言中断', error.message);
         status.textContent = `批量发送中断：${error.message || String(error)}`;
       } finally {
         send.disabled = false;

@@ -5,10 +5,9 @@
 // @homepageURL  https://github.com/linyaocrush/Steam-Store-Enhancer
 // @downloadURL  https://raw.githubusercontent.com/linyaocrush/Steam-Store-Enhancer/main/Steam%20Store%20Enhancer.user.js
 // @updateURL    https://raw.githubusercontent.com/linyaocrush/Steam-Store-Enhancer/main/Steam%20Store%20Enhancer.user.js
-// @version      1.2.0
+// @version      1.3.1
 // @description  Steam 额外地区价格、汇率转换、快速加购、购物车批量管理与家庭库游戏标记。
 // @author       linyaocrush, marioplus, Chr_, Cliencer Goge, Miku39
-// @contributionURL https://github.com/linyaocrush/Steam-Store-Enhancer
 // @license      AGPL-3.0
 // @match        https://store.steampowered.com/*
 // @match        https://steamcommunity.com/*

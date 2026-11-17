@@ -117,84 +117,7 @@ disableOnMarket = false;
   var _GM_setValue = (() => typeof GM_setValue != "undefined" ? GM_setValue : void 0)();
   var _GM_xmlhttpRequest = (() => typeof GM_xmlhttpRequest != "undefined" ? GM_xmlhttpRequest : void 0)();
   var _unsafeWindow = (() => typeof unsafeWindow != "undefined" ? unsafeWindow : void 0)();
-  function initializeLogTitle() {
-    const isInIFrame = window.parent !== window || window.frames.length > 0;
-    return isInIFrame ? `steam-price-convertor iframe(${( new Date()).getMilliseconds()})` : "steam-price-convertor";
-  }
-  function createLogStyle(color) {
-    return `
-            background: ${color};
-            color: white;
-            padding: 1px 3px;
-            border-radius: 2px;
-        `;
-  }
-  function composeLogHint() {
-    return `%c${initializeLogTitle()}`;
-  }
-  const LogDefinitions = {
-    debug: {
-      index: 0,
-      color: "#009688",
-      label: "debug",
-      bindMethod: console.info
-    },
-    info: {
-      index: 1,
-      color: "#2196f3",
-      label: "info",
-      bindMethod: console.info
-    },
-    warn: {
-      index: 2,
-      color: "#ffc107",
-      label: "warn",
-      bindMethod: console.warn
-    },
-    error: {
-      index: 3,
-      color: "#e91e63",
-      label: "error",
-      bindMethod: console.error
-    },
-    off: {
-      index: 4,
-      color: "",
-      label: "off",
-      bindMethod: () => {
-      }
-    }
-  };
-  const Logger = {
-    debug: noopLog.bind(null),
-    info: noopLog.bind(null),
-    warn: noopLog.bind(null),
-    error: noopLog.bind(null)
-  };
-  function noopLog() {
-  }
-  let currLogLevel = LogDefinitions.info;
-  function refreshBinding() {
-    const hint = composeLogHint();
-    Object.entries(LogDefinitions).forEach(([label, def]) => {
-      if (def.index >= currLogLevel.index) {
-        const logStyle = createLogStyle(def.color);
-        Logger[label.toLowerCase()] = def.bindMethod.bind(console, hint, logStyle);
-      } else {
-        Logger[label.toLowerCase()] = noopLog.bind(null);
-      }
-    });
-  }
-  function setLogLevel(levelLabel) {
-    const newLevel = LogDefinitions[levelLabel];
-    if (newLevel) {
-      currLogLevel = newLevel;
-      refreshBinding();
-    } else {
-      console.error(`Invalid log level: ${levelLabel}`);
-    }
-  }
-  refreshBinding();
+  const Logger = createLogger('汇率转换');
   class Strings {
     static format(format, ...args) {
       args = args || [];
@@ -369,6 +292,9 @@ saveSetting(setting) {
     }
     async getCountyCode() {
       const storeDom = await this.getStoreDocument();
+      const sessionGlobals = storeDom === document ? _unsafeWindow : {};
+      const sessionCountry = readStoreSession(storeDom, sessionGlobals).country;
+      if (sessionCountry && /^[A-Z]{2}$/i.test(sessionCountry)) return sessionCountry.toUpperCase();
       try {
         let countyCode = (storeDom === document ? _unsafeWindow.GStoreItemData?.rgNavParams?.__page_default_obj?.countrycode : null);
         if (countyCode) {
@@ -379,7 +305,7 @@ saveSetting(setting) {
       }
       const dataConfig = storeDom.querySelector("div#application_config")?.getAttribute("data-config");
       if (dataConfig) {
-        const countyCode = JSON.parse(dataConfig)?.["COUNTRY"];
+        const countyCode = JSON.parse(dataConfig)?.COUNTRY;
         if (countyCode) {
           return countyCode;
         }
@@ -448,7 +374,7 @@ saveSetting(setting) {
           Logger.info(`通过[${provider.name()}]获取区域代码成功`);
           return countyCode.toUpperCase();
         } catch (e) {
-          Logger.error(`通过[${provider.name()}]获取区域代码失败`);
+          Logger.debug(`通过[${provider.name()}]获取区域代码失败`, e?.message || e);
         }
       }
       throw new Error("所有获取区域代码策略都获取失败");
@@ -719,8 +645,9 @@ static async convertContent(text) {
 static async processTextAsync(text, countryCode, targetSymbol, isBefore, targetCode) {
       if (!/\d/.test(text)) return text;
       const currentRule = countyInfos.find((c) => c.code === targetCode);
+      const isCart = isCartPage();
       const otherRules = SORTED_RULES_TEMPLATE.filter((c) => {
-        return c.code !== countryCode && c.code !== targetCode && c.currencyCode !== countyCode2Info.get(countryCode)?.currencyCode;
+        return c.code !== targetCode && (isCart || (c.code !== countryCode && c.currencyCode !== countyCode2Info.get(countryCode)?.currencyCode));
       });
       const matches = [];
       for (const numMatch of text.matchAll(NUMBER_BLOCK_REGEX)) {
@@ -893,6 +820,18 @@ static tryRule(text, numStr, numStart, numEnd, info, matches, relaxedOut) {
       selectors.push(...market);
       selectors.push(...notify);
       selectors.push(...app);
+      if (isCartPage()) {
+        selectors.push(
+          '.StoreOriginalPrice',
+          '.j3jr1YqpBGk- > .-nS4ZC0Bruo-',
+          '.i1XZFikuzME- .n9HLAjXXhvI-',
+          'main [class*="price" i]',
+          'main [class*="Price"]',
+          '[role="main"] [class*="price" i]',
+          '[class*="cart" i] [class*="price" i]',
+          '[data-testid*="price" i]'
+        );
+      }
       return selectors;
     }
     async convert(elementSnap) {
@@ -955,7 +894,7 @@ targets = new Map([
             return node;
           }
         } catch (e) {
-          console.debug("获取文本节点失败，但不确定该节点是否一定会出现。selector：" + selector);
+          Logger.debug("获取文本节点失败，但不确定该节点是否一定会出现。selector：" + selector);
         }
       }
       return null;
@@ -993,13 +932,7 @@ targets = new Map([
                 converter.afterConvert(elementSnap, elementConverted);
               }
             } catch (e) {
-              console.group("转换失败");
-              console.error(e);
-              console.error("转换失败请将下列内容反馈给开发者，右键 > 复制(copy) > 复制元素(copy element)");
-              console.error("↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓");
-              console.error(element);
-              console.error("↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑");
-              console.groupEnd();
+              Logger.error('价格转换失败', e.message, element);
             }
           })();
           tasks.push(task);
@@ -1010,7 +943,17 @@ targets = new Map([
   }
   async function initializeConversion() {
     if (!GM_getValue("sse_convert_enabled", true)) return;
-    try { await initContext(); await start(); }
+    try {
+      // SSR text must stay intact until React has adopted the server-rendered cart.
+      if (isCartPage() && _unsafeWindow.SSR) {
+        const deadline = Date.now() + 15000;
+        while (!_unsafeWindow.SSR.hydrated && Date.now() < deadline) {
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+      }
+      await initContext();
+      await start();
+    }
     catch (error) { Logger.error("价格转换初始化失败", error); }
   }
   async function start() {
@@ -1019,7 +962,7 @@ targets = new Map([
       Logger.info("已开启市场首页禁用，跳过转换");
       return;
     }
-    if (context.currentCountyInfo.code === context.targetCountyInfo.code) {
+    if (context.currentCountyInfo.code === context.targetCountyInfo.code && !isCartPage()) {
       Logger.info(`${context.currentCountyInfo.name}无需转换`);
       return;
     }
@@ -1045,6 +988,7 @@ targets = new Map([
           }
         } else {
           const target = mutation.target;
+          if (target.matches?.(selector)) uniqueTargets.add(target);
           const priceEls = target.querySelectorAll(selector);
           priceEls.forEach((el) => uniqueTargets.add(el));
         }
@@ -1061,14 +1005,20 @@ targets = new Map([
   }
   async function initContext() {
     const setting = SettingManager.instance.setting;
-    setLogLevel(setting.logLevel);
     let targetCountyInfo = countyCode2Info.get(setting.countyCode);
     if (!targetCountyInfo) {
       Logger.warn(`获取转换后的国家(${setting.countyCode})信息失败，默认为美国：` + setting.countyCode);
       targetCountyInfo = countyCode2Info.get("US");
     }
     Logger.info("目标区域：", targetCountyInfo);
-    const currCountyCode = await CountyCodeProviderManager.instance.getCountyCode();
+    let currCountyCode;
+    try {
+      currCountyCode = await CountyCodeProviderManager.instance.getCountyCode();
+    } catch (error) {
+      if (!isCartPage()) throw error;
+      currCountyCode = 'US';
+      Logger.warn('购物车无法读取账号地区，改按商品价格中的币种符号识别原币种', error.message);
+    }
     if (currCountyCode) {
       Logger.info("区域代码：", currCountyCode);
     }

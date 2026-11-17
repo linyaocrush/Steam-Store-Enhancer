@@ -1,9 +1,11 @@
   function initializeFamilyLibrary() {
+    const log = createLogger('家庭库');
     const KEY = 'sse_family_cache_v1';
     const DAY = 86400000;
     const page = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
     const onStore = location.hostname === 'store.steampowered.com';
     const enabled = GM_getValue('sse_family_enabled', true);
+    log.info(enabled ? '家庭库标记已启用' : '家庭库标记已关闭');
     let cache = GM_getValue(KEY, null);
     let scanPromise = null;
     let accountId = '';
@@ -35,7 +37,7 @@
       return { steamid: session.steamid, token: session.token };
     }
     try { if (onStore) accountId = readIdentity().steamid; }
-    catch (_) { notice = '暂时无法读取登录信息，请刷新 Steam 商店页面。'; }
+    catch (_) { notice = '暂时无法读取登录信息，请刷新 Steam 商店页面。'; log.warn(notice); }
     function validCache() {
       return cache && cache.apps && (!onStore || !accountId || cache.steamid === accountId);
     }
@@ -57,6 +59,7 @@
     }
     function scan() {
       if (scanPromise) return scanPromise;
+      log.info('开始扫描家庭库');
       scanPromise = (async () => {
         if (!onStore) throw new Error('请在已登录的 Steam 商店页面中扫描家庭库。');
         const identity = readIdentity();
@@ -80,7 +83,7 @@
           for (const player of players.accounts || []) {
             if (player.public_data?.steamid) names[String(player.public_data.steamid)] = player.public_data.persona_name || String(player.public_data.steamid);
           }
-        } catch (_) { notice = '游戏已读取，部分成员昵称暂时无法获取，将显示 SteamID。'; }
+        } catch (_) { notice = '游戏已读取，部分成员昵称暂时无法获取，将显示 SteamID。'; log.warn(notice); }
         const apps = {};
         for (const app of library.apps) {
           if (Number(app.exclude_reason || 0) !== 0 || !Number.isSafeInteger(Number(app.appid))) continue;
@@ -90,8 +93,9 @@
         accountId = self;
         GM_setValue(KEY, cache);
         notice = '扫描完成，已缓存 ' + Object.keys(apps).length + ' 个家庭库游戏。';
+        log.info(notice);
         updateMarks();
-      })().catch(error => { notice = error.message || '家庭库扫描失败，原缓存已保留。'; })
+      })().catch(error => { notice = error.message || '家庭库扫描失败，原缓存已保留。'; log.error('家庭库扫描失败，原缓存已保留', error.message); })
         .finally(() => { scanPromise = null; refreshNotice(); });
       refreshNotice();
       return scanPromise;
