@@ -6,7 +6,7 @@
 
 让 Steam 商店、愿望单与购物车中的价格信息更直观。
 
-![Version](https://img.shields.io/badge/version-1.2.0-67c1f5?style=flat-square)
+![Version](https://img.shields.io/badge/version-1.3.0-67c1f5?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Tampermonkey-1b2838?style=flat-square)
 ![License](https://img.shields.io/badge/license-AGPL--3.0-green?style=flat-square)
 
