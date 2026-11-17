@@ -11,6 +11,7 @@ export const sources = [
   'conversion.js',
   'family-library.js',
   'cart-tools.js',
+  'friend-tools.js',
   'main.js'
 ];
 

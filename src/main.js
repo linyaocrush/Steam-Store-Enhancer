@@ -12,6 +12,7 @@
     if (GM_getValue('sse_cart_enabled', true) && /^(store\.steampowered\.com|steamcommunity\.com)$/.test(location.hostname)) {
       initializeCartTools();
     }
+    initializeFriendTools();
     return family;
   }
 

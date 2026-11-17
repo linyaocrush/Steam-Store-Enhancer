@@ -21,3 +21,24 @@ test('shared session and DOM helpers are used by feature modules', async () => {
   assert.doesNotMatch(family, /\bnode\(/);
   assert.match(cart, /readStoreSession\(doc, globals\)/);
 });
+
+test('friend comment tool is included and requires explicit confirmation', async () => {
+  const source = await readFile(new URL('../src/friend-tools.js', import.meta.url), 'utf8');
+  const main = await readFile(new URL('../src/main.js', import.meta.url), 'utf8');
+  assert.match(source, /window\.confirm\(/);
+  assert.match(source, /setTimeout\(resolve, 4000\)/);
+  assert.match(source, /for \(let index = 0; index < friends\.length; index\+\+\)/);
+  assert.match(source, /status\.setAttribute\('aria-live', 'polite'\)/);
+  assert.match(source, /finally \{\s*send\.disabled = false;/);
+  assert.match(source, /\/comment\/Profile\/post\//);
+  assert.match(source, /renderFriends\(\)/);
+  assert.match(source, /checkbox\.type = 'checkbox'/);
+  assert.doesNotMatch(source, /backgroundIMG|setBackgroundImg/);
+  assert.match(source, /GM_setValue\(GROUP_STORAGE_KEY, groups\)/);
+  assert.match(source, /removeFromGroup\.addEventListener/);
+  assert.match(source, /deleteGroup\.addEventListener/);
+  assert.match(source, /已加载好友/);
+  assert.match(source, /在线好友/);
+  assert.match(source, /new MutationObserver/);
+  assert.match(main, /initializeFriendTools\(\)/);
+});
