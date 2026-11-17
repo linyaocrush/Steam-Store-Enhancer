@@ -1,0 +1,14 @@
+{
+  "name": "steam-store-enhancer",
+  "version": "1.2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "check": "node scripts/build.mjs --check && node --check \"Steam Store Enhancer.user.js\"",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

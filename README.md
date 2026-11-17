@@ -91,13 +91,31 @@ $10.00(￥80) (CN ¥32.00)
 ## 安装使用
 
 1. 在浏览器中安装 [Tampermonkey](https://www.tampermonkey.net/)。
-2. 下载本项目的 [Steam Store Enhancer.user.js](./Steam%20Store%20Enhancer.user.js)。
-3. 在 Tampermonkey 管理面板中选择「实用工具 → 从文件导入」，导入脚本并安装。
-4. 打开或刷新 Steam 页面。
-5. 点击 Tampermonkey 图标，选择 **「设置：Steam Store Enhancer」**。
-6. 根据需要调整选项，点击 **「保存并刷新」**。
+2. 前往 [Greasy Fork 的 Steam Store Enhancer 页面](https://greasyfork.org/zh-CN/scripts/605911-steam-store-enhancer)，点击安装并在 Tampermonkey 中确认。
+3. 打开或刷新 Steam 页面。
+4. 点击 Tampermonkey 图标，选择 **「设置：Steam Store Enhancer」**。
+5. 根据需要调整选项，点击 **「保存并刷新」**。
+
+也可以从本项目下载 [Steam Store Enhancer.user.js](./Steam%20Store%20Enhancer.user.js)，再通过 Tampermonkey「实用工具 → 从文件导入」手动安装。
 
 如果已安装功能相同的地区价格、汇率转换、快速加购或家庭库标记脚本，请先停用，以免重复显示。
+
+## 开发
+
+需要安装 [Node.js](https://nodejs.org/) 20 或更高版本。功能源码按模块保存在 `src/` 目录中，修改源码后在项目根目录运行：
+
+```sh
+npm run build
+```
+
+构建会将 `src/` 中的模块合并，生成可直接安装的 `Steam Store Enhancer.user.js`。请修改 `src/` 中的源码，不要直接编辑生成文件。
+
+运行以下命令检查生成文件是否与源码一致、验证脚本语法并执行测试：
+
+```sh
+npm run check
+npm test
+```
 
 ## 设置说明
 

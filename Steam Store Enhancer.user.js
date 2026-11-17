@@ -1,6 +1,7 @@
 // ==UserScript==
 // @name         Steam Store Enhancer
 // @namespace   https://github.com/linyaocrush/Steam-Store-Enhancer
+// @homepageURL  https://greasyfork.org/zh-CN/scripts/605911-steam-store-enhancer
 // @homepageURL  https://github.com/linyaocrush/Steam-Store-Enhancer
 // @downloadURL  https://raw.githubusercontent.com/linyaocrush/Steam-Store-Enhancer/main/Steam%20Store%20Enhancer.user.js
 // @updateURL    https://raw.githubusercontent.com/linyaocrush/Steam-Store-Enhancer/main/Steam%20Store%20Enhancer.user.js
@@ -31,6 +32,7 @@
 (function () {
   'use strict';
 
+  // ---- config.js ----
   const STORAGE_KEY_REGION_ID = 'sapx_target_region_id_v1';
   const STORAGE_KEY_SHOW_CODE = 'sapx_show_region_code_v1';
 
@@ -92,6 +94,46 @@
   const UI_STYLE_ID = 'sapx-ui-style';
   const UI_ROOT_ID = 'sapx-ui-root';
 
+  // ---- shared.js ----
+  function createElement(tag, content, className) {
+    const element = document.createElement(tag);
+    if (content !== undefined) element.textContent = content;
+    if (className) element.className = className;
+    return element;
+  }
+
+  // Coalesce repeated requests without postponing the first scheduled scan.
+  function createScheduledTask(task, delay) {
+    let timer = null;
+    return () => {
+      if (timer !== null) return;
+      timer = setTimeout(() => {
+        timer = null;
+        task();
+      }, delay);
+    };
+  }
+
+  function readStoreSession(doc, globals = {}) {
+    const config = doc.querySelector('#application_config');
+    const settings = JSON.parse(config?.getAttribute('data-config') || 'null') || globals.Config || {};
+    const user = JSON.parse(config?.getAttribute('data-store_user_config') || '{}');
+    const info = JSON.parse(config?.getAttribute('data-userinfo') || '{}');
+    let steamid = String(info.steamid || globals.UserConfig?.steamid || globals.g_steamID || '');
+    let token = user.webapi_token;
+    for (const entry of globals.SSR?.loaderData || []) {
+      try {
+        const data = typeof entry === 'string' ? JSON.parse(entry) : entry;
+        token ||= data?.strWebAPIToken;
+        steamid ||= String(data?.steamid || '');
+      } catch (_) {}
+    }
+    const account = globals.g_AccountID || globals.UserConfig?.accountid;
+    if (!steamid && account) steamid = (76561197960265728n + BigInt(account)).toString();
+    return { steamid, token, country: settings.COUNTRY, language: settings.LANGUAGE || 'schinese' };
+  }
+
+  // ---- styles.js ----
   function addStyle() {
     if (!document.getElementById(STYLE_ID)) {
       const style = document.createElement('style');
@@ -146,6 +188,7 @@
     }
   }
 
+  // ---- settings.js ----
   function ensureSettingsUI() {
     let root = document.getElementById(UI_ROOT_ID);
     if (root) return root;
@@ -275,6 +318,7 @@
     select.focus();
   }
 
+  // ---- regional-prices.js ----
   function gmGet(url) {
     return new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
@@ -799,12 +843,7 @@
     obs.observe(document.body, { childList: true, subtree: true, characterData: true });
   }
 
-  function registerMenu() {
-    GM_registerMenuCommand('设置：Steam Store Enhancer', () => openSettingsUI());
-  }
-
-
-
+  // ---- conversion.js ----
   const conversion = (() => {
   const countyObjs = JSON.parse('[{"code":"US","currencyCode":"USD","name":"美国","nameEn":"United States","symbol":"$","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"front","symbolGap":""},{"code":"CN","currencyCode":"CNY","name":"中国","nameEn":"China","symbol":"¥","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"front","symbolGap":""},{"code":"JP","currencyCode":"JPY","name":"日本","nameEn":"Japan","symbol":"¥","decimalSep":null,"thousandsSep":",","fractionDigits":0,"symbolPos":"front","symbolGap":""},{"code":"DE","currencyCode":"EUR","name":"德国","nameEn":"Germany","symbol":"€","decimalSep":",","thousandsSep":" ","fractionDigits":2,"symbolPos":"end","symbolGap":""},{"code":"RU","currencyCode":"RUB","name":"俄罗斯","nameEn":"Russia","symbol":"руб","decimalSep":",","thousandsSep":".","fractionDigits":2,"symbolPos":"end","symbolGap":" "},{"code":"PL","currencyCode":"PLN","name":"波兰","nameEn":"Poland","symbol":"zł","decimalSep":",","thousandsSep":" ","fractionDigits":2,"symbolPos":"end","symbolGap":" "},{"code":"BR","currencyCode":"BRL","name":"巴西","nameEn":"Brazil","symbol":"R$","decimalSep":",","thousandsSep":".","fractionDigits":2,"symbolPos":"front","symbolGap":""},{"code":"VN","currencyCode":"VND","name":"越南","nameEn":"Vietnam","symbol":"₫","decimalSep":null,"thousandsSep":".","fractionDigits":0,"symbolPos":"end","symbolGap":""},{"code":"KR","currencyCode":"KRW","name":"韩国","nameEn":"South Korea","symbol":"₩","decimalSep":null,"thousandsSep":",","fractionDigits":0,"symbolPos":"front","symbolGap":" "},{"code":"ID","currencyCode":"IDR","name":"印度尼西亚","nameEn":"Indonesia","symbol":"Rp","decimalSep":null,"thousandsSep":" ","fractionDigits":0,"symbolPos":"front","symbolGap":" "},{"code":"TW","currencyCode":"TWD","name":"中国台湾","nameEn":"Taiwan","symbol":"NT$","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"front","symbolGap":" "},{"code":"HK","currencyCode":"HKD","name":"中国香港","nameEn":"Hong Kong","symbol":"HK$","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"front","symbolGap":" "},{"code":"UA","currencyCode":"UAH","name":"乌克兰","nameEn":"Ukraine","symbol":"₴","decimalSep":",","thousandsSep":" ","fractionDigits":2,"symbolPos":"end","symbolGap":""},{"code":"KZ","currencyCode":"KZT","name":"哈萨克斯坦","nameEn":"Kazakhstan","symbol":"₸","decimalSep":",","thousandsSep":" ","fractionDigits":2,"symbolPos":"end","symbolGap":""},{"code":"GB","currencyCode":"GBP","name":"英国","nameEn":"United Kingdom","symbol":"£","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"front","symbolGap":""},{"code":"CH","currencyCode":"CHF","name":"瑞士","nameEn":"Switzerland","symbol":"CHF","decimalSep":".","thousandsSep":" ","fractionDigits":2,"symbolPos":"front","symbolGap":" "},{"code":"NO","currencyCode":"NOK","name":"挪威","nameEn":"Norway","symbol":"kr","decimalSep":",","thousandsSep":".","fractionDigits":2,"symbolPos":"end","symbolGap":" "},{"code":"TH","currencyCode":"THB","name":"泰国","nameEn":"Thailand","symbol":"฿","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"front","symbolGap":""},{"code":"PH","currencyCode":"PHP","name":"菲律宾","nameEn":"Philippines","symbol":"₱","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"front","symbolGap":""},{"code":"SG","currencyCode":"SGD","name":"新加坡","nameEn":"Singapore","symbol":"S$","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"front","symbolGap":""},{"code":"MY","currencyCode":"MYR","name":"马来西亚","nameEn":"Malaysia","symbol":"RM","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"front","symbolGap":""},{"code":"MX","currencyCode":"MXN","name":"墨西哥","nameEn":"Mexico","symbol":"Mex$","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"front","symbolGap":" "},{"code":"CA","currencyCode":"CAD","name":"加拿大","nameEn":"Canada","symbol":"C$","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"front","symbolGap":" "},{"code":"AU","currencyCode":"AUD","name":"澳大利亚","nameEn":"Australia","symbol":"A$","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"front","symbolGap":" "},{"code":"NZ","currencyCode":"NZD","name":"新西兰","nameEn":"New Zealand","symbol":"NZ$","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"front","symbolGap":" "},{"code":"IN","currencyCode":"INR","name":"印度","nameEn":"India","symbol":"₹","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"front","symbolGap":""},{"code":"CL","currencyCode":"CLP","name":"智利","nameEn":"Chile","symbol":"CLP$","decimalSep":null,"thousandsSep":".","fractionDigits":0,"symbolPos":"front","symbolGap":""},{"code":"PE","currencyCode":"PEN","name":"秘鲁","nameEn":"Peru","symbol":"S/.","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"front","symbolGap":" "},{"code":"CO","currencyCode":"COP","name":"哥伦比亚","nameEn":"Colombia","symbol":"COL$","decimalSep":",","thousandsSep":".","fractionDigits":2,"symbolPos":"front","symbolGap":" "},{"code":"ZA","currencyCode":"ZAR","name":"南非","nameEn":"South Africa","symbol":"R","decimalSep":".","thousandsSep":" ","fractionDigits":2,"symbolPos":"front","symbolGap":" "},{"code":"SA","currencyCode":"SAR","name":"沙特阿拉伯","nameEn":"Saudi Arabia","symbol":"SR","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"end","symbolGap":" "},{"code":"AE","currencyCode":"AED","name":"阿联酋","nameEn":"United Arab Emirates","symbol":"AED","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"end","symbolGap":" "},{"code":"IL","currencyCode":"ILS","name":"以色列","nameEn":"Israel","symbol":"₪","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"front","symbolGap":""},{"code":"KW","currencyCode":"KWD","name":"科威特","nameEn":"Kuwait","symbol":"KD","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"end","symbolGap":" "},{"code":"QA","currencyCode":"QAR","name":"卡塔尔","nameEn":"Qatar","symbol":"QR","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"end","symbolGap":" "},{"code":"CR","currencyCode":"CRC","name":"哥斯达黎加","nameEn":"Costa Rica","symbol":"₡","decimalSep":",","thousandsSep":".","fractionDigits":2,"symbolPos":"front","symbolGap":""},{"code":"UY","currencyCode":"UYU","name":"乌拉圭","nameEn":"Uruguay","symbol":"$U","decimalSep":",","thousandsSep":".","fractionDigits":2,"symbolPos":"front","symbolGap":""}]');
   class Jsons {
@@ -1923,18 +1962,7 @@ targets = new Map([
 
   })();
 
-  addStyle();
-  registerMenu();
-  if (location.hostname === "store.steampowered.com" && GM_getValue("sse_extra_enabled", true)) {
-    scheduleScan();
-    startObserver();
-  }
-  if (/^(store\.steampowered\.com|steamcommunity\.com|checkout\.steampowered\.com)$/.test(location.hostname)) conversion.start();
-  const familyLibrary = initializeFamilyLibrary();
-  if (GM_getValue('sse_cart_enabled', true) && /^(store\.steampowered\.com|steamcommunity\.com)$/.test(location.hostname)) {
-    initializeCartTools();
-  }
-
+  // ---- family-library.js ----
   function initializeFamilyLibrary() {
     const KEY = 'sse_family_cache_v1';
     const DAY = 86400000;
@@ -1967,28 +1995,9 @@ targets = new Map([
     `;
     document.head.appendChild(style);
 
-    function node(tag, content, className) {
-      const element = document.createElement(tag);
-      if (content !== undefined) element.textContent = content;
-      if (className) element.className = className;
-      return element;
-    }
     function readIdentity() {
-      const config = document.querySelector('#application_config');
-      const user = JSON.parse(config?.getAttribute('data-store_user_config') || '{}');
-      const info = JSON.parse(config?.getAttribute('data-userinfo') || '{}');
-      let steamid = String(info.steamid || page.UserConfig?.steamid || page.g_steamID || '');
-      let token = user.webapi_token;
-      for (const entry of page.SSR?.loaderData || []) {
-        try {
-          const data = typeof entry === 'string' ? JSON.parse(entry) : entry;
-          token ||= data?.strWebAPIToken;
-          steamid ||= String(data?.steamid || '');
-        } catch (_) {}
-      }
-      const numericAccount = page.g_AccountID || page.UserConfig?.accountid;
-      if (!steamid && numericAccount) steamid = (76561197960265728n + BigInt(numericAccount)).toString();
-      return { steamid, token };
+      const session = readStoreSession(document, page);
+      return { steamid: session.steamid, token: session.token };
     }
     try { if (onStore) accountId = readIdentity().steamid; }
     catch (_) { notice = '暂时无法读取登录信息，请刷新 Steam 商店页面。'; }
@@ -2054,14 +2063,14 @@ targets = new Map([
     }
 
     function action(label, handler) {
-      const control = node('button', label);
+      const control = createElement('button', label);
       control.type = 'button';
       control.addEventListener('click', handler);
       return control;
     }
     function open() {
       if (!root) {
-        root = node('div');
+        root = createElement('div');
         root.id = 'sse-family-dialog';
         root.addEventListener('click', event => { if (event.target === root) close(); });
         document.documentElement.appendChild(root);
@@ -2073,7 +2082,7 @@ targets = new Map([
     function hideChartTooltip() { chartTooltip?.remove(); chartTooltip = null; }
     function showChartTooltip(content, x, y) {
       if (!chartTooltip) {
-        chartTooltip = node('div'); chartTooltip.id = 'sse-family-chart-tooltip'; chartTooltip.setAttribute('role', 'tooltip');
+        chartTooltip = createElement('div'); chartTooltip.id = 'sse-family-chart-tooltip'; chartTooltip.setAttribute('role', 'tooltip');
         document.documentElement.appendChild(chartTooltip);
       }
       chartTooltip.textContent = content;
@@ -2107,7 +2116,7 @@ targets = new Map([
         if (!count) {
           count = [...control.querySelectorAll('span')].find(element => /^\s*\d+\s*$/.test(element.textContent));
         }
-        if (!count) { count = node('span'); control.appendChild(count); }
+        if (!count) { count = createElement('span'); control.appendChild(count); }
         count.classList.add('sse-family-count');
         const walker = document.createTreeWalker(control, NodeFilter.SHOW_TEXT);
         const labels = [];
@@ -2138,9 +2147,9 @@ targets = new Map([
     function renderDialog() {
       if (!root) return;
       hideChartTooltip();
-      const panel = node('div', undefined, 'sse-family-window');
+      const panel = createElement('div', undefined, 'sse-family-window');
       panel.setAttribute('role', 'dialog'); panel.setAttribute('aria-modal', 'true'); panel.setAttribute('aria-label', 'Steam 家庭库');
-      panel.append(node('h2', 'Steam 家庭库'));
+      panel.append(createElement('h2', 'Steam 家庭库'));
       const scanButton = action(scanPromise ? '扫描中……' : '现在扫描家庭库', scan);
       scanButton.disabled = !onStore || Boolean(scanPromise);
       panel.append(scanButton, action('清空缓存', () => {
@@ -2149,20 +2158,20 @@ targets = new Map([
         GM_deleteValue(KEY); cache = null; notice = '家庭库缓存已清空。'; updateMarks(); renderDialog();
       }), action('关闭', close));
       const summary = validCache() ? cache.name + ' · ' + Object.keys(cache.apps).length + ' 个游戏 · 上次扫描：' + new Date(cache.updated).toLocaleString() : '暂无当前账号的家庭库缓存。';
-      panel.append(node('div', summary + '\n' + (notice || (!onStore ? '请前往 Steam 商店扫描，本站使用已保存的缓存。' : '')), 'sse-family-status'));
+      panel.append(createElement('div', summary + '\n' + (notice || (!onStore ? '请前往 Steam 商店扫描，本站使用已保存的缓存。' : '')), 'sse-family-status'));
       if (validCache()) {
-        panel.append(node('h3', '家庭成员贡献统计'));
+        panel.append(createElement('h3', '家庭成员贡献统计'));
         const games = Object.values(cache.apps);
         const totals = cache.members.map(id => games.filter(game => game.owners.includes(id)).length);
         const maximum = Math.max(1, ...totals);
         const colors = ['#67c1f5', '#06cfbe', '#a0c85a', '#d7a64c', '#bb83db', '#e18484'];
         cache.members.forEach((id, index) => {
-          const row = node('div', undefined, 'sse-family-chart-row');
-          const bar = node('div', undefined, 'sse-family-chart-bar');
+          const row = createElement('div', undefined, 'sse-family-chart-row');
+          const bar = createElement('div', undefined, 'sse-family-chart-bar');
           const counts = Array.from({ length: Math.max(1, cache.members.length) }, () => 0);
           for (const game of games) if (game.owners.includes(id)) counts[Math.min(counts.length, game.owners.length) - 1]++;
           counts.forEach((count, group) => {
-            const segment = node('span'); segment.style.width = count / maximum * 100 + '%'; segment.style.background = colors[group % colors.length];
+            const segment = createElement('span'); segment.style.width = count / maximum * 100 + '%'; segment.style.background = colors[group % colors.length];
             const category = group === 0 ? '单独贡献' : (group + 1) + ' 人共同拥有';
             const details = ownerName(id) + '\n' + category + '：' + count + ' 个游戏\n该成员拥有总数：' + totals[index] + ' 个\n占该成员游戏的比例：' + (totals[index] ? (count / totals[index] * 100).toFixed(1) : '0') + '%';
             segment.setAttribute('aria-label', details);
@@ -2174,22 +2183,22 @@ targets = new Map([
             segment.addEventListener('blur', hideChartTooltip);
             bar.appendChild(segment);
           });
-          row.append(node('span', ownerName(id)), bar, node('span', String(totals[index]))); panel.appendChild(row);
+          row.append(createElement('span', ownerName(id)), bar, createElement('span', String(totals[index]))); panel.appendChild(row);
         });
-        panel.append(node('div', '柱条按拥有同一游戏的成员人数分段；悬停查看数量。统计包含当前账号，不代表家庭实际可用的同时游玩份数。', 'sse-family-status'));
-        panel.append(node('h3', '最近购入的游戏'));
-        panel.append(node('div', '按接口记录的最早购入时间排序；绿色表示最近 30 天购入且仅一位成员拥有。', 'sse-family-status'));
-        const search = node('input'); search.placeholder = '搜索游戏或贡献者'; search.setAttribute('aria-label', '搜索家庭库游戏'); panel.appendChild(search);
-        const scroll = node('div', undefined, 'sse-family-scroll');
-        const table = node('table'); const header = node('tr');
-        ['游戏名称', '记录的最早购入时间', '贡献者'].forEach(value => header.appendChild(node('th', value)));
-        const head = node('thead'); head.appendChild(header); table.appendChild(head);
-        const body = node('tbody');
+        panel.append(createElement('div', '柱条按拥有同一游戏的成员人数分段；悬停查看数量。统计包含当前账号，不代表家庭实际可用的同时游玩份数。', 'sse-family-status'));
+        panel.append(createElement('h3', '最近购入的游戏'));
+        panel.append(createElement('div', '按接口记录的最早购入时间排序；绿色表示最近 30 天购入且仅一位成员拥有。', 'sse-family-status'));
+        const search = createElement('input'); search.placeholder = '搜索游戏或贡献者'; search.setAttribute('aria-label', '搜索家庭库游戏'); panel.appendChild(search);
+        const scroll = createElement('div', undefined, 'sse-family-scroll');
+        const table = createElement('table'); const header = createElement('tr');
+        ['游戏名称', '记录的最早购入时间', '贡献者'].forEach(value => header.appendChild(createElement('th', value)));
+        const head = createElement('thead'); head.appendChild(header); table.appendChild(head);
+        const body = createElement('tbody');
         Object.entries(cache.apps).sort((a, b) => b[1].time - a[1].time).forEach(([id, game]) => {
-          const row = node('tr');
+          const row = createElement('tr');
           if (game.time * 1000 >= Date.now() - 30 * DAY && game.owners.length === 1) row.className = 'sse-family-recent';
-          const cell = node('td'); const link = node('a', game.name); link.href = 'https://store.steampowered.com/app/' + id; link.target = '_blank'; link.rel = 'noopener noreferrer'; cell.appendChild(link);
-          row.append(cell, node('td', game.time ? new Date(game.time * 1000).toLocaleDateString() : '未知'), node('td', game.owners.map(ownerName).join('、'))); body.appendChild(row);
+          const cell = createElement('td'); const link = createElement('a', game.name); link.href = 'https://store.steampowered.com/app/' + id; link.target = '_blank'; link.rel = 'noopener noreferrer'; cell.appendChild(link);
+          row.append(cell, createElement('td', game.time ? new Date(game.time * 1000).toLocaleDateString() : '未知'), createElement('td', game.owners.map(ownerName).join('、'))); body.appendChild(row);
         });
         search.addEventListener('input', () => { const value = search.value.toLocaleLowerCase(); [...body.rows].forEach(row => { row.hidden = !row.textContent.toLocaleLowerCase().includes(value); }); });
         table.appendChild(body); scroll.appendChild(table); panel.appendChild(scroll);
@@ -2227,7 +2236,7 @@ targets = new Map([
         if (owner && appId(owner) === id) return;
         element.setAttribute('data-sse-family-app', id);
         let badge = element.querySelector(':scope > .sse-family-badge');
-        if (!badge) { badge = node('span', '在家庭库中', 'sse-family-badge'); element.appendChild(badge); }
+        if (!badge) { badge = createElement('span', '在家庭库中', 'sse-family-badge'); element.appendChild(badge); }
         const title = gameDescription(game);
         if (badge.title !== title) badge.title = title;
       });
@@ -2236,16 +2245,16 @@ targets = new Map([
       if (onStore && detail) {
         const host = document.querySelector('.queue_and_playtime, #game_area_purchase, .game_area_purchase');
         if (host) {
-          const banner = node('div', detail.owners.includes(cache.steamid) ? '您和家庭成员拥有此游戏' : '您的 Steam 家庭库中已有此游戏', 'sse-family-banner');
+          const banner = createElement('div', detail.owners.includes(cache.steamid) ? '您和家庭成员拥有此游戏' : '您的 Steam 家庭库中已有此游戏', 'sse-family-banner');
           banner.title = gameDescription(detail);
           banner.appendChild(action('查看贡献者（' + detail.owners.length + '）', () => window.alert(gameDescription(detail))));
-          const launch = node('a', '马上开玩'); launch.href = 'steam://launch/' + detailId + '/Dialog'; banner.appendChild(launch);
+          const launch = createElement('a', '马上开玩'); launch.href = 'steam://launch/' + detailId + '/Dialog'; banner.appendChild(launch);
           host.prepend(banner);
         }
       }
       if (location.hostname === 'steamdb.keylol.com') {
         const id = location.hash.match(/app\/(\d+)/)?.[1]; const game = cache.apps[id]; const host = document.querySelector('#game_score');
-        if (game && !game.owners.includes(cache.steamid) && host) host.after(node('div', '家庭组：' + gameDescription(game), 'sse-family-banner'));
+        if (game && !game.owners.includes(cache.steamid) && host) host.after(createElement('div', '家庭组：' + gameDescription(game), 'sse-family-banner'));
       }
     }
     if (enabled) {
@@ -2268,6 +2277,7 @@ targets = new Map([
     return { open };
   }
 
+  // ---- cart-tools.js ----
   function initializeCartTools() {
     const page = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
     const english = GM_getValue('sse_cart_language', 'ZH') === 'EN';
@@ -2294,19 +2304,8 @@ targets = new Map([
     const itemRequests = new Map();
 
     function readContext(doc, globals = {}) {
-      const config = doc.querySelector('#application_config');
-      const settings = JSON.parse(config?.getAttribute('data-config') || 'null') || globals.Config || {};
-      const user = JSON.parse(config?.getAttribute('data-store_user_config') || '{}');
-      let token = user.webapi_token;
-      if (!token) {
-        for (const entry of globals.SSR?.loaderData || []) {
-          try {
-            const value = typeof entry === 'string' ? JSON.parse(entry) : entry;
-            if (value?.strWebAPIToken) { token = value.strWebAPIToken; break; }
-          } catch (_) {}
-        }
-      }
-      return { token, country: settings.COUNTRY, language: settings.LANGUAGE || 'schinese' };
+      const session = readStoreSession(doc, globals);
+      return { token: session.token, country: session.country, language: session.language };
     }
 
     async function context() {
@@ -2665,4 +2664,24 @@ targets = new Map([
       }
     }).catch(error => console.warn('Steam Store Enhancer:', error.message));
   }
+
+  // ---- main.js ----
+  function initialize() {
+    addStyle();
+    GM_registerMenuCommand('设置：Steam Store Enhancer', openSettingsUI);
+    if (location.hostname === 'store.steampowered.com' && GM_getValue('sse_extra_enabled', true)) {
+      scheduleScan();
+      startObserver();
+    }
+    if (/^(store\.steampowered\.com|steamcommunity\.com|checkout\.steampowered\.com)$/.test(location.hostname)) {
+      conversion.start();
+    }
+    const family = initializeFamilyLibrary();
+    if (GM_getValue('sse_cart_enabled', true) && /^(store\.steampowered\.com|steamcommunity\.com)$/.test(location.hostname)) {
+      initializeCartTools();
+    }
+    return family;
+  }
+
+  const familyLibrary = initialize();
 })();
