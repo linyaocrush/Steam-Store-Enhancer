@@ -1,37 +1,4 @@
-  function gmGet(url) {
-    return new Promise((resolve, reject) => {
-      GM_xmlhttpRequest({
-        method: 'GET',
-        url,
-        timeout: 20000,
-        onload: (res) => {
-          if ((res.status >= 200 && res.status < 300) || (res.status === 0 && res.responseText)) resolve(res.responseText);
-          else reject(new Error('HTTP ' + res.status));
-        },
-        onerror: reject,
-        ontimeout: () => reject(new Error('Timeout'))
-      });
-    });
-  }
-
-  class RequestQueue {
-    constructor(concurrency = 4) { this.concurrency = concurrency; this.running = 0; this.queue = []; }
-    enqueue(task) {
-      return new Promise((resolve, reject) => {
-        this.queue.push({ task, resolve, reject });
-        this._deq();
-      });
-    }
-    _deq() {
-      if (this.running >= this.concurrency) return;
-      const job = this.queue.shift();
-      if (!job) return;
-      this.running++;
-      Promise.resolve().then(job.task).then(job.resolve).catch(job.reject).finally(() => { this.running--; this._deq(); });
-    }
-  }
-
-  const requestQueue = new RequestQueue(4);
+  const regionalLog = diagnostics.scope('regional-prices');
   const currencyDigitsCache = new Map();
 
   function getCurrencyFractionDigits(currency) {
@@ -124,7 +91,7 @@
           }
         }
       }
-    } catch (e) {}
+    } catch (error) { regionalLog.debug('package.fallback', '套餐接口失败，尝试备用接口', { packageid, cc, error }); }
 
     try {
       const url = 'https://store.steampowered.com/api/packagedetails?packageids=' + packageid + '&cc=' + cc;
@@ -143,6 +110,7 @@
         discountPercent: p.discount_percent
       });
     } catch (e) {
+      regionalLog.debug('package.unavailable', '备用套餐接口失败', { packageid, cc, error: e });
       return null;
     }
   }
@@ -192,18 +160,19 @@
 
   function getPriceForItem(item, region) {
     const key = item.type + ':' + item.id + ':' + region.id;
-    if (pendingPrices.has(key)) return pendingPrices.get(key);
+    if (pendingPrices.has(key)) { regionalLog.debug('price.join', '复用进行中的价格查询', { item: key }); return pendingPrices.get(key); }
     const pending = fetchPriceForItem(item, region).finally(() => pendingPrices.delete(key));
     pendingPrices.set(key, pending);
     return pending;
   }
 
   async function fetchPriceForItem(item, region) {
-    const log = createLogger('地区价格');
     const key = item.type + ':' + item.id + ':' + region.id;
     const cached = cacheGet(key);
-    if (cached !== undefined) { log.debug('命中价格缓存', { item: key }); return cached; }
+    if (cached !== undefined) { regionalLog.debug('cache.hit', '命中价格缓存', { item: key }); return cached; }
+    const task = regionalLog.begin('price.fetch', { item: key });
     for (const cc of region.ccCandidates) {
+      task.debug('candidate', '读取候选地区', { cc });
       try {
         let res = null;
         if (item.type === 'app') res = await getAppPrice(item.id, cc, region.currency);
@@ -212,14 +181,14 @@
         if (res && res.ok) {
           if (item.type === 'bundle' || !res.currency || res.currency === region.currency) {
             cacheSet(key, res);
-            log.debug('地区价格读取成功', { item: key, country: cc });
+            task.end('地区价格读取成功', { item: key, country: cc });
             return res;
           }
         }
-      } catch (e) { log.debug('候选地区价格读取失败', { item: key, country: cc, message: e.message }); }
+      } catch (error) { task.debug('candidate.failed', '候选地区价格读取失败', { item: key, country: cc, error }); }
     }
     cacheSet(key, null);
-    log.debug('没有可用地区价格', { item: key });
+    task.end('没有可用地区价格', { item: key, available: false });
     return null;
   }
 
@@ -406,6 +375,7 @@
     if (!priceEl.isConnected) return;
     if (!price || !price.ok) {
       markRegionLocked(priceEl, region);
+      regionalLog.debug('render.locked', '标记地区不可用', { item, region: region.id });
       return;
     }
     priceEl.querySelector('.sapx-region-locked')?.remove();
@@ -423,6 +393,7 @@
     if (!formatted) return;
 
     upsertExtraInside(priceEl, region, formatted);
+    regionalLog.debug('render.price', '地区价格已显示', { item, region: region.id, kind: wantInitial ? 'initial' : 'final' });
   }
 
   async function updateCartSummary() {
@@ -435,7 +406,7 @@
     const totalRow = totalValue?.closest('._1mIUrXeHG3k-') || Array.from(document.querySelectorAll('.i1XZFikuzME- > div'))
       .find(row => /预计总额/.test(row.textContent));
     if (!items.length || !totalRow) {
-      createLogger('地区价格').debug('购物车汇总等待页面节点', { items: items.length, totalRow: Boolean(totalRow) });
+      regionalLog.debug('summary.wait', '购物车汇总等待页面节点', { items: items.length, totalRow: Boolean(totalRow) });
       scheduleCartSummaryRetry();
       return;
     }
@@ -464,7 +435,7 @@
     let html = '<div class="sapx-row"><div class="sapx-label">' + label + '：</div><div class="sapx-value">' + totalText + '</div></div>';
     if (missingCount > 0) html += '<div class="sapx-warn">目标地区有 ' + missingCount + ' 款锁区游戏，未计入小计</div>';
     if (box.innerHTML !== html) box.innerHTML = html;
-    createLogger('地区价格').info('购物车额外地区汇总完成', {
+    regionalLog.debug('summary.complete', '购物车额外地区汇总完成', {
       region: region.id,
       total: totalText,
       items: items.length,
@@ -559,14 +530,16 @@
     if (scanTimer) return;
     scanTimer = setTimeout(() => {
       scanTimer = null;
-      document.querySelectorAll(PRICE_SELECTORS).forEach(el => { enhancePriceElement(el); });
+      const elements = document.querySelectorAll(PRICE_SELECTORS);
+      regionalLog.debug('scan.start', '扫描价格节点', { count: elements.length });
+      elements.forEach(el => { enhancePriceElement(el); });
       if (isWishlistPage()) scanWishlistFallback();
       if (isCartPage()) { scanCartFallback(); updateCartSummary(); }
     }, 450);
   }
 
   function startObserver() {
-    createLogger('地区价格').info('地区价格扫描与动态监听已启用');
+    regionalLog.info('observer.ready', '地区价格扫描与动态监听已启用');
     const obs = new MutationObserver(mutations => {
       if (mutations.some(mutation => !mutation.target.parentElement?.closest('#' + UI_ROOT_ID + ', .' + EXTRA_CLASS + ', #' + CART_SUMMARY_ID) &&
           !(mutation.target.nodeType === 1 && mutation.target.closest('#' + UI_ROOT_ID + ', .' + EXTRA_CLASS + ', #' + CART_SUMMARY_ID)))) scheduleScan();

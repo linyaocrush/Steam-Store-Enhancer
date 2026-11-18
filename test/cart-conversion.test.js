@@ -2,9 +2,10 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import vm from 'node:vm';
+import { loggingSource } from './helpers/logging.mjs';
 
 async function harness() {
-  const source = await readFile(new URL('../src/conversion.js', import.meta.url), 'utf8');
+  const source = (await Promise.all(['settings', 'rates', 'price-processor', 'index'].map(name => readFile(new URL(`../src/conversion/${name}.js`, import.meta.url), 'utf8')))).join('\n');
   const page = {};
   let observer;
   const document = {
@@ -18,10 +19,10 @@ async function harness() {
   const context = vm.createContext({
     unsafeWindow: page, document, NodeFilter: { SHOW_TEXT: 4 },
     isCartPage: () => true,
-    createLogger: () => Object.fromEntries(['info', 'debug', 'warn', 'error'].map(level => [level, () => {}])),
     GM_getValue: () => undefined, GM_setValue() {}, GM_info: { script: { version: '1.3.1' } },
     MutationObserver: class { constructor(callback) { observer = callback; } observe() {} }
   });
+  vm.runInContext(await loggingSource(), context);
   vm.runInContext(source.replace('get setting() { return SettingManager.instance.setting; },',
     'get setting() { return SettingManager.instance.setting; }, ElementConverter, SpcContext, countyCode2Info, convert,'), context);
   const api = vm.runInContext('conversion', context);

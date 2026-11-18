@@ -94,32 +94,167 @@
   const UI_STYLE_ID = 'sapx-ui-style';
   const UI_ROOT_ID = 'sapx-ui-root';
 
-  // ---- shared.js ----
-  function createLogger(feature) {
-    const levels = { debug: 0, info: 1, warn: 2, error: 3, off: 4 };
-    const colors = { debug: '#8f98a0', info: '#67c1f5', warn: '#ffc857', error: '#ff8585' };
-    const logger = {};
-    for (const level of ['debug', 'info', 'warn', 'error']) {
-      logger[level] = (...args) => {
-        let configured = 'info';
-        try {
-          const stored = GM_getValue('Storage:Setting', null);
-          const settings = typeof stored === 'string' ? JSON.parse(stored) : stored;
-          configured = settings?.logLevel || 'info';
-        } catch (_) {}
-        if (levels[level] < (levels[configured] ?? levels.info)) return;
-        console[level](
-          `%cSteam Store Enhancer%c ${feature} %c${level.toUpperCase()}%c`,
-          'background:#1b2838;color:#67c1f5;padding:3px 7px;border-radius:4px;font-weight:bold',
-          'color:#c6d4df;font-weight:bold',
-          `color:${colors[level]};font-weight:bold`,
-          'color:inherit;font-weight:normal', ...args
-        );
-      };
-    }
-    return logger;
+  // ---- logging/policy.js ----
+  // Logging owns its settings. The legacy field is read only once for migration.
+  const LOG_LEVELS = Object.freeze({ debug: 10, info: 20, warn: 30, error: 40, off: Infinity });
+  const LOG_LEVEL_KEY = 'sse_log_level';
+
+  function isLogLevel(value) {
+    return typeof value === 'string' && Object.hasOwn(LOG_LEVELS, value);
   }
 
+  function createLogPolicy(read, write) {
+    let current = 'info';
+    try {
+      const saved = read(LOG_LEVEL_KEY);
+      if (isLogLevel(saved)) current = saved;
+      else if (saved == null) {
+        const legacy = read('Storage:Setting');
+        const value = typeof legacy === 'string' ? JSON.parse(legacy) : legacy;
+        if (isLogLevel(value?.logLevel)) {
+          current = value.logLevel;
+          write(LOG_LEVEL_KEY, current);
+        }
+      }
+    } catch (_) { /* Diagnostics must also work when storage is unavailable. */ }
+    return {
+      getLevel() {
+        try {
+          const saved = read(LOG_LEVEL_KEY);
+          if (isLogLevel(saved)) current = saved;
+        } catch (_) {}
+        return current;
+      },
+      setLevel(value) {
+        if (!isLogLevel(value)) throw new TypeError('无效的日志等级：' + value);
+        write(LOG_LEVEL_KEY, value);
+        current = value;
+      }
+    };
+  }
+
+  // ---- logging/format.js ----
+  // Store snapshots, never live objects, DOM nodes, credentials or request bodies.
+  function snapshotLogData(input) {
+    const seen = new WeakSet();
+    let remaining = 150;
+    const privateKey = /token|authorization|cookie|sessionid|password|secret|comment|gift_message/i;
+    const cleanText = value => String(value)
+      .replace(/((?:access_token|sessionid|token|key)=)[^\s&#]+/gi, '$1[redacted]')
+      .replace(/Bearer\s+\S+/gi, 'Bearer [redacted]').slice(0, 3000);
+    function visit(value, depth) {
+      if (--remaining < 0) return '[limit]';
+      if (value == null || typeof value === 'boolean' || typeof value === 'number') return value;
+      if (typeof value === 'string') return cleanText(value);
+      if (typeof value !== 'object') return cleanText(value);
+      if (seen.has(value)) return '[circular]';
+      if (depth > 5) return '[depth limit]';
+      seen.add(value);
+      try {
+        if (value.nodeType) return { node: value.nodeName || 'DOM', id: value.id || undefined };
+        if (Object.prototype.toString.call(value) === '[object Error]') {
+          return { name: cleanText(value.name), message: cleanText(value.message), stack: cleanText(value.stack || ''),
+            ...(value.cause === undefined ? {} : { cause: visit(value.cause, depth + 1) }) };
+        }
+        if (Array.isArray(value)) return value.slice(0, 40).map(item => visit(item, depth + 1));
+        if (Object.prototype.toString.call(value) === '[object Map]') return visit([...value.entries()], depth + 1);
+        const result = {};
+        for (const key of Object.keys(value).slice(0, 40)) {
+          if (privateKey.test(key)) result[key] = '[redacted]';
+          else {
+            const descriptor = Object.getOwnPropertyDescriptor(value, key);
+            Object.defineProperty(result, key, { enumerable: true, configurable: true, writable: true,
+              value: descriptor && 'value' in descriptor ? visit(descriptor.value, depth + 1) : '[accessor]' });
+          }
+        }
+        return result;
+      } catch (_) { return '[unavailable]'; }
+    }
+    return visit(input, 0);
+  }
+
+  function renderLogRecord(sink, record) {
+    const palette = { debug: '#536c84', info: '#14618b', warn: '#855400', error: '#b32c30' };
+    // DEBUG uses log deliberately: users need not enable DevTools' Verbose filter.
+    const method = record.level === 'debug' ? 'log' : record.level;
+    const output = typeof sink[method] === 'function' ? sink[method] : sink.log;
+    if (typeof output !== 'function') return;
+    const timing = record.durationMs === undefined ? '' : ` · ${record.durationMs}ms`;
+    const trace = record.operation ? ` @${record.operation}` : '';
+    output.call(sink,
+      '%c SSE %c %s %c %s %c %s %c%s',
+      'background:#1b2838;color:#9ed8f5;border-radius:3px;padding:2px 5px;font-weight:bold',
+      'color:#77838f;font-family:monospace', record.time.slice(11, 23) + 'Z',
+      `background:${palette[record.level]};color:#fff;border-radius:3px;padding:2px 5px;font-weight:bold`, record.level.toUpperCase(),
+      'font-weight:bold', `${record.module} / ${record.step}`,
+      'font-weight:normal', `#${record.sequence}${trace}${timing} ${record.message}`,
+      record);
+  }
+
+  // ---- logging/service.js ----
+  function createDiagnostics({ read, write, sink, now = () => Date.now(), capacity = 200 }) {
+    const policy = createLogPolicy(read, write);
+    const history = [];
+    let sequence = 0;
+    let operation = 0;
+    const enabled = level => isLogLevel(level) && level !== 'off' && LOG_LEVELS[level] >= LOG_LEVELS[policy.getLevel()];
+
+    function emit(module, level, step, message, data, extra = {}) {
+      if (!enabled(level)) return;
+      try {
+        const record = {
+          sequence: ++sequence, time: new Date(now()).toISOString(), level, module, step,
+          message: snapshotLogData(String(message)), ...extra,
+          data: snapshotLogData(typeof data === 'function' ? data() : data)
+        };
+        history.push(record);
+        if (history.length > capacity) history.shift();
+        renderLogRecord(sink, record);
+      } catch (_) { /* Logging must never interrupt the feature being observed. */ }
+    }
+
+    function scope(module) {
+      const logger = { enabled };
+      for (const level of ['debug', 'info', 'warn', 'error']) {
+        logger[level] = (step, message, data) => emit(module, level, step, message, data);
+      }
+      logger.begin = (step, data, level = 'debug') => {
+        const id = ++operation;
+        const started = now();
+        let settled = false;
+        emit(module, level, step, '开始', data, { operation: id, status: 'start' });
+        const finish = (severity, status, message, details) => {
+          if (settled) return;
+          settled = true;
+          emit(module, severity, step, message, details, { operation: id, status,
+            durationMs: Math.max(0, now() - started) });
+        };
+        const span = {
+          end: (message = '完成', details) => finish(level, 'success', message, details),
+          fail: (error, details) => finish('error', 'failure', '失败', { error, details }),
+          cancel: (message = '已取消', details) => finish(level, 'cancelled', message, details)
+        };
+        for (const severity of ['debug', 'info', 'warn', 'error']) {
+          span[severity] = (childStep, message, details) => {
+            if (!settled) emit(module, severity, `${step}.${childStep}`, message, details, { operation: id });
+          };
+        }
+        return span;
+      };
+      return Object.freeze(logger);
+    }
+    return Object.freeze({ scope, enabled, getLevel: policy.getLevel, setLevel: policy.setLevel,
+      records: () => JSON.parse(JSON.stringify(history)), clear: () => { history.length = 0; } });
+  }
+
+  // ---- logging/index.js ----
+  const diagnostics = createDiagnostics({
+    read: key => GM_getValue(key, null),
+    write: (key, value) => GM_setValue(key, value),
+    sink: console
+  });
+
+  // ---- shared.js ----
   function createElement(tag, content, className) {
     const element = document.createElement(tag);
     if (content !== undefined) element.textContent = content;
@@ -162,6 +297,48 @@
     const country = settings.COUNTRY || settings.COUNTRY_CODE || settings.country_code || globals.UserConfig?.country || '';
     return { steamid, token, country: String(country).toUpperCase(), language: settings.LANGUAGE || 'schinese' };
   }
+
+  // ---- network.js ----
+  function gmGet(url) {
+    // The endpoint is sufficient for diagnosis; query strings can contain tokens.
+    const address = new URL(url);
+    const task = diagnostics.scope('network').begin('get', { endpoint: address.origin + address.pathname });
+    return new Promise((resolve, reject) => {
+      const fail = error => { task.fail(error); reject(error); };
+      try {
+        GM_xmlhttpRequest({
+          method: 'GET', url, timeout: 20000,
+          onload: response => {
+            if ((response.status >= 200 && response.status < 300) || (response.status === 0 && response.responseText)) {
+              task.end('请求完成', { status: response.status });
+              resolve(response.responseText);
+            } else fail(new Error('HTTP ' + response.status));
+          },
+          onerror: () => fail(new Error('网络请求失败')),
+          ontimeout: () => fail(new Error('Timeout'))
+        });
+      } catch (error) { fail(error); }
+    });
+  }
+
+  class RequestQueue {
+    constructor(concurrency = 4) { this.concurrency = concurrency; this.running = 0; this.queue = []; }
+    enqueue(task) {
+      return new Promise((resolve, reject) => {
+        this.queue.push({ task, resolve, reject });
+        diagnostics.scope('network').debug('queue.add', '请求进入队列', { waiting: this.queue.length, running: this.running });
+        this._deq();
+      });
+    }
+    _deq() {
+      if (this.running >= this.concurrency) return;
+      const job = this.queue.shift();
+      if (!job) return;
+      this.running++;
+      Promise.resolve().then(job.task).then(job.resolve).catch(job.reject).finally(() => { this.running--; this._deq(); });
+    }
+  }
+  const requestQueue = new RequestQueue(4);
 
   // ---- styles.js ----
   function addStyle() {
@@ -245,7 +422,8 @@
       '<div class="sapx-field"><label class="sapx-check"><input class="sapx-checkbox" id="sse-family-auto" type="checkbox" />每隔 24 小时自动扫描家庭库</label></div>' +
       '<div class="sapx-field"><button class="sapx-btn sapx-btn-ghost" type="button" id="sse-family-open">管理家庭库：扫描、贡献统计与最近购入</button></div>' +
       '<div class="sapx-field"><label class="sapx-label" for="sse-convert-region">价格转换目标地区</label><select class="sapx-select" id="sse-convert-region"></select></div>' +
-      '<div class="sapx-field"><label class="sapx-label" for="sse-log">全局日志等级</label><select class="sapx-select" id="sse-log"><option>debug</option><option>info</option><option>warn</option><option>error</option><option>off</option></select></div>' +
+      '<div class="sapx-field"><label class="sapx-label" for="sse-log">日志等级</label><select class="sapx-select" id="sse-log"><option value="debug">debug · 全部步骤</option><option value="info">info · 运行概况</option><option value="warn">warn · 警告和错误</option><option value="error">error · 仅错误</option><option value="off">off · 关闭</option></select></div>' +
+      '<div class="sapx-field"><button class="sapx-btn sapx-btn-ghost" type="button" id="sse-copy-logs">复制诊断日志</button></div>' +
       '<details class="sapx-details" id="sapx-adv">' +
       '<summary>更多设置</summary>' +
       '<div class="sapx-field"><label class="sapx-label" for="sse-cart-language">购物车工具语言</label><select class="sapx-select" id="sse-cart-language"><option value="ZH">中文</option><option value="EN">English</option></select></div>' +
@@ -276,13 +454,25 @@
     root.querySelector('.sapx-close').addEventListener('click', close);
     root.querySelector('#sapx-cancel').addEventListener('click', close);
     root.querySelector('#sse-family-open').addEventListener('click', () => { close(); familyLibrary.open(); });
+    root.querySelector('#sse-copy-logs').addEventListener('click', async () => {
+      const log = diagnostics.scope('settings');
+      try {
+        await GM_setClipboard(JSON.stringify({ level: diagnostics.getLevel(), records: diagnostics.records() }, null, 2), 'text');
+        log.info('diagnostics.copy', '已复制当前页面最近的诊断日志');
+        root.querySelector('#sse-copy-logs').textContent = '已复制';
+      } catch (error) {
+        log.error('diagnostics.copy', '复制诊断日志失败', { error });
+        root.querySelector('#sapx-adv').open = true;
+        root.querySelector('#sse-error').textContent = '日志复制失败，请重试。';
+      }
+    });
     window.addEventListener('keydown', (e) => { if (e.key === 'Escape' && root.classList.contains('sapx-open')) close(); }, { passive: true });
     return root;
   }
 
   function openSettingsUI() {
-    const log = createLogger('设置');
-    log.debug('打开设置');
+    const log = diagnostics.scope('settings');
+    log.debug('panel.open', '打开设置', { level: diagnostics.getLevel() });
     const root = ensureSettingsUI();
     const select = root.querySelector('#sapx-region-select');
     const showCode = root.querySelector('#sapx-show-code');
@@ -314,7 +504,8 @@
     field('custom-enabled').checked = settings.useCustomRate;
     field('rate').value = settings.customRate;
     field('disable-market').checked = settings.disableOnMarket;
-    field('log').value = settings.logLevel;
+    field('log').value = diagnostics.getLevel();
+    field('copy-logs').textContent = '复制诊断日志';
     field('error').textContent = '';
     field('rate').disabled = !field('custom-enabled').checked;
     field('custom-enabled').onchange = () => { field('rate').disabled = !field('custom-enabled').checked; };
@@ -322,71 +513,47 @@
       const hours = Number(field('cache-hours').value);
       const rate = Number(field('rate').value);
       if (!Number.isFinite(hours) || hours <= 0 || (field('custom-enabled').checked && (!Number.isFinite(rate) || rate <= 0))) {
+        log.warn('save.validate', '设置校验失败', { hours, customRateEnabled: field('custom-enabled').checked, rate });
         adv.open = true;
         field('error').textContent = '缓存有效期和启用后的自定义汇率必须为大于 0 的数字。';
         return;
       }
-      conversion.save({ ...settings,
-        countyCode: field('convert-region').value,
-        currencySymbol: field('symbol').value,
-        currencySymbolBeforeValue: field('position').value === 'before',
-        rateCacheExpired: hours * 3600000,
-        useCustomRate: field('custom-enabled').checked,
-        customRate: Number.isFinite(rate) && rate > 0 ? rate : settings.customRate,
-        disableOnMarket: field('disable-market').checked,
-        logLevel: field('log').value
-      });
-      GM_setValue('sse_extra_enabled', field('extra-enabled').checked);
-      GM_setValue('sse_convert_enabled', field('convert-enabled').checked);
-      GM_setValue('sse_cart_enabled', field('cart-enabled').checked);
-      GM_setValue('sse_family_enabled', field('family-enabled').checked);
-      GM_setValue('sse_family_auto', field('family-auto').checked);
-      GM_setValue('sse_cart_language', field('cart-language').value);
-      GM_setValue('sse_cart_country', field('cart-country').checked);
-      GM_setValue(STORAGE_KEY_REGION_ID, select.value);
-      GM_setValue(STORAGE_KEY_SHOW_CODE, Boolean(showCode.checked));
-      log.info('设置已保存，准备刷新页面');
-      location.reload();
+      const logLevel = field('log').value;
+      try {
+        diagnostics.setLevel(logLevel);
+        conversion.save({ ...settings,
+          countyCode: field('convert-region').value,
+          currencySymbol: field('symbol').value,
+          currencySymbolBeforeValue: field('position').value === 'before',
+          rateCacheExpired: hours * 3600000,
+          useCustomRate: field('custom-enabled').checked,
+          customRate: Number.isFinite(rate) && rate > 0 ? rate : settings.customRate,
+          disableOnMarket: field('disable-market').checked
+        });
+        GM_setValue('sse_extra_enabled', field('extra-enabled').checked);
+        GM_setValue('sse_convert_enabled', field('convert-enabled').checked);
+        GM_setValue('sse_cart_enabled', field('cart-enabled').checked);
+        GM_setValue('sse_family_enabled', field('family-enabled').checked);
+        GM_setValue('sse_family_auto', field('family-auto').checked);
+        GM_setValue('sse_cart_language', field('cart-language').value);
+        GM_setValue('sse_cart_country', field('cart-country').checked);
+        GM_setValue(STORAGE_KEY_REGION_ID, select.value);
+        GM_setValue(STORAGE_KEY_SHOW_CODE, Boolean(showCode.checked));
+        log.info('save.complete', '设置已保存，准备刷新页面', { level: diagnostics.getLevel() });
+        log.debug('save.logging', '调试日志已启用');
+        location.reload();
+      } catch (error) {
+        log.error('save.failed', '保存设置失败', { error });
+        adv.open = true;
+        field('error').textContent = '保存失败，请重试。';
+      }
     };
     root.classList.add('sapx-open');
     select.focus();
   }
 
   // ---- regional-prices.js ----
-  function gmGet(url) {
-    return new Promise((resolve, reject) => {
-      GM_xmlhttpRequest({
-        method: 'GET',
-        url,
-        timeout: 20000,
-        onload: (res) => {
-          if ((res.status >= 200 && res.status < 300) || (res.status === 0 && res.responseText)) resolve(res.responseText);
-          else reject(new Error('HTTP ' + res.status));
-        },
-        onerror: reject,
-        ontimeout: () => reject(new Error('Timeout'))
-      });
-    });
-  }
-
-  class RequestQueue {
-    constructor(concurrency = 4) { this.concurrency = concurrency; this.running = 0; this.queue = []; }
-    enqueue(task) {
-      return new Promise((resolve, reject) => {
-        this.queue.push({ task, resolve, reject });
-        this._deq();
-      });
-    }
-    _deq() {
-      if (this.running >= this.concurrency) return;
-      const job = this.queue.shift();
-      if (!job) return;
-      this.running++;
-      Promise.resolve().then(job.task).then(job.resolve).catch(job.reject).finally(() => { this.running--; this._deq(); });
-    }
-  }
-
-  const requestQueue = new RequestQueue(4);
+  const regionalLog = diagnostics.scope('regional-prices');
   const currencyDigitsCache = new Map();
 
   function getCurrencyFractionDigits(currency) {
@@ -479,7 +646,7 @@
           }
         }
       }
-    } catch (e) {}
+    } catch (error) { regionalLog.debug('package.fallback', '套餐接口失败，尝试备用接口', { packageid, cc, error }); }
 
     try {
       const url = 'https://store.steampowered.com/api/packagedetails?packageids=' + packageid + '&cc=' + cc;
@@ -498,6 +665,7 @@
         discountPercent: p.discount_percent
       });
     } catch (e) {
+      regionalLog.debug('package.unavailable', '备用套餐接口失败', { packageid, cc, error: e });
       return null;
     }
   }
@@ -547,18 +715,19 @@
 
   function getPriceForItem(item, region) {
     const key = item.type + ':' + item.id + ':' + region.id;
-    if (pendingPrices.has(key)) return pendingPrices.get(key);
+    if (pendingPrices.has(key)) { regionalLog.debug('price.join', '复用进行中的价格查询', { item: key }); return pendingPrices.get(key); }
     const pending = fetchPriceForItem(item, region).finally(() => pendingPrices.delete(key));
     pendingPrices.set(key, pending);
     return pending;
   }
 
   async function fetchPriceForItem(item, region) {
-    const log = createLogger('地区价格');
     const key = item.type + ':' + item.id + ':' + region.id;
     const cached = cacheGet(key);
-    if (cached !== undefined) { log.debug('命中价格缓存', { item: key }); return cached; }
+    if (cached !== undefined) { regionalLog.debug('cache.hit', '命中价格缓存', { item: key }); return cached; }
+    const task = regionalLog.begin('price.fetch', { item: key });
     for (const cc of region.ccCandidates) {
+      task.debug('candidate', '读取候选地区', { cc });
       try {
         let res = null;
         if (item.type === 'app') res = await getAppPrice(item.id, cc, region.currency);
@@ -567,14 +736,14 @@
         if (res && res.ok) {
           if (item.type === 'bundle' || !res.currency || res.currency === region.currency) {
             cacheSet(key, res);
-            log.debug('地区价格读取成功', { item: key, country: cc });
+            task.end('地区价格读取成功', { item: key, country: cc });
             return res;
           }
         }
-      } catch (e) { log.debug('候选地区价格读取失败', { item: key, country: cc, message: e.message }); }
+      } catch (error) { task.debug('candidate.failed', '候选地区价格读取失败', { item: key, country: cc, error }); }
     }
     cacheSet(key, null);
-    log.debug('没有可用地区价格', { item: key });
+    task.end('没有可用地区价格', { item: key, available: false });
     return null;
   }
 
@@ -761,6 +930,7 @@
     if (!priceEl.isConnected) return;
     if (!price || !price.ok) {
       markRegionLocked(priceEl, region);
+      regionalLog.debug('render.locked', '标记地区不可用', { item, region: region.id });
       return;
     }
     priceEl.querySelector('.sapx-region-locked')?.remove();
@@ -778,6 +948,7 @@
     if (!formatted) return;
 
     upsertExtraInside(priceEl, region, formatted);
+    regionalLog.debug('render.price', '地区价格已显示', { item, region: region.id, kind: wantInitial ? 'initial' : 'final' });
   }
 
   async function updateCartSummary() {
@@ -790,7 +961,7 @@
     const totalRow = totalValue?.closest('._1mIUrXeHG3k-') || Array.from(document.querySelectorAll('.i1XZFikuzME- > div'))
       .find(row => /预计总额/.test(row.textContent));
     if (!items.length || !totalRow) {
-      createLogger('地区价格').debug('购物车汇总等待页面节点', { items: items.length, totalRow: Boolean(totalRow) });
+      regionalLog.debug('summary.wait', '购物车汇总等待页面节点', { items: items.length, totalRow: Boolean(totalRow) });
       scheduleCartSummaryRetry();
       return;
     }
@@ -819,7 +990,7 @@
     let html = '<div class="sapx-row"><div class="sapx-label">' + label + '：</div><div class="sapx-value">' + totalText + '</div></div>';
     if (missingCount > 0) html += '<div class="sapx-warn">目标地区有 ' + missingCount + ' 款锁区游戏，未计入小计</div>';
     if (box.innerHTML !== html) box.innerHTML = html;
-    createLogger('地区价格').info('购物车额外地区汇总完成', {
+    regionalLog.debug('summary.complete', '购物车额外地区汇总完成', {
       region: region.id,
       total: totalText,
       items: items.length,
@@ -914,14 +1085,16 @@
     if (scanTimer) return;
     scanTimer = setTimeout(() => {
       scanTimer = null;
-      document.querySelectorAll(PRICE_SELECTORS).forEach(el => { enhancePriceElement(el); });
+      const elements = document.querySelectorAll(PRICE_SELECTORS);
+      regionalLog.debug('scan.start', '扫描价格节点', { count: elements.length });
+      elements.forEach(el => { enhancePriceElement(el); });
       if (isWishlistPage()) scanWishlistFallback();
       if (isCartPage()) { scanCartFallback(); updateCartSummary(); }
     }, 450);
   }
 
   function startObserver() {
-    createLogger('地区价格').info('地区价格扫描与动态监听已启用');
+    regionalLog.info('observer.ready', '地区价格扫描与动态监听已启用');
     const obs = new MutationObserver(mutations => {
       if (mutations.some(mutation => !mutation.target.parentElement?.closest('#' + UI_ROOT_ID + ', .' + EXTRA_CLASS + ', #' + CART_SUMMARY_ID) &&
           !(mutation.target.nodeType === 1 && mutation.target.closest('#' + UI_ROOT_ID + ', .' + EXTRA_CLASS + ', #' + CART_SUMMARY_ID)))) scheduleScan();
@@ -929,7 +1102,263 @@
     obs.observe(document.body, { childList: true, subtree: true, characterData: true });
   }
 
-  // ---- conversion.js ----
+  // ---- conversion/settings.js ----
+  function createConversionSettings({ Jsons, countyCode2Info }) {
+    const log = diagnostics.scope('conversion.settings');
+    const STORAGE_KEY_SETTING = 'Storage:Setting';
+    class Setting {
+      countyCode = 'CN';
+      currencySymbol = '￥';
+      currencySymbolBeforeValue = true;
+      rateCacheExpired = 3600000;
+      useCustomRate = false;
+      customRate = 1;
+      oldVersion = '0.0.0';
+      currVersion = '0.0.0';
+      disableOnMarket = false;
+    }
+    const storage = {
+      getObjValue(cls, key, fallback) {
+        const value = GM_getValue(key);
+        if (!value) return fallback;
+        return Jsons.readJson(typeof value === 'string' ? JSON.parse(value) : value, cls);
+      },
+      setObjValue(key, value) { GM_setValue(key, Jsons.toString(value)); },
+      deleteValue(key) { GM_deleteValue(key); }
+    };
+    class SettingManager {
+      constructor() { this.setting = this.loadSetting(); }
+      loadSetting() {
+        const setting = storage.getObjValue(Setting, STORAGE_KEY_SETTING, new Setting());
+        delete setting.logLevel;
+        setting.oldVersion = setting.currVersion;
+        setting.currVersion = GM_info.script.version;
+        if (setting.oldVersion === setting.currVersion) {
+          log.debug('load', '读取转换设置', setting);
+        } else {
+          log.debug('version', '更新设置版本', { previous: setting.oldVersion, current: setting.currVersion });
+          this.saveSetting(setting);
+        }
+        return setting;
+      }
+      saveSetting(setting) {
+        delete setting.logLevel;
+        this.setting = setting;
+        storage.setObjValue(STORAGE_KEY_SETTING, setting);
+        log.debug('save', '转换设置已保存', setting);
+      }
+      setCountyCode(code) {
+        if (!countyCode2Info.has(code)) throw Error(`国家代码不存在：${code}`);
+        this.setting.countyCode = code;
+        this.saveSetting(this.setting);
+      }
+      setCurrencySymbol(value) { this.setting.currencySymbol = value; this.saveSetting(this.setting); }
+      setCurrencySymbolBeforeValue(value) { this.setting.currencySymbolBeforeValue = value; this.saveSetting(this.setting); }
+      setRateCacheExpired(value) { this.setting.rateCacheExpired = value; this.saveSetting(this.setting); }
+      setUseCustomRate(value) { this.setting.useCustomRate = value; this.saveSetting(this.setting); }
+      setCustomRate(value) { this.setting.customRate = value; this.saveSetting(this.setting); }
+      reset() { this.saveSetting(new Setting()); }
+    }
+    SettingManager.instance = new SettingManager();
+    return { SettingManager, storage };
+  }
+
+  // ---- conversion/rates.js ----
+  function createRateService({ storage, getContext, fetchRates }) {
+    const log = diagnostics.scope('conversion.rates');
+    const cacheKey = 'Storage:RateCache';
+    class RateCaches {
+      caches = new Map();
+      getCache(from, to) { return this.caches.get(`${from}:${to}`); }
+      setCache(cache) { this.caches.set(`${cache.from}:${cache.to}`, cache); }
+    }
+    class RateManager {
+      memoryCache = null;
+      pendingRequests = new Map();
+      isBroken = false;
+      async getRate4Remote(from, to) {
+        const task = log.begin('fetch', { from, to });
+        try {
+          const response = await fetchRates(from);
+          const rate = response.get(to)?.[from];
+          if (!rate) throw new Error(`汇率接口没有返回有效币种对：${from} -> ${to}`);
+          task.end('汇率读取成功', { rate });
+          return rate;
+        } catch (error) { task.fail(error); throw error; }
+      }
+      async getRate(source, target) {
+        if (this.isBroken) throw new Error('汇率服务已熔断，停止请求');
+        const context = getContext();
+        const from = source || context.currentCountyInfo.currencyCode;
+        const to = target || context.targetCountyInfo.currencyCode;
+        const key = `${from}:${to}`;
+        if (this.pendingRequests.has(key)) {
+          log.debug('join', '复用进行中的汇率查询', { from, to });
+          return this.pendingRequests.get(key);
+        }
+        const request = (async () => {
+          if (!this.memoryCache) {
+            this.memoryCache = this.loadRateCache();
+            log.debug('cache.load', '汇率缓存已加载', { size: this.memoryCache.caches.size });
+          }
+          let cache = this.memoryCache.getCache(from, to);
+          const now = Date.now();
+          if (!cache?.rate || now > cache.createdAt + context.setting.rateCacheExpired) {
+            log.debug('cache.miss', '汇率缓存缺失或过期', { from, to });
+            try {
+              const rate = await this.getRate4Remote(from, to);
+              cache = { from, to, rate, createdAt: now };
+              this.memoryCache.setCache(cache);
+              this.saveRateCache();
+            } catch (error) {
+              if (cache?.rate) {
+                log.warn('cache.stale', '远程刷新失败，使用旧汇率缓存', { from, to, error });
+                return cache.rate;
+              }
+              this.isBroken = true;
+              log.error('breaker', '汇率不可用，停止后续远程请求', { from, to, error });
+              throw error;
+            }
+          } else log.debug('cache.hit', '命中汇率缓存', { from, to });
+          return cache.rate;
+        })();
+        this.pendingRequests.set(key, request);
+        try { return await request; }
+        finally { this.pendingRequests.delete(key); }
+      }
+      loadRateCache() {
+        const setting = getContext().setting;
+        if (setting.oldVersion !== setting.currVersion) {
+          log.debug('cache.invalidate', '版本变化，刷新汇率缓存');
+          this.clear();
+          return new RateCaches();
+        }
+        return storage.getObjValue(RateCaches, cacheKey, new RateCaches());
+      }
+      saveRateCache() {
+        if (!this.memoryCache) return;
+        storage.setObjValue(cacheKey, this.memoryCache);
+        log.debug('cache.save', '汇率缓存已保存', { size: this.memoryCache.caches.size });
+      }
+      clear() {
+        this.memoryCache = null;
+        storage.deleteValue(cacheKey);
+        log.info('cache.clear', '汇率缓存已清除');
+      }
+    }
+    return new RateManager();
+  }
+
+  // ---- conversion/price-processor.js ----
+  function createPriceProcessor({ countries, countryMap, getSetting, getContext, getRate, isCart }) {
+    const log = diagnostics.scope('conversion.prices');
+    const escapeRegex = value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const separators = [...new Set(countries.flatMap(country => [country.decimalSep, country.thousandsSep].filter(Boolean)))];
+    const numberPattern = new RegExp(`\\d[\\d${separators.map(value => value === ' ' ? '\\s' : escapeRegex(value)).join('')}]*\\d|\\d`, 'g');
+    const rules = [...countries].sort((a, b) => b.symbol.length - a.symbol.length ||
+      Number(a.fractionDigits === 0) - Number(b.fractionDigits === 0) || a.currencyCode.localeCompare(b.currencyCode));
+
+    function symbolRange(text, start, end, rule, relaxed) {
+      if (rule.symbolPos === 'front') {
+        let cursor = start;
+        if (relaxed) while (cursor > 0 && /\s/.test(text[cursor - 1])) cursor--;
+        const prefix = rule.symbol + (relaxed ? '' : rule.symbolGap);
+        const left = cursor - prefix.length;
+        if (left < 0 || text.substring(left, cursor).toUpperCase() !== prefix.toUpperCase()) return null;
+        return { start: left, end };
+      }
+      let cursor = end;
+      if (relaxed) while (cursor < text.length && /\s/.test(text[cursor])) cursor++;
+      const suffix = (relaxed ? '' : rule.symbolGap) + rule.symbol;
+      const right = cursor + suffix.length;
+      if (right > text.length || text.substring(cursor, right).toUpperCase() !== suffix.toUpperCase()) return null;
+      return { start, end: right };
+    }
+    function validNumber(value, rule) {
+      const found = new Set(value.replace(/\d/g, '').split('').filter(Boolean).map(char => /\s/.test(char) ? ' ' : char));
+      for (const separator of found) {
+        if (separator !== rule.thousandsSep && separator !== rule.decimalSep) return false;
+      }
+      return !(rule.fractionDigits === 0 && rule.decimalSep && found.has(rule.decimalSep));
+    }
+    function parseNumber(value, rule) {
+      let clean = rule.thousandsSep ? value.split(rule.thousandsSep).join('') : value;
+      if (rule.decimalSep && rule.decimalSep !== '.') clean = clean.replace(rule.decimalSep, '.');
+      const number = parseFloat(clean);
+      return Number.isNaN(number) ? null : number;
+    }
+    function matchRule(text, number, start, end, rule, matches, fallback) {
+      const range = symbolRange(text, start, end, rule, false);
+      const value = parseNumber(number, rule);
+      const candidate = bounds => ({ index: bounds.start, length: bounds.end - bounds.start,
+        value, info: rule, raw: text.substring(bounds.start, bounds.end) });
+      if (range && validNumber(number, rule) && value !== null) {
+        matches.push(candidate(range));
+        return true;
+      }
+      if (!fallback.candidate) {
+        const relaxed = symbolRange(text, start, end, rule, true);
+        if (relaxed && value !== null) fallback.candidate = candidate(relaxed);
+      }
+      return false;
+    }
+    async function processTextAsync(text, countryCode, targetSymbol, before, sourceCode) {
+      if (!/\d/.test(text)) return text;
+      const currentRule = countries.find(country => country.code === sourceCode);
+      const cart = isCart();
+      const otherRules = rules.filter(country => country.code !== sourceCode &&
+        (cart || (country.code !== countryCode && country.currencyCode !== countryMap.get(countryCode)?.currencyCode)));
+      const matches = [];
+      for (const number of text.matchAll(numberPattern)) {
+        const start = number.index;
+        const end = start + number[0].length;
+        const fallback = { candidate: null };
+        let matched = currentRule && currentRule.code !== countryCode &&
+          matchRule(text, number[0], start, end, currentRule, matches, fallback);
+        if (!matched) {
+          for (const rule of otherRules) {
+            if (matchRule(text, number[0], start, end, rule, matches, fallback)) { matched = true; break; }
+          }
+        }
+        if (!matched && fallback.candidate) matches.push(fallback.candidate);
+      }
+      if (!matches.length) return text;
+      const currencies = [...new Set(matches.map(match => match.info.currencyCode))];
+      const rates = new Map();
+      const setting = getContext().setting;
+      if (setting.useCustomRate) {
+        log.debug('custom-rate', '使用自定义汇率', { rate: setting.customRate });
+        currencies.forEach(code => rates.set(code, setting.customRate));
+      } else {
+        await Promise.all(currencies.map(async code => {
+          try { rates.set(code, await getRate(code)); }
+          catch (error) { log.error('rate-failed', '价格所需汇率不可用', { currency: code, error }); }
+        }));
+      }
+      let result = text;
+      let convertedCount = 0;
+      for (const match of matches.sort((a, b) => b.index - a.index)) {
+        const rate = rates.get(match.info.currencyCode);
+        if (!rate) continue;
+        const converted = Number.parseFloat((match.value / rate).toFixed(2));
+        const formatted = before ? `(${targetSymbol}${converted})` : `(${converted}${targetSymbol})`;
+        result = result.substring(0, match.index) + match.raw + formatted + result.substring(match.index + match.length);
+        convertedCount++;
+      }
+      log.debug('converted', '价格文本处理完成', { matched: matches.length, converted: convertedCount, currencies });
+      return result;
+    }
+    return {
+      processTextAsync,
+      convertContent(text) {
+        const setting = getSetting();
+        return processTextAsync(text, setting.countyCode, setting.currencySymbol,
+          setting.currencySymbolBeforeValue, getContext().currentCountyInfo.code);
+      }
+    };
+  }
+
+  // ---- conversion/index.js ----
   const conversion = (() => {
   const countyObjs = JSON.parse('[{"code":"US","currencyCode":"USD","name":"美国","nameEn":"United States","symbol":"$","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"front","symbolGap":""},{"code":"CN","currencyCode":"CNY","name":"中国","nameEn":"China","symbol":"¥","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"front","symbolGap":""},{"code":"JP","currencyCode":"JPY","name":"日本","nameEn":"Japan","symbol":"¥","decimalSep":null,"thousandsSep":",","fractionDigits":0,"symbolPos":"front","symbolGap":""},{"code":"DE","currencyCode":"EUR","name":"德国","nameEn":"Germany","symbol":"€","decimalSep":",","thousandsSep":" ","fractionDigits":2,"symbolPos":"end","symbolGap":""},{"code":"RU","currencyCode":"RUB","name":"俄罗斯","nameEn":"Russia","symbol":"руб","decimalSep":",","thousandsSep":".","fractionDigits":2,"symbolPos":"end","symbolGap":" "},{"code":"PL","currencyCode":"PLN","name":"波兰","nameEn":"Poland","symbol":"zł","decimalSep":",","thousandsSep":" ","fractionDigits":2,"symbolPos":"end","symbolGap":" "},{"code":"BR","currencyCode":"BRL","name":"巴西","nameEn":"Brazil","symbol":"R$","decimalSep":",","thousandsSep":".","fractionDigits":2,"symbolPos":"front","symbolGap":""},{"code":"VN","currencyCode":"VND","name":"越南","nameEn":"Vietnam","symbol":"₫","decimalSep":null,"thousandsSep":".","fractionDigits":0,"symbolPos":"end","symbolGap":""},{"code":"KR","currencyCode":"KRW","name":"韩国","nameEn":"South Korea","symbol":"₩","decimalSep":null,"thousandsSep":",","fractionDigits":0,"symbolPos":"front","symbolGap":" "},{"code":"ID","currencyCode":"IDR","name":"印度尼西亚","nameEn":"Indonesia","symbol":"Rp","decimalSep":null,"thousandsSep":" ","fractionDigits":0,"symbolPos":"front","symbolGap":" "},{"code":"TW","currencyCode":"TWD","name":"中国台湾","nameEn":"Taiwan","symbol":"NT$","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"front","symbolGap":" "},{"code":"HK","currencyCode":"HKD","name":"中国香港","nameEn":"Hong Kong","symbol":"HK$","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"front","symbolGap":" "},{"code":"UA","currencyCode":"UAH","name":"乌克兰","nameEn":"Ukraine","symbol":"₴","decimalSep":",","thousandsSep":" ","fractionDigits":2,"symbolPos":"end","symbolGap":""},{"code":"KZ","currencyCode":"KZT","name":"哈萨克斯坦","nameEn":"Kazakhstan","symbol":"₸","decimalSep":",","thousandsSep":" ","fractionDigits":2,"symbolPos":"end","symbolGap":""},{"code":"GB","currencyCode":"GBP","name":"英国","nameEn":"United Kingdom","symbol":"£","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"front","symbolGap":""},{"code":"CH","currencyCode":"CHF","name":"瑞士","nameEn":"Switzerland","symbol":"CHF","decimalSep":".","thousandsSep":" ","fractionDigits":2,"symbolPos":"front","symbolGap":" "},{"code":"NO","currencyCode":"NOK","name":"挪威","nameEn":"Norway","symbol":"kr","decimalSep":",","thousandsSep":".","fractionDigits":2,"symbolPos":"end","symbolGap":" "},{"code":"TH","currencyCode":"THB","name":"泰国","nameEn":"Thailand","symbol":"฿","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"front","symbolGap":""},{"code":"PH","currencyCode":"PHP","name":"菲律宾","nameEn":"Philippines","symbol":"₱","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"front","symbolGap":""},{"code":"SG","currencyCode":"SGD","name":"新加坡","nameEn":"Singapore","symbol":"S$","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"front","symbolGap":""},{"code":"MY","currencyCode":"MYR","name":"马来西亚","nameEn":"Malaysia","symbol":"RM","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"front","symbolGap":""},{"code":"MX","currencyCode":"MXN","name":"墨西哥","nameEn":"Mexico","symbol":"Mex$","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"front","symbolGap":" "},{"code":"CA","currencyCode":"CAD","name":"加拿大","nameEn":"Canada","symbol":"C$","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"front","symbolGap":" "},{"code":"AU","currencyCode":"AUD","name":"澳大利亚","nameEn":"Australia","symbol":"A$","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"front","symbolGap":" "},{"code":"NZ","currencyCode":"NZD","name":"新西兰","nameEn":"New Zealand","symbol":"NZ$","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"front","symbolGap":" "},{"code":"IN","currencyCode":"INR","name":"印度","nameEn":"India","symbol":"₹","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"front","symbolGap":""},{"code":"CL","currencyCode":"CLP","name":"智利","nameEn":"Chile","symbol":"CLP$","decimalSep":null,"thousandsSep":".","fractionDigits":0,"symbolPos":"front","symbolGap":""},{"code":"PE","currencyCode":"PEN","name":"秘鲁","nameEn":"Peru","symbol":"S/.","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"front","symbolGap":" "},{"code":"CO","currencyCode":"COP","name":"哥伦比亚","nameEn":"Colombia","symbol":"COL$","decimalSep":",","thousandsSep":".","fractionDigits":2,"symbolPos":"front","symbolGap":" "},{"code":"ZA","currencyCode":"ZAR","name":"南非","nameEn":"South Africa","symbol":"R","decimalSep":".","thousandsSep":" ","fractionDigits":2,"symbolPos":"front","symbolGap":" "},{"code":"SA","currencyCode":"SAR","name":"沙特阿拉伯","nameEn":"Saudi Arabia","symbol":"SR","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"end","symbolGap":" "},{"code":"AE","currencyCode":"AED","name":"阿联酋","nameEn":"United Arab Emirates","symbol":"AED","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"end","symbolGap":" "},{"code":"IL","currencyCode":"ILS","name":"以色列","nameEn":"Israel","symbol":"₪","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"front","symbolGap":""},{"code":"KW","currencyCode":"KWD","name":"科威特","nameEn":"Kuwait","symbol":"KD","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"end","symbolGap":" "},{"code":"QA","currencyCode":"QAR","name":"卡塔尔","nameEn":"Qatar","symbol":"QR","decimalSep":".","thousandsSep":",","fractionDigits":2,"symbolPos":"end","symbolGap":" "},{"code":"CR","currencyCode":"CRC","name":"哥斯达黎加","nameEn":"Costa Rica","symbol":"₡","decimalSep":",","thousandsSep":".","fractionDigits":2,"symbolPos":"front","symbolGap":""},{"code":"UY","currencyCode":"UYU","name":"乌拉圭","nameEn":"Uruguay","symbol":"$U","decimalSep":",","thousandsSep":".","fractionDigits":2,"symbolPos":"front","symbolGap":""}]');
   class Jsons {
@@ -1024,116 +1453,14 @@ static readString(jsonString, cls) {
   }
   const countyInfos = Jsons.readJson(countyObjs, Array).sort((a, b) => a.name.localeCompare(b.name));
   const countyCode2Info = new Map(countyInfos.map((v) => [v.code, v]));
-  class Setting {
-countyCode = "CN";
-currencySymbol = "￥";
-currencySymbolBeforeValue = true;
-rateCacheExpired = 1e3 * 60 * 60;
-useCustomRate = false;
-customRate = 1;
-oldVersion = "0.0.0";
-currVersion = "0.0.0";
-logLevel = "info";
-disableOnMarket = false;
-  }
-  const STORAGE_KEY_PREFIX = "Storage:";
-  const STORAGE_KEY_RATE_CACHES = STORAGE_KEY_PREFIX + "RateCache";
-  const STORAGE_KEY_SETTING = STORAGE_KEY_PREFIX + "Setting";
+  const { SettingManager, storage: GmUtils } = createConversionSettings({ Jsons, countyCode2Info });
   class Attrs {
     static STATUS_KEY = "data-spc-status";
   }
   var _GM_cookie = (() => typeof GM_cookie != "undefined" ? GM_cookie : void 0)();
-  var _GM_deleteValue = (() => typeof GM_deleteValue != "undefined" ? GM_deleteValue : void 0)();
-  var _GM_getValue = (() => typeof GM_getValue != "undefined" ? GM_getValue : void 0)();
-  var _GM_info = (() => typeof GM_info != "undefined" ? GM_info : void 0)();
-  var _GM_setValue = (() => typeof GM_setValue != "undefined" ? GM_setValue : void 0)();
   var _GM_xmlhttpRequest = (() => typeof GM_xmlhttpRequest != "undefined" ? GM_xmlhttpRequest : void 0)();
   var _unsafeWindow = (() => typeof unsafeWindow != "undefined" ? unsafeWindow : void 0)();
-  const Logger = createLogger('汇率转换');
-  class Strings {
-    static format(format, ...args) {
-      args = args || [];
-      let message = format;
-      for (let arg of args) {
-        message = message.replace("%s", arg);
-      }
-      return message;
-    }
-  }
-  class GmUtils {
-    static getSimpleValue(key, defaultValue) {
-      const value = _GM_getValue(key);
-      return value || defaultValue;
-    }
-    static getObjValue(cls, key, defaultValue) {
-      const value = _GM_getValue(key);
-      return value ? Jsons.readString(value, cls) : defaultValue;
-    }
-    static setSimpleValue(key, value) {
-      _GM_setValue(key, value);
-    }
-    static setObjValue(key, value) {
-      _GM_setValue(key, Jsons.toString(value));
-    }
-    static deleteValue(key) {
-      _GM_deleteValue(key);
-    }
-  }
-  class SettingManager {
-    static instance = new SettingManager();
-    setting;
-    constructor() {
-      this.setting = this.loadSetting();
-    }
-    loadSetting() {
-      const setting = GmUtils.getObjValue(Setting, STORAGE_KEY_SETTING, new Setting());
-      setting.oldVersion = setting.currVersion;
-      setting.currVersion = _GM_info.script.version;
-      if (setting.oldVersion === setting.currVersion) {
-        Logger.info("读取设置", setting);
-      } else {
-        Logger.debug(Strings.format(`版本更新重置设置：%s -> %s`, setting.oldVersion, setting.currVersion));
-        this.saveSetting(setting);
-      }
-      return setting;
-    }
-saveSetting(setting) {
-      Logger.info("保存设置", setting);
-      this.setting = setting;
-      GmUtils.setObjValue(STORAGE_KEY_SETTING, setting);
-    }
-    setCountyCode(countyCode) {
-      const county = countyCode2Info.get(countyCode);
-      if (!county) {
-        throw Error(`国家代码不存在：${countyCode}`);
-      }
-      this.setting.countyCode = countyCode;
-      this.saveSetting(this.setting);
-    }
-    setCurrencySymbol(currencySymbol) {
-      this.setting.currencySymbol = currencySymbol;
-      this.saveSetting(this.setting);
-    }
-    setCurrencySymbolBeforeValue(isCurrencySymbolBeforeValue) {
-      this.setting.currencySymbolBeforeValue = isCurrencySymbolBeforeValue;
-      this.saveSetting(this.setting);
-    }
-    reset() {
-      this.saveSetting(new Setting());
-    }
-    setRateCacheExpired(rateCacheExpired) {
-      this.setting.rateCacheExpired = rateCacheExpired;
-      this.saveSetting(this.setting);
-    }
-    setUseCustomRate(isUseCustomRate) {
-      this.setting.useCustomRate = isUseCustomRate;
-      this.saveSetting(this.setting);
-    }
-    setCustomRate(customRate) {
-      this.setting.customRate = customRate;
-      this.saveSetting(this.setting);
-    }
-  }
+  const log = diagnostics.scope('conversion');
   class SpcContext {
     _setting;
     _targetCountyInfo;
@@ -1193,9 +1520,11 @@ saveSetting(setting) {
       return this.request(cls, details);
     }
     static request(cls, details) {
+      const task = diagnostics.scope('network').begin('conversion.request', { method: details.method });
       return new Promise((resolve, reject) => {
+        const fail = error => { task.fail(error); reject(error); };
         details.onload = (response) => {
-          if (response.status < 200 || response.status >= 300) { reject(new Error("HTTP " + response.status)); return; }
+          if (response.status < 200 || response.status >= 300) { fail(new Error("HTTP " + response.status)); return; }
           try {
           if (cls.name === String.name) {
             resolve(response.response);
@@ -1203,12 +1532,14 @@ saveSetting(setting) {
             const json = JSON.parse(response.response);
             resolve(Jsons.readJson(json, cls));
           }
-          } catch (error) { reject(error); }
+          task.end('转换模块请求完成', { status: response.status });
+          } catch (error) { fail(error); }
         };
         details.timeout = 20000;
-        details.ontimeout = () => reject(new Error("请求超时"));
-        details.onerror = (error) => reject(error);
-        _GM_xmlhttpRequest(details);
+        details.ontimeout = () => fail(new Error("请求超时"));
+        details.onerror = () => fail(new Error('网络请求失败'));
+        try { _GM_xmlhttpRequest(details); }
+        catch (error) { fail(error); }
       });
     }
   }
@@ -1233,7 +1564,7 @@ saveSetting(setting) {
           return countyCode;
         }
       } catch (e) {
-        Logger.warn("读取商店页面区域代码变量失败： " + e.message);
+        log.warn('country.page', '读取商店页面区域代码变量失败', { error: e });
       }
       const dataConfig = storeDom.querySelector("div#application_config")?.getAttribute("data-config");
       if (dataConfig) {
@@ -1277,7 +1608,7 @@ saveSetting(setting) {
           const code = _unsafeWindow.g_strCountryCode;
           if (code) return resolve(code);
         } catch (err) {
-          Logger.error(err);
+          log.debug('country.market', '读取市场区域失败', { error: err });
         }
         reject();
       });
@@ -1295,135 +1626,29 @@ saveSetting(setting) {
       ];
     }
     async getCountyCode() {
-      Logger.info("尝试获取区域代码");
+      const task = log.begin('country.resolve');
       for (let provider of this.providers) {
         if (!provider.match()) {
           continue;
         }
-        Logger.debug(`尝试通过[${provider.name()}]获取区域代码`);
+        task.debug('provider', '尝试区域来源', { provider: provider.name() });
         try {
           const countyCode = await provider.getCountyCode();
-          Logger.info(`通过[${provider.name()}]获取区域代码成功`);
+          task.end('区域读取成功', { provider: provider.name(), country: countyCode });
           return countyCode.toUpperCase();
         } catch (e) {
-          Logger.debug(`通过[${provider.name()}]获取区域代码失败`, e?.message || e);
+          task.debug('fallback', '尝试下一个区域来源', { provider: provider.name(), error: e });
         }
       }
-      throw new Error("所有获取区域代码策略都获取失败");
+      const error = new Error("所有获取区域代码策略都获取失败");
+      task.fail(error);
+      throw error;
     }
   }
-  class RateCache {
-    constructor(from, to, rate, createdAt) {
-      this.from = from;
-      this.to = to;
-      this.createdAt = createdAt || 0;
-      this.rate = rate || 0;
-    }
-    from;
-    to;
-    createdAt;
-    rate;
-  }
-  class RateCaches {
-    caches = new Map();
-    getCache(from, to) {
-      const key = this.buildCacheKey(from, to);
-      return this.caches.get(key);
-    }
-    setCache(cache) {
-      this.caches.set(this.buildCacheKey(cache.from, cache.to), cache);
-    }
-    buildCacheKey(from, to) {
-      return `${from}:${to}`;
-    }
-  }
-  class RateManager {
-    static instance = new RateManager();
-    memoryCache = null;
-    pendingRequests = new Map();
-    isBroken = false;
-constructor() {
-    }
-    getName() {
-      return "RateManager";
-    }
-    async getRate4Remote(sourceCurrency, targetCurrency) {
-      Logger.info(`[Rate] 远程获取汇率: ${sourceCurrency} -> ${targetCurrency}...`);
-      let rate;
-      const url = `https://api.augmentedsteam.com/rates/v1?to=${sourceCurrency}`;
-      try {
-        const res = await Http.get(Map, url);
-        rate = res.get(targetCurrency)?.[sourceCurrency];
-      } catch (e) {
-        Logger.error(`[Rate] 获取汇率对(${sourceCurrency} -> ${targetCurrency})失败`, e);
-      }
-      if (rate) return rate;
-      throw Error(`所有汇率获取实现对币种对(${sourceCurrency} -> ${targetCurrency})均失败`);
-    }
-    async getRate(sourceCurrencyCode, targetCurrencyCode) {
-      if (this.isBroken) {
-        throw new Error("[Rate] 汇率服务已熔断，停止请求");
-      }
-      const context = SpcContext.getContext();
-      const from = sourceCurrencyCode || context.currentCountyInfo.currencyCode;
-      const to = targetCurrencyCode || context.targetCountyInfo.currencyCode;
-      const cacheKey = `${from}:${to}`;
-      const pending = this.pendingRequests.get(cacheKey);
-      if (pending) return pending;
-      const requestPromise = (async () => {
-        try {
-          if (!this.memoryCache) {
-            this.memoryCache = this.loadRateCache();
-            Logger.info(`[Rate] 内存缓存加载:`, this.memoryCache);
-          }
-          let cache = this.memoryCache.getCache(from, to);
-          const now = Date.now();
-          const expired = context.setting.rateCacheExpired;
-          if (!cache || !cache.rate || now > cache.createdAt + expired) {
-            Logger.info(`[Rate] 缓存缺失或过期: ${from} -> ${to}`);
-            try {
-              const remoteRate = await this.getRate4Remote(from, to);
-              cache = new RateCache(from, to, remoteRate, now);
-              this.memoryCache.setCache(cache);
-              this.saveRateCache();
-            } catch (e) {
-              if (cache && cache.rate) {
-                Logger.warn(`[Rate] 远程刷新失败，回退至旧缓存: ${from} -> ${to}`);
-                return cache.rate;
-              }
-              this.isBroken = true;
-              Logger.error(`[Rate] 汇率获取彻底失败，触发全局熔断: ${from} -> ${to}`);
-              throw e;
-            }
-          }
-          return cache.rate;
-        } finally {
-          this.pendingRequests.delete(cacheKey);
-        }
-      })();
-      this.pendingRequests.set(cacheKey, requestPromise);
-      return requestPromise;
-    }
-    loadRateCache() {
-      const setting = SpcContext.getContext().setting;
-      if (setting.oldVersion !== setting.currVersion) {
-        Logger.info(`脚本版本发生变化需要刷新汇率缓存`);
-        this.clear();
-        return new RateCaches();
-      }
-      Logger.info(`读取汇率缓存`);
-      return GmUtils.getObjValue(RateCaches, STORAGE_KEY_RATE_CACHES, new RateCaches());
-    }
-    saveRateCache() {
-      if (!this.memoryCache) return;
-      Logger.info("保存汇率缓存", this.memoryCache);
-      GmUtils.setObjValue(STORAGE_KEY_RATE_CACHES, this.memoryCache);
-    }
-    clear() {
-      this.memoryCache = null;
-      GmUtils.deleteValue(STORAGE_KEY_RATE_CACHES);
-    }
-  }
+  const RateManager = { instance: createRateService({ storage: GmUtils,
+    getContext: () => SpcContext.getContext(),
+    fetchRates: from => Http.get(Map, `https://api.augmentedsteam.com/rates/v1?to=${from}`)
+  }) };
   class SpcManager {
     static instance = new SpcManager();
     constructor() {
@@ -1493,180 +1718,10 @@ afterConvert(elementSnap, result) {
       }
     }
   }
-  function escapeRegex(str) {
-    return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  }
-  const allSepChars = Array.from(new Set(
-    countyInfos.flatMap((c) => [c.decimalSep, c.thousandsSep].filter(Boolean))
-  )).map((s) => s === " " ? "\\s" : escapeRegex(s)).join("");
-  const NUMBER_BLOCK_REGEX = new RegExp(`\\d[\\d${allSepChars}]*\\d|\\d`, "g");
-  const SORTED_RULES_TEMPLATE = [...countyInfos].sort((a, b) => b.symbol.length - a.symbol.length || Number(a.fractionDigits === 0) - Number(b.fractionDigits === 0) || a.currencyCode.localeCompare(b.currencyCode));
-  function tryMatchSymbol(text, numStart, numEnd, info) {
-    if (info.symbolPos === "front") {
-      const prefix = info.symbol + info.symbolGap;
-      const start2 = numStart - prefix.length;
-      if (start2 < 0) return null;
-      const slice = text.substring(start2, numStart);
-      if (slice.toUpperCase() !== prefix.toUpperCase()) return null;
-      return { matchStart: start2, matchEnd: numEnd };
-    } else {
-      const suffix = info.symbolGap + info.symbol;
-      const end = numEnd + suffix.length;
-      if (end > text.length) return null;
-      const slice = text.substring(numEnd, end);
-      if (slice.toUpperCase() !== suffix.toUpperCase()) return null;
-      return { matchStart: numStart, matchEnd: end };
-    }
-  }
-  function tryMatchSymbolRelaxed(text, numStart, numEnd, info) {
-    if (info.symbolPos === "front") {
-      let cursor = numStart;
-      while (cursor > 0 && /\s/.test(text[cursor - 1])) cursor--;
-      const start2 = cursor - info.symbol.length;
-      if (start2 < 0) return null;
-      const slice = text.substring(start2, cursor);
-      if (slice.toUpperCase() !== info.symbol.toUpperCase()) return null;
-      return { matchStart: start2, matchEnd: numEnd };
-    } else {
-      let cursor = numEnd;
-      while (cursor < text.length && /\s/.test(text[cursor])) cursor++;
-      const end = cursor + info.symbol.length;
-      if (end > text.length) return null;
-      const slice = text.substring(cursor, end);
-      if (slice.toUpperCase() !== info.symbol.toUpperCase()) return null;
-      return { matchStart: numStart, matchEnd: end };
-    }
-  }
-  function validateNumberDNA(numStr, info) {
-    const seps = new Set(
-      numStr.replace(/\d/g, "").split("").filter(Boolean).map((s) => /\s/.test(s) ? " " : s)
-    );
-    for (const sep of seps) {
-      if (sep !== info.thousandsSep && sep !== info.decimalSep) {
-        return false;
-      }
-    }
-    if (info.fractionDigits === 0 && info.decimalSep && seps.has(info.decimalSep)) {
-      return false;
-    }
-    return true;
-  }
-  function parseNumber(numStr, info) {
-    let clean = numStr;
-    if (info.thousandsSep) {
-      clean = clean.split(info.thousandsSep).join("");
-    }
-    if (info.decimalSep && info.decimalSep !== ".") {
-      clean = clean.replace(info.decimalSep, ".");
-    }
-    const val = parseFloat(clean);
-    return isNaN(val) ? null : val;
-  }
-  class PriceProcessor {
-static async convertContent(text) {
-      const setting = SettingManager.instance.setting;
-      const targetCode = SpcContext.getContext().currentCountyInfo.code;
-      return await this.processTextAsync(
-        text,
-        setting.countyCode,
-        setting.currencySymbol,
-        setting.currencySymbolBeforeValue,
-        targetCode
-      );
-    }
-static async processTextAsync(text, countryCode, targetSymbol, isBefore, targetCode) {
-      if (!/\d/.test(text)) return text;
-      const currentRule = countyInfos.find((c) => c.code === targetCode);
-      const isCart = isCartPage();
-      const otherRules = SORTED_RULES_TEMPLATE.filter((c) => {
-        return c.code !== targetCode && (isCart || (c.code !== countryCode && c.currencyCode !== countyCode2Info.get(countryCode)?.currencyCode));
-      });
-      const matches = [];
-      for (const numMatch of text.matchAll(NUMBER_BLOCK_REGEX)) {
-        const numStr = numMatch[0];
-        const numStart = numMatch.index;
-        const numEnd = numStart + numStr.length;
-        let matched = false;
-        const relaxedOut = { candidate: null };
-        if (currentRule && currentRule.code !== countryCode) {
-          matched = this.tryRule(text, numStr, numStart, numEnd, currentRule, matches, relaxedOut);
-        }
-        if (!matched) {
-          for (const rule of otherRules) {
-            if (this.tryRule(text, numStr, numStart, numEnd, rule, matches, relaxedOut)) {
-              matched = true;
-              break;
-            }
-          }
-        }
-        if (!matched && relaxedOut.candidate) {
-          matches.push(relaxedOut.candidate);
-        }
-      }
-      if (matches.length === 0) return text;
-      const uniqueCurrencies = [...new Set(matches.map((m) => m.info.currencyCode))];
-      const rateMap = new Map();
-      let setting = SpcContext.getContext().setting;
-      if (setting.useCustomRate) {
-        Logger.info(`[PriceProcessor] 使用自定义汇率，当前自定义汇率为${setting.customRate}`);
-        uniqueCurrencies.forEach((code) => rateMap.set(code, setting.customRate));
-      } else {
-        await Promise.all(uniqueCurrencies.map(async (code) => {
-          try {
-            const rate = await RateManager.instance.getRate(code);
-            rateMap.set(code, rate);
-          } catch (e) {
-            Logger.error(`[PriceProcessor] 获取币种汇率失败: ${code}`, e);
-          }
-        }));
-      }
-      let result = text;
-      matches.sort((a, b) => b.index - a.index);
-      for (const m of matches) {
-        const rate = rateMap.get(m.info.currencyCode);
-        if (!rate) continue;
-        const converted = Number.parseFloat((m.value / rate).toFixed(2));
-        const formatted = isBefore ? `(${targetSymbol}${converted})` : `(${converted}${targetSymbol})`;
-        result = result.substring(0, m.index) + m.raw + formatted + result.substring(m.index + m.length);
-      }
-      Logger.debug(`[PriceProcessor] 转换成功，命中 ${matches.length} 处价格`);
-      return result;
-    }
-static tryRule(text, numStr, numStart, numEnd, info, matches, relaxedOut) {
-      const range = tryMatchSymbol(text, numStart, numEnd, info);
-      if (range && validateNumberDNA(numStr, info)) {
-        const value = parseNumber(numStr, info);
-        if (value !== null) {
-          const raw = text.substring(range.matchStart, range.matchEnd);
-          matches.push({
-            index: range.matchStart,
-            length: raw.length,
-            value,
-            info,
-            raw
-          });
-          return true;
-        }
-      }
-      if (relaxedOut && !relaxedOut.candidate) {
-        const relaxedRange = tryMatchSymbolRelaxed(text, numStart, numEnd, info);
-        if (relaxedRange) {
-          const value = parseNumber(numStr, info);
-          if (value !== null) {
-            const raw = text.substring(relaxedRange.matchStart, relaxedRange.matchEnd);
-            relaxedOut.candidate = {
-              index: relaxedRange.matchStart,
-              length: raw.length,
-              value,
-              info,
-              raw
-            };
-          }
-        }
-      }
-      return false;
-    }
-  }
+  const PriceProcessor = createPriceProcessor({ countries: countyInfos, countryMap: countyCode2Info,
+    getSetting: () => SettingManager.instance.setting, getContext: () => SpcContext.getContext(),
+    getRate: code => RateManager.instance.getRate(code), isCart: isCartPage
+  });
   class ElementConverter extends AbstractConverter {
     getCssSelectors() {
       const home = [
@@ -1826,7 +1881,7 @@ targets = new Map([
             return node;
           }
         } catch (e) {
-          Logger.debug("获取文本节点失败，但不确定该节点是否一定会出现。selector：" + selector);
+          log.debug('nodes.fallback', '文本节点路径不适用，尝试其他路径', { selector });
         }
       }
       return null;
@@ -1864,7 +1919,7 @@ targets = new Map([
                 converter.afterConvert(elementSnap, elementConverted);
               }
             } catch (e) {
-              Logger.error('价格转换失败', e.message, element);
+              log.error('nodes.convert-failed', '价格转换失败', { error: e, element });
             }
           })();
           tasks.push(task);
@@ -1874,36 +1929,41 @@ targets = new Map([
     }
   }
   async function initializeConversion() {
-    if (!GM_getValue("sse_convert_enabled", true)) return;
+    if (!GM_getValue("sse_convert_enabled", true)) { log.debug('initialize.skip', '价格转换已关闭'); return; }
+    const task = log.begin('initialize', undefined, 'info');
     try {
       // SSR text must stay intact until React has adopted the server-rendered cart.
       if (isCartPage() && _unsafeWindow.SSR) {
+        task.debug('hydrate.wait', '等待购物车页面接管服务端内容');
         const deadline = Date.now() + 15000;
         while (!_unsafeWindow.SSR.hydrated && Date.now() < deadline) {
           await new Promise(resolve => setTimeout(resolve, 100));
         }
+        task.debug('hydrate.ready', '结束页面就绪等待', { hydrated: Boolean(_unsafeWindow.SSR.hydrated) });
       }
       await initContext();
       await start();
+      task.end('价格转换初始化完成');
     }
-    catch (error) { Logger.error("价格转换初始化失败", error); }
+    catch (error) { task.fail(error); }
   }
   async function start() {
     const context = SpcContext.getContext();
     if (context.setting.disableOnMarket && window.location.href === "https://steamcommunity.com/market/") {
-      Logger.info("已开启市场首页禁用，跳过转换");
+      log.info('start.skip', '已开启市场首页禁用，跳过转换');
       return;
     }
     if (context.currentCountyInfo.code === context.targetCountyInfo.code && !isCartPage()) {
-      Logger.info(`${context.currentCountyInfo.name}无需转换`);
+      log.info('start.skip', '当前区域与目标一致，无需转换', { country: context.currentCountyInfo.code });
       return;
     }
-    Logger.info(` 核心启动：目标：${context.targetCountyInfo.name}`);
+    log.info('start.ready', '开始价格转换', { target: context.targetCountyInfo.code });
     await convert();
   }
   async function convert() {
     const exchangerManager = ConverterManager.instance;
     const elements = document.querySelectorAll(exchangerManager.getSelector());
+    log.debug('scan.initial', '扫描初始价格节点', { count: elements.length });
     await exchangerManager.convert(elements);
     const selector = exchangerManager.getSelector();
     const priceObserver = new MutationObserver(async (mutations) => {
@@ -1926,6 +1986,7 @@ targets = new Map([
         }
       });
       if (uniqueTargets.size > 0) {
+        log.debug('scan.mutation', '处理变化的价格节点', { count: uniqueTargets.size });
         await exchangerManager.convert(uniqueTargets);
       }
     });
@@ -1934,32 +1995,33 @@ targets = new Map([
       subtree: true,
       characterData: true
     });
+    log.debug('observer.ready', '价格变化监听已启用');
   }
   async function initContext() {
     const setting = SettingManager.instance.setting;
     let targetCountyInfo = countyCode2Info.get(setting.countyCode);
     if (!targetCountyInfo) {
-      Logger.warn(`获取转换后的国家(${setting.countyCode})信息失败，默认为美国：` + setting.countyCode);
+      log.warn('context.target-fallback', '目标区域未知，使用美国', { country: setting.countyCode });
       targetCountyInfo = countyCode2Info.get("US");
     }
-    Logger.info("目标区域：", targetCountyInfo);
+    log.debug('context.target', '目标区域已就绪', targetCountyInfo);
     let currCountyCode;
     try {
       currCountyCode = await CountyCodeProviderManager.instance.getCountyCode();
     } catch (error) {
       if (!isCartPage()) throw error;
       currCountyCode = 'US';
-      Logger.warn('购物车无法读取账号地区，改按商品价格中的币种符号识别原币种', error.message);
+      log.warn('context.cart-fallback', '账号地区不可用，按商品币种符号识别', { error });
     }
     if (currCountyCode) {
-      Logger.info("区域代码：", currCountyCode);
+      log.debug('context.country', '账号区域已就绪', { country: currCountyCode });
     }
     let currCountInfo = countyCode2Info.get(currCountyCode);
     if (!currCountInfo) {
-      Logger.warn("缺少当前国家的信息映射：county: " + currCountyCode + ", 默认为美国");
+      log.warn('context.source-fallback', '当前区域缺少映射，使用美国', { country: currCountyCode });
       currCountInfo = countyCode2Info.get("US");
     }
-    Logger.info("当前区域：", currCountInfo);
+    log.debug('context.source', '原币种区域已就绪', currCountInfo);
     _unsafeWindow.SpcManager = SpcManager.instance;
     _unsafeWindow.spcContext = new SpcContext(setting, targetCountyInfo, currCountInfo);
   }
@@ -2000,14 +2062,15 @@ targets = new Map([
 
   // ---- family-library.js ----
   function initializeFamilyLibrary() {
-    const log = createLogger('家庭库');
+    const log = diagnostics.scope('family');
     const KEY = 'sse_family_cache_v1';
     const DAY = 86400000;
     const page = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
     const onStore = location.hostname === 'store.steampowered.com';
     const enabled = GM_getValue('sse_family_enabled', true);
-    log.info(enabled ? '家庭库标记已启用' : '家庭库标记已关闭');
+    log.info('initialize', enabled ? '家庭库标记已启用' : '家庭库标记已关闭');
     let cache = GM_getValue(KEY, null);
+    log.debug('cache.load', '读取家庭库缓存', { cached: Boolean(cache), updated: cache?.updated });
     let scanPromise = null;
     let accountId = '';
     let root = null;
@@ -2038,7 +2101,7 @@ targets = new Map([
       return { steamid: session.steamid, token: session.token };
     }
     try { if (onStore) accountId = readIdentity().steamid; }
-    catch (_) { notice = '暂时无法读取登录信息，请刷新 Steam 商店页面。'; log.warn(notice); }
+    catch (error) { notice = '暂时无法读取登录信息，请刷新 Steam 商店页面。'; log.warn('session.read', notice, { error }); }
     function validCache() {
       return cache && cache.apps && (!onStore || !accountId || cache.steamid === accountId);
     }
@@ -2048,19 +2111,23 @@ targets = new Map([
       return '家庭库贡献者：' + owners + (game.time ? '\n记录的最早购入时间：' + new Date(game.time * 1000).toLocaleString() : '');
     }
     async function api(method, token, params) {
+      const task = log.begin('api.' + method);
+      try {
       const url = new URL('https://api.steampowered.com/' + method + '/v1/');
       url.searchParams.set('access_token', token);
       Object.entries(params).forEach(([key, value]) => url.searchParams.set(key, value));
       const parsed = JSON.parse(await gmGet(url.href));
       if (!parsed.response) throw new Error('Steam 返回了无效的家庭库数据。');
+      task.end('家庭库接口请求完成');
       return parsed.response;
+      } catch (error) { task.fail(error); throw error; }
     }
     function refreshNotice() {
       if (root) renderDialog();
     }
     function scan() {
-      if (scanPromise) return scanPromise;
-      log.info('开始扫描家庭库');
+      if (scanPromise) { log.debug('scan.join', '复用当前家庭库扫描'); return scanPromise; }
+      const task = log.begin('scan', undefined, 'info');
       scanPromise = (async () => {
         if (!onStore) throw new Error('请在已登录的 Steam 商店页面中扫描家庭库。');
         const identity = readIdentity();
@@ -2069,6 +2136,7 @@ targets = new Map([
         const family = await api('IFamilyGroupsService/GetFamilyGroupForUser', identity.token, { include_family_group_response: true });
         if (!family.family_groupid || !family.family_group) throw new Error('当前账号没有可读取的 Steam 家庭组。');
         const members = family.family_group.members || [];
+        task.debug('members', '家庭成员已读取', { count: members.length });
         // The API identifies the signed-in member even when the SSR page omits its SteamID.
         const self = identity.steamid || String(family.steamid || '');
         if (!self) throw new Error('无法确认当前账号 SteamID，未覆盖已保存的家庭库。');
@@ -2077,6 +2145,7 @@ targets = new Map([
           family_groupid: family.family_groupid, include_own: true, include_excluded: false, include_non_games: false
         });
         if (!Array.isArray(library.apps)) throw new Error('家庭库接口没有返回游戏列表，原缓存已保留。');
+        task.debug('library', '共享游戏列表已读取', { count: library.apps.length });
         const names = Object.fromEntries(members.map(member => [String(member.steamid), String(member.steamid)]));
         try {
           const params = Object.fromEntries(members.map((member, index) => ['steamids[' + index + ']', member.steamid]));
@@ -2084,7 +2153,7 @@ targets = new Map([
           for (const player of players.accounts || []) {
             if (player.public_data?.steamid) names[String(player.public_data.steamid)] = player.public_data.persona_name || String(player.public_data.steamid);
           }
-        } catch (_) { notice = '游戏已读取，部分成员昵称暂时无法获取，将显示 SteamID。'; log.warn(notice); }
+        } catch (error) { notice = '游戏已读取，部分成员昵称暂时无法获取，将显示 SteamID。'; task.warn('names.fallback', notice, { error }); }
         const apps = {};
         for (const app of library.apps) {
           if (Number(app.exclude_reason || 0) !== 0 || !Number.isSafeInteger(Number(app.appid))) continue;
@@ -2093,10 +2162,11 @@ targets = new Map([
         cache = { steamid: self, familyId: String(family.family_groupid), name: family.family_group.name || 'Steam 家庭', members: members.map(member => String(member.steamid)), names, apps, updated: Date.now() };
         accountId = self;
         GM_setValue(KEY, cache);
+        task.debug('cache.save', '家庭库缓存已保存', { count: Object.keys(apps).length });
         notice = '扫描完成，已缓存 ' + Object.keys(apps).length + ' 个家庭库游戏。';
-        log.info(notice);
         updateMarks();
-      })().catch(error => { notice = error.message || '家庭库扫描失败，原缓存已保留。'; log.error('家庭库扫描失败，原缓存已保留', error.message); })
+        task.end(notice, { games: Object.keys(apps).length, members: members.length });
+      })().catch(error => { notice = error.message || '家庭库扫描失败，原缓存已保留。'; task.fail(error); })
         .finally(() => { scanPromise = null; refreshNotice(); });
       refreshNotice();
       return scanPromise;
@@ -2109,6 +2179,7 @@ targets = new Map([
       return control;
     }
     function open() {
+      log.debug('panel.open', '打开家庭库管理');
       if (!root) {
         root = createElement('div');
         root.id = 'sse-family-dialog';
@@ -2117,7 +2188,7 @@ targets = new Map([
       }
       renderDialog();
     }
-    function close() { hideChartTooltip(); root?.remove(); root = null; }
+    function close() { if (root) log.debug('panel.close', '关闭家庭库管理'); hideChartTooltip(); root?.remove(); root = null; }
     let chartTooltip = null;
     function hideChartTooltip() { chartTooltip?.remove(); chartTooltip = null; }
     function showChartTooltip(content, x, y) {
@@ -2196,10 +2267,12 @@ targets = new Map([
         if (scanPromise) { notice = '请等待扫描完成后再清空缓存。'; refreshNotice(); return; }
         if (!window.confirm('确定清空本脚本保存的家庭库记录？')) return;
         GM_deleteValue(KEY); cache = null; notice = '家庭库缓存已清空。'; updateMarks(); renderDialog();
+        log.info('cache.clear', '家庭库缓存已清空');
       }), action('关闭', close));
       const summary = validCache() ? cache.name + ' · ' + Object.keys(cache.apps).length + ' 个游戏 · 上次扫描：' + new Date(cache.updated).toLocaleString() : '暂无当前账号的家庭库缓存。';
       panel.append(createElement('div', summary + '\n' + (notice || (!onStore ? '请前往 Steam 商店扫描，本站使用已保存的缓存。' : '')), 'sse-family-status'));
       if (validCache()) {
+        log.debug('panel.statistics', '渲染家庭库统计', { games: Object.keys(cache.apps).length, members: cache.members.length });
         panel.append(createElement('h3', '家庭成员贡献统计'));
         const games = Object.values(cache.apps);
         const totals = cache.members.map(id => games.filter(game => game.owners.includes(id)).length);
@@ -2244,6 +2317,7 @@ targets = new Map([
         table.appendChild(body); scroll.appendChild(table); panel.appendChild(scroll);
       }
       root.replaceChildren(panel);
+      log.debug('panel.render', '家庭库面板已更新', { cacheValid: Boolean(validCache()), scanning: Boolean(scanPromise) });
     }
 
     const targets = 'a[href*="/app/"], [data-ds-appid], [data-app-id], [data-rfd-draggable-id^="WishlistItem-"]';
@@ -2268,6 +2342,7 @@ targets = new Map([
       });
       document.querySelectorAll('.sse-family-banner').forEach(element => element.remove());
       if (!active) return;
+      let added = 0;
       document.querySelectorAll(targets).forEach(element => {
         if (element.closest('#sse-family-dialog, #sapx-ui-root, #sse-cart-tools, .sse-family-banner, .sse-family-badge')) return;
         const id = appId(element); const game = cache.apps[id];
@@ -2276,10 +2351,11 @@ targets = new Map([
         if (owner && appId(owner) === id) return;
         element.setAttribute('data-sse-family-app', id);
         let badge = element.querySelector(':scope > .sse-family-badge');
-        if (!badge) { badge = createElement('span', '在家庭库中', 'sse-family-badge'); element.appendChild(badge); }
+        if (!badge) { badge = createElement('span', '在家庭库中', 'sse-family-badge'); element.appendChild(badge); added++; }
         const title = gameDescription(game);
         if (badge.title !== title) badge.title = title;
       });
+      if (added) log.debug('marks.render', '家庭库标记已添加', { count: added });
       const detailId = location.pathname.match(/^\/app\/(\d+)/)?.[1];
       const detail = cache.apps[detailId];
       if (onStore && detail) {
@@ -2310,9 +2386,12 @@ targets = new Map([
         timer = setTimeout(() => { timer = null; updateMarks(); }, 350);
       });
       observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['href', 'data-ds-appid', 'data-app-id', 'data-rfd-draggable-id'] });
+      log.debug('observer.ready', '家庭库标记动态监听已启用');
       window.addEventListener('hashchange', updateMarks);
       updateMarks();
-      if (onStore && GM_getValue('sse_family_auto', true) && (!validCache() || Date.now() - cache.updated >= DAY)) scan();
+      if (onStore && GM_getValue('sse_family_auto', true) && (!validCache() || Date.now() - cache.updated >= DAY)) {
+        log.debug('scan.auto', '缓存缺失或过期，触发自动扫描'); scan();
+      } else log.debug('scan.skip', '无需自动扫描');
     }
     return { open };
   }
@@ -2329,8 +2408,8 @@ targets = new Map([
   }
 
   function initializeCartTools() {
-    const log = createLogger('购物车');
-    log.info('快速加购与购物车管理已启用');
+    const log = diagnostics.scope('cart');
+    log.info('initialize', '快速加购与购物车管理已启用');
     const page = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
     const english = GM_getValue('sse_cart_language', 'ZH') === 'EN';
     const text = (zh, en) => english ? en : zh;
@@ -2366,7 +2445,9 @@ targets = new Map([
       if (!contextPromise) {
         contextPromise = (async () => {
           let result = readContext(document, page);
+          log.debug('session.read', '读取当前页面账号信息', { hasToken: Boolean(result.token), country: result.country });
           if (!result.token || !result.country) {
+            log.debug('session.fallback', '从购物车页面补充账号信息');
             const html = await gmGet('https://store.steampowered.com/cart/');
             const remote = new DOMParser().parseFromString(html, 'text/html');
             const fallback = readContext(remote);
@@ -2374,13 +2455,14 @@ targets = new Map([
           }
           if (!result.token || !result.country) throw new Error(text('无法读取账号信息，请先登录 Steam 商店并刷新页面。', 'Sign in to the Steam store and refresh this page.'));
           return result;
-        })().catch(error => { contextPromise = null; throw error; });
+        })().catch(error => { contextPromise = null; log.error('session.failed', '读取账号信息失败', { error }); throw error; });
       }
       return contextPromise;
     }
 
     async function account(method, payload) {
-      log.debug('请求购物车操作', { method });
+      const task = log.begin('api.' + method);
+      try {
       const current = await context();
       const url = new URL('https://api.steampowered.com/IAccountCartService/' + method + '/v1/');
       url.searchParams.set('access_token', current.token);
@@ -2394,21 +2476,25 @@ targets = new Map([
         throw new Error(text('Steam 拒绝了购物车操作。', 'Steam rejected the cart operation.'));
       }
       if (!data.response) throw new Error(text('Steam 返回了无效结果。', 'Invalid Steam response.'));
-      log.debug('购物车操作完成', { method });
+      task.end('购物车接口操作完成');
       return data.response;
+      } catch (error) { task.fail(error); throw error; }
     }
 
     async function storeItem(item) {
       const key = item.type + '/' + item.id;
+      if (itemRequests.has(key)) log.debug('item.cache', '复用商品查询', { item: key });
       if (!itemRequests.has(key)) itemRequests.set(key, (async () => {
+        log.debug('item.fetch', '读取商品购买选项', { item: key });
         const current = await context();
         const field = { app: 'appid', sub: 'packageid', bundle: 'bundleid' }[item.type];
         const payload = { ids: [{ [field]: item.id }], context: { language: current.language, country_code: current.country, steam_realm: 1 }, data_request: { include_all_purchase_options: true } };
         const response = JSON.parse(await requestQueue.enqueue(() => gmGet('https://api.steampowered.com/IStoreBrowseService/GetItems/v1/?input_json=' + encodeURIComponent(JSON.stringify(payload)))));
         const result = response.response?.store_items?.[0];
         if (!result) throw new Error(text('无法读取商品：', 'Cannot read item: ') + key);
+        log.debug('item.ready', '商品购买选项已读取', { item: key });
         return result;
-      })().catch(error => { itemRequests.delete(key); throw error; }));
+      })().catch(error => { itemRequests.delete(key); log.warn('item.failed', '商品读取失败', { item: key, error }); throw error; }));
       return itemRequests.get(key);
     }
 
@@ -2425,6 +2511,7 @@ targets = new Map([
         const key = type + '/' + match[2];
         if (!seen.has(key)) { seen.add(key); items.push({ type, id: Number(match[2]) }); }
       }
+      log.debug('import.parse', '商品列表解析完成', { valid: items.length, invalid: invalid.length });
       return { items, invalid };
     }
 
@@ -2435,6 +2522,7 @@ targets = new Map([
     }
 
     function chooseOption(options, title = text('选择购买版本', 'Choose an edition')) {
+      log.debug('option.open', '等待选择', { options: options.length });
       return new Promise(resolve => {
         const overlay = document.createElement('div');
         overlay.className = 'sse-cart-dialog';
@@ -2444,7 +2532,7 @@ targets = new Map([
         const heading = document.createElement('h3');
         heading.textContent = title;
         panel.appendChild(heading);
-        const close = value => { overlay.remove(); window.removeEventListener('keydown', escape); resolve(value); };
+        const close = value => { log.debug('option.close', value ? '已选择选项' : '已取消选择'); overlay.remove(); window.removeEventListener('keydown', escape); resolve(value); };
         const escape = event => { if (event.key === 'Escape') close(null); };
         for (const option of options) panel.appendChild(button((option.purchase_option_name || '') + ' · ' + (option.formatted_final_price || ''), () => close(option)));
         panel.appendChild(button(text('取消', 'Cancel'), () => close(null)));
@@ -2460,7 +2548,7 @@ targets = new Map([
       const items = options.map(option => ({ ...(option.packageid ? { packageid: option.packageid } : { bundleid: option.bundleid }), flags: { is_gift: false, is_private: false } }));
       if (!items.length) return;
       for (let offset = 0; offset < items.length; offset += 50) await account('AddItemsToCart', { items: items.slice(offset, offset + 50) });
-      log.info('已提交加购', { count: items.length });
+      log.info('add.complete', '已提交加购', { count: items.length });
     }
 
     function button(label, action) {
@@ -2473,8 +2561,9 @@ targets = new Map([
         event.stopPropagation();
         if (element.disabled) return;
         element.disabled = true;
-        try { log.debug('执行操作', { action: label }); await action(); }
-        catch (error) { log.error('操作失败', { action: label, message: error.message }); window.alert(error.message || String(error)); }
+        const task = log.begin('action', { action: label });
+        try { await action(); task.end('操作回调完成', { action: label }); }
+        catch (error) { task.fail(error, { action: label }); window.alert(error.message || String(error)); }
         finally { element.disabled = false; }
       });
       return element;
@@ -2552,10 +2641,11 @@ targets = new Map([
         panel.querySelectorAll('button').forEach(element => { element.disabled = true; });
         status.textContent = text('操作中……', 'Working…');
         try { await action(); }
-        catch (error) { log.error('批量操作失败', error.message); status.textContent = error.message || String(error); }
+        catch (error) { log.error('batch.failed', '批量操作失败', { error }); status.textContent = error.message || String(error); }
         finally { busy = false; panel.querySelectorAll('button').forEach(element => { element.disabled = false; }); }
       };
       toolbar.append(button(text('导入', 'Import'), run(async () => {
+        log.info('import.start', '开始导入商品列表');
         const parsed = parseItems(input.value);
         if (!parsed.items.length) throw new Error(text('请输入有效的商品链接或 ID。', 'Enter valid item links or IDs.'));
         const selected = [];
@@ -2567,19 +2657,21 @@ targets = new Map([
           try {
             const data = await storeItem(item);
             const option = optionsFor(item, data)[0];
-            if (!option) { results.push(key + ' # ' + text('无可购买项目', 'No purchase option')); continue; }
-            if (importSale.control.checked && !(Number(option.discount_pct) > 0)) { results.push(key + ' # ' + text('未打折，跳过', 'Not discounted, skipped')); continue; }
+            if (!option) { log.debug('import.skip', '无可购买项目', { item: key }); results.push(key + ' # ' + text('无可购买项目', 'No purchase option')); continue; }
+            if (importSale.control.checked && !(Number(option.discount_pct) > 0)) { log.debug('import.skip', '跳过未打折商品', { item: key }); results.push(key + ' # ' + text('未打折，跳过', 'Not discounted, skipped')); continue; }
             const purchaseKey = option.packageid ? 'sub/' + option.packageid : 'bundle/' + option.bundleid;
             if (!seen.has(purchaseKey)) { selected.push(option); seen.add(purchaseKey); }
             results.push(purchaseKey + ' # ' + (option.purchase_option_name || data.name || '') + ' ' + (option.formatted_final_price || ''));
-          } catch (error) { log.warn('导入项目失败', { item: key, message: error.message }); results.push(key + ' # ' + error.message); }
+          } catch (error) { log.warn('import.item-failed', '导入项目失败', { item: key, error }); results.push(key + ' # ' + error.message); }
         }
         save(results.join('\n'));
-        if (!selected.length) { status.textContent = text('没有符合条件的商品。', 'No matching items.'); return; }
+        if (!selected.length) { log.info('import.empty', '没有符合条件的商品'); status.textContent = text('没有符合条件的商品。', 'No matching items.'); return; }
         await addOptions(selected);
         status.textContent = text('已提交加购，请刷新购物车查看结果。', 'Items submitted. Refresh the cart to see the result.');
+        log.info('import.complete', '导入完成', { count: selected.length });
       })), importSale.wrapper);
       toolbar.append(button(text('导出', 'Export'), run(async () => {
+        log.info('export.start', '开始导出购物车');
         const { cart } = await account('GetCart');
         const lines = [];
         for (const item of cart?.line_items || []) {
@@ -2587,28 +2679,30 @@ targets = new Map([
           if (!target.id) continue;
           let data;
           try { data = await storeItem(target); }
-          catch (error) { if (exportSale.control.checked) throw error; }
+          catch (error) { log.debug('export.fallback', '商品详情不可用，使用购物车价格', { error }); if (exportSale.control.checked) throw error; }
           const option = data ? optionsFor(target, data)[0] : null;
           if (exportSale.control.checked && !(Number(option?.discount_pct) > 0)) continue;
           lines.push(target.type + '/' + target.id + ' # ' + (option?.purchase_option_name || data?.name || '') + ' ' + (item.price_when_added?.formatted_amount || option?.formatted_final_price || ''));
         }
-        if (!lines.length) { status.textContent = text('购物车为空或没有符合条件的商品。', 'Cart is empty or no items match.'); return; }
+        if (!lines.length) { log.info('export.empty', '没有符合条件的商品'); status.textContent = text('购物车为空或没有符合条件的商品。', 'Cart is empty or no items match.'); return; }
         const output = '# ' + new Date().toLocaleString() + '\n' + lines.join('\n');
         if (input.value.trim()) {
           const choice = await chooseOption([
             { purchase_option_name: text('覆盖原有内容', 'Replace existing text'), formatted_final_price: '', mode: 'replace' },
             { purchase_option_name: text('追加到末尾', 'Append to existing text'), formatted_final_price: '', mode: 'append' }
           ], text('导出方式', 'Export mode'));
-          if (!choice) { status.textContent = text('已取消。', 'Cancelled.'); return; }
+          if (!choice) { log.debug('export.cancel', '已取消导出'); status.textContent = text('已取消。', 'Cancelled.'); return; }
           save(choice.mode === 'append' ? input.value.trimEnd() + '\n' + output : output);
         } else save(output);
         status.textContent = text('导出完成。', 'Export complete.');
+        log.info('export.complete', '导出完成', { count: lines.length });
       })), exportSale.wrapper);
       const edit = gift => run(async () => {
+        log.info('modify.start', '开始修改购物车用途', { gift });
         let giftInfo = null;
         if (gift) {
           const value = window.prompt(text('输入接收人的 SteamID 或好友代码；留空暂不指定，取消则停止操作。', 'Recipient SteamID or friend code; leave blank to skip recipient, or cancel to stop.'));
-          if (value === null) { status.textContent = text('已取消。', 'Cancelled.'); return; }
+          if (value === null) { log.debug('modify.cancel', '已取消修改'); status.textContent = text('已取消。', 'Cancelled.'); return; }
           if (value.trim()) {
             if (!/^\d+$/.test(value.trim())) throw new Error(text('接收人 ID 无效。', 'Invalid recipient ID.'));
             let id = BigInt(value.trim());
@@ -2624,8 +2718,10 @@ targets = new Map([
         for (const [index, item] of items.entries()) {
           await account('ModifyLineItem', { line_item_id: item.line_item_id, gift_info: giftInfo, flags: { is_gift: gift, is_private: false } });
           status.textContent = (index + 1) + '/' + items.length;
+          log.debug('modify.progress', '已修改购物车项目', { index: index + 1, total: items.length });
         }
         status.textContent = text('修改完成，请刷新购物车查看结果。', 'Updated. Refresh the cart to see the result.');
+        log.info('modify.complete', '购物车用途修改完成', { count: items.length, gift });
       });
       toolbar.append(button(text('转送礼', 'Set as gift'), edit(true)), button(text('转自用', 'Set for myself'), edit(false)));
       const bottom = document.createElement('div');
@@ -2639,12 +2735,14 @@ targets = new Map([
         button(text('清空购物车', 'Empty cart'), run(async () => {
           if (!window.confirm(text('确定移除购物车中的所有商品？', 'Remove every item from the cart?'))) { status.textContent = text('已取消。', 'Cancelled.'); return; }
           await account('DeleteCart', {});
+          log.info('clear.complete', '购物车已清空');
           location.reload();
         }))
       );
       panel.append(title, toolbar, input, bottom, status);
       cartPanel = panel;
       placeCartPanel(panel, anchor);
+      log.debug('panel.mount', '购物车工具面板已挂载');
     }
 
     const quickSelector = 'a.search_result_row, a.tab_item, a.recommendation_link, .wishlist_row, [data-rfd-draggable-id^="WishlistItem-"], .game_purchase_action';
@@ -2662,12 +2760,14 @@ targets = new Map([
             if (!keys.size) return;
             if (GM_getValue('fac_cart', '').trim() && !window.confirm(text('用当前商品列表覆盖已保存的文本？', 'Replace the saved text with these items?'))) return;
             GM_setValue('fac_cart', [...keys].join('\n'));
+            log.info('extract.complete', '已提取当前页面商品', { count: keys.size });
             window.alert(text('已保存商品列表，可前往购物车批量导入。', 'List saved. Open the cart to import it.'));
           });
           extract.id = 'sse-cart-extract';
           host.prepend(extract);
         }
       }
+      let mounted = 0;
       document.querySelectorAll(quickSelector).forEach(row => {
         const wishlistRow = row.matches('.wishlist_row, [data-rfd-draggable-id^="WishlistItem-"]');
         const existing = row.querySelector('.sse-quick-add');
@@ -2689,7 +2789,7 @@ targets = new Map([
           const options = optionsFor(target, await storeItem(target));
           if (!options.length) throw new Error(text('未找到可购买版本，可能尚未发行、免费或受地区限制。', 'No purchase options: unreleased, free, or region restricted.'));
           const chosen = options.length === 1 ? options[0] : await chooseOption(options);
-          if (!chosen) return;
+          if (!chosen) { log.debug('quick-add.cancel', '已取消加购'); return; }
           await addOptions([chosen]);
           const label = control.querySelector('span') || control;
           label.textContent = text('✓ 已提交加购', '✓ Submitted');
@@ -2708,7 +2808,9 @@ targets = new Map([
         } else if (!wishlistRow || !placeWishlistCartButton(row, control)) {
           row.appendChild(control);
         }
+        mounted++;
       });
+      if (mounted) log.debug('quick-add.mount', '已挂载快速加购按钮', { count: mounted });
     }
     let timer = null;
     const observer = new MutationObserver(mutations => {
@@ -2716,6 +2818,7 @@ targets = new Map([
       timer = setTimeout(() => { timer = null; scanQuickButtons(); }, 400);
     });
     observer.observe(document.body, { childList: true, subtree: true });
+    log.debug('observer.ready', '购物车动态节点监听已启用');
     window.addEventListener('resize', () => mountPanel(), { passive: true });
     scanQuickButtons();
     if (GM_getValue('sse_cart_country', false)) context().then(current => {
@@ -2726,14 +2829,16 @@ targets = new Map([
         label.textContent = ' [' + current.country + ']';
         host.appendChild(label);
       }
-    }).catch(error => log.warn('读取账号地区失败', error.message));
+    }).catch(error => log.warn('country.failed', '读取账号地区失败', { error }));
   }
 
   // ---- friend-tools.js ----
   function initializeFriendTools() {
-    if (location.hostname !== 'steamcommunity.com' || !/\/friends\/?$/i.test(location.pathname)) return;
-    const log = createLogger('好友工具');
-    log.info('留言、分组与统计已启用');
+    const log = diagnostics.scope('friends');
+    if (location.hostname !== 'steamcommunity.com' || !/\/friends\/?$/i.test(location.pathname)) {
+      log.debug('initialize.skip', '当前页面不启用好友工具'); return;
+    }
+    log.info('initialize', '留言、分组与统计已启用');
 
     const ROOT_ID = 'sse-friend-tools';
     const style = document.createElement('style');
@@ -2824,6 +2929,7 @@ targets = new Map([
       tab.setAttribute('aria-selected', String(index === 0));
       panel.hidden = index !== 0;
       tab.addEventListener('click', () => {
+        log.debug('tabs.select', '切换好友工具标签', { tab: labels[index] });
         panels.forEach((item, position) => {
           item.hidden = position !== index;
           tabs.children[position].setAttribute('aria-selected', String(position === index));
@@ -2836,7 +2942,8 @@ targets = new Map([
     const nativeList = document.querySelector('#search_results');
     if (managePanel) managePanel.after(root);
     else if (nativeList) nativeList.before(root);
-    else return;
+    else { log.warn('panel.missing', '未找到好友管理面板或好友列表'); return; }
+    log.debug('panel.mount', '好友工具已挂载', { nativeManagement: Boolean(managePanel) });
 
     const getFriendRows = () => [...document.querySelectorAll('#search_results .selectable[data-steamid]')]
       .filter(row => /^\d{17}$/.test(row.dataset.steamid || ''));
@@ -2849,8 +2956,9 @@ targets = new Map([
     const GROUP_STORAGE_KEY = `sse_friend_groups_v1_${accountId}`;
     let groups = GM_getValue(GROUP_STORAGE_KEY, {});
     if (!groups || typeof groups !== 'object' || Array.isArray(groups)) groups = {};
+    log.debug('groups.load', '本地分组已加载', { count: Object.keys(groups).length });
 
-    function saveGroups() { GM_setValue(GROUP_STORAGE_KEY, groups); log.info('本地分组已保存', { count: Object.keys(groups).length }); }
+    function saveGroups() { GM_setValue(GROUP_STORAGE_KEY, groups); log.debug('groups.save', '本地分组已保存', { count: Object.keys(groups).length }); }
     function renderGroups() {
       const selectedGroup = groupSelect.value;
       groupSelect.replaceChildren(createElement('option', '选择分组'));
@@ -2869,6 +2977,7 @@ targets = new Map([
     }
     function renderFriends() {
       const friends = getFriendRows();
+      log.debug('friends.scan', '扫描已加载好友', { count: friends.length });
       for (const friend of friends) {
         const steamId = friend.dataset.steamid;
         const name = friend.querySelector('.friend_block_content')?.textContent.trim().split('\n')[0] || steamId;
@@ -2893,9 +3002,11 @@ targets = new Map([
       statValues[0].textContent = String(friends.length);
       statValues[1].textContent = String(online);
       statValues[2].textContent = String(Object.keys(groups).length);
+      log.debug('statistics.update', '好友统计已更新', { loaded: friends.length, online, groups: Object.keys(groups).length });
     }
     function updateSelectionCount() {
       selectionCount.textContent = `已选 ${getSelectedFriends().length} 位`;
+      log.debug('selection.update', '好友选择已更新', { selected: getSelectedFriends().length });
     }
     const getSelectedFriends = () => {
       return getFriendRows().filter(row => row.querySelector('.select_friend_checkbox, .sse-friend-select')?.checked);
@@ -2918,6 +3029,7 @@ targets = new Map([
           renderFriends();
         }, 250);
       }).observe(friendList, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'data-steamid'] });
+      log.debug('observer.ready', '好友列表动态监听已启用');
     }
     createGroup.addEventListener('click', () => {
       const name = groupName.value.trim();
@@ -2930,6 +3042,7 @@ targets = new Map([
       updateFriendStats();
       groupSelect.value = name;
       groupStatus.textContent = `已创建分组“${name}”。`;
+      log.info('groups.create', '已创建本地分组');
     });
     addToGroup.addEventListener('click', () => {
       const name = groupSelect.value;
@@ -2944,6 +3057,7 @@ targets = new Map([
       updateFriendStats();
       groupSelect.value = name;
       groupStatus.textContent = `已将 ${friends.length} 位好友加入“${name}”。`;
+      log.info('groups.add', '已加入本地分组', { count: friends.length });
     });
     removeFromGroup.addEventListener('click', () => {
       const name = groupSelect.value;
@@ -2958,6 +3072,7 @@ targets = new Map([
       updateFriendStats();
       groupSelect.value = name;
       groupStatus.textContent = `已从“${name}”移除 ${before - groups[name].length} 位好友。`;
+      log.info('groups.remove', '已从本地分组移除好友', { count: before - groups[name].length });
     });
     deleteGroup.addEventListener('click', () => {
       const name = groupSelect.value;
@@ -2968,20 +3083,21 @@ targets = new Map([
       renderGroups();
       updateFriendStats();
       groupStatus.textContent = `已删除分组“${name}”。`;
+      log.info('groups.delete', '已删除本地分组');
     });
 
     send.addEventListener('click', async () => {
       const friends = getSelectedFriends();
       const comment = message.value.trim();
       const sessionId = getSessionId();
-      if (!friends.length) { status.textContent = '请先在 Steam 好友列表中选择至少一位好友。'; return; }
-      if (!comment) { status.textContent = '请输入评论内容。'; message.focus(); return; }
-      if (new TextEncoder().encode(comment).length > 1000) { status.textContent = '评论超过 Steam 的 1000 字节限制。'; return; }
-      if (!sessionId) { status.textContent = '未能读取 Steam 会话，请刷新好友页面后重试。'; return; }
-      if (!window.confirm(`将向 ${friends.length} 位已选好友的个人主页发送相同评论。此操作无法撤回，继续吗？`)) return;
+      if (!friends.length) { log.debug('comments.validate', '未选择好友'); status.textContent = '请先在 Steam 好友列表中选择至少一位好友。'; return; }
+      if (!comment) { log.debug('comments.validate', '未填写评论'); status.textContent = '请输入评论内容。'; message.focus(); return; }
+      if (new TextEncoder().encode(comment).length > 1000) { log.warn('comments.validate', '评论超出字节限制'); status.textContent = '评论超过 Steam 的 1000 字节限制。'; return; }
+      if (!sessionId) { log.warn('comments.validate', '未读取到 Steam 会话'); status.textContent = '未能读取 Steam 会话，请刷新好友页面后重试。'; return; }
+      if (!window.confirm(`将向 ${friends.length} 位已选好友的个人主页发送相同评论。此操作无法撤回，继续吗？`)) { log.debug('comments.cancel', '用户取消批量留言'); return; }
 
       send.disabled = true;
-      log.info('开始批量留言', { count: friends.length });
+      const task = log.begin('comments.send', { count: friends.length }, 'info');
       status.textContent = `已确认，准备向 ${friends.length} 位好友发送……`;
       const results = [];
       try {
@@ -2991,6 +3107,7 @@ targets = new Map([
           const name = friend.querySelector('.friend_block_content')?.textContent.trim().split('\n')[0] || steamId;
           status.textContent = `正在处理 ${index + 1}/${friends.length}：${name}`;
           try {
+          task.debug('request', '开始发送留言', { index: index + 1, total: friends.length });
           const body = new URLSearchParams({ comment, count: '6', sessionid: sessionId });
           const response = await fetch(`/comment/Profile/post/${steamId}/-1/`, {
             method: 'POST', credentials: 'same-origin',
@@ -2999,18 +3116,21 @@ targets = new Map([
           const result = await response.json();
           if (!response.ok || result.success === false) throw new Error(result.error || `HTTP ${response.status}`);
           results.push(`已发送 ${name}`);
-          log.debug('留言发送成功', { index: index + 1, total: friends.length });
+          task.debug('sent', '留言发送成功', { index: index + 1, total: friends.length });
           } catch (error) {
-            log.warn('留言发送失败', { index: index + 1, message: error.message });
+            task.warn('failed', '留言发送失败', { index: index + 1, error });
             results.push(`发送失败 ${name}：${error.message || '请求失败'}`);
           }
           status.textContent = `${index + 1}/${friends.length}\n${results.slice(-5).join('\n')}`;
-          if (index + 1 < friends.length) await new Promise(resolve => setTimeout(resolve, 4000));
+          if (index + 1 < friends.length) {
+            task.debug('interval', '等待下一次发送', { delayMs: 4000 });
+            await new Promise(resolve => setTimeout(resolve, 4000));
+          }
         }
         status.textContent = `处理完成：${results.filter(result => result.startsWith('已发送')).length} 成功，${results.filter(result => result.startsWith('发送失败')).length} 失败。\n${results.join('\n')}`;
-        log.info('批量留言完成', { success: results.filter(result => result.startsWith('已发送')).length, failed: results.filter(result => result.startsWith('发送失败')).length });
+        task.end('批量留言处理完成', { success: results.filter(result => result.startsWith('已发送')).length, failed: results.filter(result => result.startsWith('发送失败')).length });
       } catch (error) {
-        log.error('批量留言中断', error.message);
+        task.fail(error);
         status.textContent = `批量发送中断：${error.message || String(error)}`;
       } finally {
         send.disabled = false;
@@ -3020,23 +3140,26 @@ targets = new Map([
 
   // ---- main.js ----
   function initialize() {
-    const log = createLogger('核心');
-    log.info('初始化', { host: location.hostname });
+    const log = diagnostics.scope('core');
+    const boot = log.begin('initialize', { host: location.hostname, level: diagnostics.getLevel() }, 'info');
     addStyle();
-    GM_registerMenuCommand('设置：Steam Store Enhancer', openSettingsUI);
+    boot.debug('styles', '基础样式已加载');
+    GM_registerMenuCommand('设置', openSettingsUI);
+    boot.debug('settings', '设置菜单已注册');
     if (location.hostname === 'store.steampowered.com' && GM_getValue('sse_extra_enabled', true)) {
       scheduleScan();
       startObserver();
-    }
+    } else boot.debug('regional-prices.skip', '跳过地区价格', { host: location.hostname });
     if (/^(store\.steampowered\.com|steamcommunity\.com|checkout\.steampowered\.com)$/.test(location.hostname)) {
       conversion.start();
-    }
+    } else boot.debug('conversion.skip', '当前站点不启用价格转换');
     const family = initializeFamilyLibrary();
+    boot.debug('family', '家庭库初始化完成');
     if (GM_getValue('sse_cart_enabled', true) && /^(store\.steampowered\.com|steamcommunity\.com)$/.test(location.hostname)) {
       initializeCartTools();
-    }
+    } else boot.debug('cart.skip', '跳过购物车工具', { host: location.hostname });
     initializeFriendTools();
-    log.info('功能初始化完成');
+    boot.end('功能启动已调度，异步任务由各模块记录结果');
     return family;
   }
 

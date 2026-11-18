@@ -108,7 +108,7 @@ $10.00(￥80) (CN ¥32.00)
 1. 在浏览器中安装 [Tampermonkey](https://www.tampermonkey.net/)。
 2. 前往 [Greasy Fork 的 Steam Store Enhancer 页面](https://greasyfork.org/zh-CN/scripts/605911-steam-store-enhancer)，点击安装并在 Tampermonkey 中确认。
 3. 打开或刷新 Steam 页面。
-4. 点击 Tampermonkey 图标，选择 **「设置：Steam Store Enhancer」**。
+4. 点击 Tampermonkey 图标，选择 **「设置」**。
 5. 根据需要调整选项，点击 **「保存并刷新」**。
 
 也可以从本项目下载 [Steam Store Enhancer.user.js](./Steam%20Store%20Enhancer.user.js)，再通过 Tampermonkey「实用工具 → 从文件导入」手动安装。
@@ -124,6 +124,8 @@ npm run build
 ```
 
 构建会将 `src/` 中的模块合并，生成可直接安装的 `Steam Store Enhancer.user.js`。请修改 `src/` 中的源码，不要直接编辑生成文件。
+
+模块职责和日志接口见 [维护说明](docs/architecture.md)。日志核心位于 `src/logging/`，转换设置、汇率服务、价格文本处理分别位于 `src/conversion/`；公共请求队列位于 `src/network.js`。模块的构建顺序由 `scripts/build.mjs` 定义。
 
 运行以下命令检查生成文件是否与源码一致、逐个验证仓库内 JavaScript（源码、构建脚本、测试和生成文件）的语法，并执行测试：
 
@@ -153,7 +155,8 @@ npm test
 | 使用自定义汇率 | 开启后使用手动输入的汇率 | 关闭 |
 | 自定义汇率 | 1 单位目标货币可兑换的原货币数量 | `1` |
 | 在市场首页禁用价格转换 | 在社区市场首页暂停换算 | 关闭 |
-| 全局日志等级 | 位于设置主区域，统一控制所有功能的控制台日志；`debug` 显示处理细节，`info` 显示常规结果，`warn`／`error` 仅显示相应等级及以上，`off` 关闭日志 | `info` |
+| 日志等级 | `debug` 显示全部步骤，`info` 显示运行概况，`warn` 显示警告和错误，`error` 仅显示错误，`off` 关闭；保存后生效 | `info` |
+| 复制诊断日志 | 复制当前页面最近 200 条通过等级过滤的记录；只保存在页面内存中 | — |
 
 ### 自定义汇率示例
 

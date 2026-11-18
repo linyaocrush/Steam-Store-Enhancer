@@ -9,8 +9,8 @@
   }
 
   function initializeCartTools() {
-    const log = createLogger('购物车');
-    log.info('快速加购与购物车管理已启用');
+    const log = diagnostics.scope('cart');
+    log.info('initialize', '快速加购与购物车管理已启用');
     const page = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
     const english = GM_getValue('sse_cart_language', 'ZH') === 'EN';
     const text = (zh, en) => english ? en : zh;
@@ -46,7 +46,9 @@
       if (!contextPromise) {
         contextPromise = (async () => {
           let result = readContext(document, page);
+          log.debug('session.read', '读取当前页面账号信息', { hasToken: Boolean(result.token), country: result.country });
           if (!result.token || !result.country) {
+            log.debug('session.fallback', '从购物车页面补充账号信息');
             const html = await gmGet('https://store.steampowered.com/cart/');
             const remote = new DOMParser().parseFromString(html, 'text/html');
             const fallback = readContext(remote);
@@ -54,13 +56,14 @@
           }
           if (!result.token || !result.country) throw new Error(text('无法读取账号信息，请先登录 Steam 商店并刷新页面。', 'Sign in to the Steam store and refresh this page.'));
           return result;
-        })().catch(error => { contextPromise = null; throw error; });
+        })().catch(error => { contextPromise = null; log.error('session.failed', '读取账号信息失败', { error }); throw error; });
       }
       return contextPromise;
     }
 
     async function account(method, payload) {
-      log.debug('请求购物车操作', { method });
+      const task = log.begin('api.' + method);
+      try {
       const current = await context();
       const url = new URL('https://api.steampowered.com/IAccountCartService/' + method + '/v1/');
       url.searchParams.set('access_token', current.token);
@@ -74,21 +77,25 @@
         throw new Error(text('Steam 拒绝了购物车操作。', 'Steam rejected the cart operation.'));
       }
       if (!data.response) throw new Error(text('Steam 返回了无效结果。', 'Invalid Steam response.'));
-      log.debug('购物车操作完成', { method });
+      task.end('购物车接口操作完成');
       return data.response;
+      } catch (error) { task.fail(error); throw error; }
     }
 
     async function storeItem(item) {
       const key = item.type + '/' + item.id;
+      if (itemRequests.has(key)) log.debug('item.cache', '复用商品查询', { item: key });
       if (!itemRequests.has(key)) itemRequests.set(key, (async () => {
+        log.debug('item.fetch', '读取商品购买选项', { item: key });
         const current = await context();
         const field = { app: 'appid', sub: 'packageid', bundle: 'bundleid' }[item.type];
         const payload = { ids: [{ [field]: item.id }], context: { language: current.language, country_code: current.country, steam_realm: 1 }, data_request: { include_all_purchase_options: true } };
         const response = JSON.parse(await requestQueue.enqueue(() => gmGet('https://api.steampowered.com/IStoreBrowseService/GetItems/v1/?input_json=' + encodeURIComponent(JSON.stringify(payload)))));
         const result = response.response?.store_items?.[0];
         if (!result) throw new Error(text('无法读取商品：', 'Cannot read item: ') + key);
+        log.debug('item.ready', '商品购买选项已读取', { item: key });
         return result;
-      })().catch(error => { itemRequests.delete(key); throw error; }));
+      })().catch(error => { itemRequests.delete(key); log.warn('item.failed', '商品读取失败', { item: key, error }); throw error; }));
       return itemRequests.get(key);
     }
 
@@ -105,6 +112,7 @@
         const key = type + '/' + match[2];
         if (!seen.has(key)) { seen.add(key); items.push({ type, id: Number(match[2]) }); }
       }
+      log.debug('import.parse', '商品列表解析完成', { valid: items.length, invalid: invalid.length });
       return { items, invalid };
     }
 
@@ -115,6 +123,7 @@
     }
 
     function chooseOption(options, title = text('选择购买版本', 'Choose an edition')) {
+      log.debug('option.open', '等待选择', { options: options.length });
       return new Promise(resolve => {
         const overlay = document.createElement('div');
         overlay.className = 'sse-cart-dialog';
@@ -124,7 +133,7 @@
         const heading = document.createElement('h3');
         heading.textContent = title;
         panel.appendChild(heading);
-        const close = value => { overlay.remove(); window.removeEventListener('keydown', escape); resolve(value); };
+        const close = value => { log.debug('option.close', value ? '已选择选项' : '已取消选择'); overlay.remove(); window.removeEventListener('keydown', escape); resolve(value); };
         const escape = event => { if (event.key === 'Escape') close(null); };
         for (const option of options) panel.appendChild(button((option.purchase_option_name || '') + ' · ' + (option.formatted_final_price || ''), () => close(option)));
         panel.appendChild(button(text('取消', 'Cancel'), () => close(null)));
@@ -140,7 +149,7 @@
       const items = options.map(option => ({ ...(option.packageid ? { packageid: option.packageid } : { bundleid: option.bundleid }), flags: { is_gift: false, is_private: false } }));
       if (!items.length) return;
       for (let offset = 0; offset < items.length; offset += 50) await account('AddItemsToCart', { items: items.slice(offset, offset + 50) });
-      log.info('已提交加购', { count: items.length });
+      log.info('add.complete', '已提交加购', { count: items.length });
     }
 
     function button(label, action) {
@@ -153,8 +162,9 @@
         event.stopPropagation();
         if (element.disabled) return;
         element.disabled = true;
-        try { log.debug('执行操作', { action: label }); await action(); }
-        catch (error) { log.error('操作失败', { action: label, message: error.message }); window.alert(error.message || String(error)); }
+        const task = log.begin('action', { action: label });
+        try { await action(); task.end('操作回调完成', { action: label }); }
+        catch (error) { task.fail(error, { action: label }); window.alert(error.message || String(error)); }
         finally { element.disabled = false; }
       });
       return element;
@@ -232,10 +242,11 @@
         panel.querySelectorAll('button').forEach(element => { element.disabled = true; });
         status.textContent = text('操作中……', 'Working…');
         try { await action(); }
-        catch (error) { log.error('批量操作失败', error.message); status.textContent = error.message || String(error); }
+        catch (error) { log.error('batch.failed', '批量操作失败', { error }); status.textContent = error.message || String(error); }
         finally { busy = false; panel.querySelectorAll('button').forEach(element => { element.disabled = false; }); }
       };
       toolbar.append(button(text('导入', 'Import'), run(async () => {
+        log.info('import.start', '开始导入商品列表');
         const parsed = parseItems(input.value);
         if (!parsed.items.length) throw new Error(text('请输入有效的商品链接或 ID。', 'Enter valid item links or IDs.'));
         const selected = [];
@@ -247,19 +258,21 @@
           try {
             const data = await storeItem(item);
             const option = optionsFor(item, data)[0];
-            if (!option) { results.push(key + ' # ' + text('无可购买项目', 'No purchase option')); continue; }
-            if (importSale.control.checked && !(Number(option.discount_pct) > 0)) { results.push(key + ' # ' + text('未打折，跳过', 'Not discounted, skipped')); continue; }
+            if (!option) { log.debug('import.skip', '无可购买项目', { item: key }); results.push(key + ' # ' + text('无可购买项目', 'No purchase option')); continue; }
+            if (importSale.control.checked && !(Number(option.discount_pct) > 0)) { log.debug('import.skip', '跳过未打折商品', { item: key }); results.push(key + ' # ' + text('未打折，跳过', 'Not discounted, skipped')); continue; }
             const purchaseKey = option.packageid ? 'sub/' + option.packageid : 'bundle/' + option.bundleid;
             if (!seen.has(purchaseKey)) { selected.push(option); seen.add(purchaseKey); }
             results.push(purchaseKey + ' # ' + (option.purchase_option_name || data.name || '') + ' ' + (option.formatted_final_price || ''));
-          } catch (error) { log.warn('导入项目失败', { item: key, message: error.message }); results.push(key + ' # ' + error.message); }
+          } catch (error) { log.warn('import.item-failed', '导入项目失败', { item: key, error }); results.push(key + ' # ' + error.message); }
         }
         save(results.join('\n'));
-        if (!selected.length) { status.textContent = text('没有符合条件的商品。', 'No matching items.'); return; }
+        if (!selected.length) { log.info('import.empty', '没有符合条件的商品'); status.textContent = text('没有符合条件的商品。', 'No matching items.'); return; }
         await addOptions(selected);
         status.textContent = text('已提交加购，请刷新购物车查看结果。', 'Items submitted. Refresh the cart to see the result.');
+        log.info('import.complete', '导入完成', { count: selected.length });
       })), importSale.wrapper);
       toolbar.append(button(text('导出', 'Export'), run(async () => {
+        log.info('export.start', '开始导出购物车');
         const { cart } = await account('GetCart');
         const lines = [];
         for (const item of cart?.line_items || []) {
@@ -267,28 +280,30 @@
           if (!target.id) continue;
           let data;
           try { data = await storeItem(target); }
-          catch (error) { if (exportSale.control.checked) throw error; }
+          catch (error) { log.debug('export.fallback', '商品详情不可用，使用购物车价格', { error }); if (exportSale.control.checked) throw error; }
           const option = data ? optionsFor(target, data)[0] : null;
           if (exportSale.control.checked && !(Number(option?.discount_pct) > 0)) continue;
           lines.push(target.type + '/' + target.id + ' # ' + (option?.purchase_option_name || data?.name || '') + ' ' + (item.price_when_added?.formatted_amount || option?.formatted_final_price || ''));
         }
-        if (!lines.length) { status.textContent = text('购物车为空或没有符合条件的商品。', 'Cart is empty or no items match.'); return; }
+        if (!lines.length) { log.info('export.empty', '没有符合条件的商品'); status.textContent = text('购物车为空或没有符合条件的商品。', 'Cart is empty or no items match.'); return; }
         const output = '# ' + new Date().toLocaleString() + '\n' + lines.join('\n');
         if (input.value.trim()) {
           const choice = await chooseOption([
             { purchase_option_name: text('覆盖原有内容', 'Replace existing text'), formatted_final_price: '', mode: 'replace' },
             { purchase_option_name: text('追加到末尾', 'Append to existing text'), formatted_final_price: '', mode: 'append' }
           ], text('导出方式', 'Export mode'));
-          if (!choice) { status.textContent = text('已取消。', 'Cancelled.'); return; }
+          if (!choice) { log.debug('export.cancel', '已取消导出'); status.textContent = text('已取消。', 'Cancelled.'); return; }
           save(choice.mode === 'append' ? input.value.trimEnd() + '\n' + output : output);
         } else save(output);
         status.textContent = text('导出完成。', 'Export complete.');
+        log.info('export.complete', '导出完成', { count: lines.length });
       })), exportSale.wrapper);
       const edit = gift => run(async () => {
+        log.info('modify.start', '开始修改购物车用途', { gift });
         let giftInfo = null;
         if (gift) {
           const value = window.prompt(text('输入接收人的 SteamID 或好友代码；留空暂不指定，取消则停止操作。', 'Recipient SteamID or friend code; leave blank to skip recipient, or cancel to stop.'));
-          if (value === null) { status.textContent = text('已取消。', 'Cancelled.'); return; }
+          if (value === null) { log.debug('modify.cancel', '已取消修改'); status.textContent = text('已取消。', 'Cancelled.'); return; }
           if (value.trim()) {
             if (!/^\d+$/.test(value.trim())) throw new Error(text('接收人 ID 无效。', 'Invalid recipient ID.'));
             let id = BigInt(value.trim());
@@ -304,8 +319,10 @@
         for (const [index, item] of items.entries()) {
           await account('ModifyLineItem', { line_item_id: item.line_item_id, gift_info: giftInfo, flags: { is_gift: gift, is_private: false } });
           status.textContent = (index + 1) + '/' + items.length;
+          log.debug('modify.progress', '已修改购物车项目', { index: index + 1, total: items.length });
         }
         status.textContent = text('修改完成，请刷新购物车查看结果。', 'Updated. Refresh the cart to see the result.');
+        log.info('modify.complete', '购物车用途修改完成', { count: items.length, gift });
       });
       toolbar.append(button(text('转送礼', 'Set as gift'), edit(true)), button(text('转自用', 'Set for myself'), edit(false)));
       const bottom = document.createElement('div');
@@ -319,12 +336,14 @@
         button(text('清空购物车', 'Empty cart'), run(async () => {
           if (!window.confirm(text('确定移除购物车中的所有商品？', 'Remove every item from the cart?'))) { status.textContent = text('已取消。', 'Cancelled.'); return; }
           await account('DeleteCart', {});
+          log.info('clear.complete', '购物车已清空');
           location.reload();
         }))
       );
       panel.append(title, toolbar, input, bottom, status);
       cartPanel = panel;
       placeCartPanel(panel, anchor);
+      log.debug('panel.mount', '购物车工具面板已挂载');
     }
 
     const quickSelector = 'a.search_result_row, a.tab_item, a.recommendation_link, .wishlist_row, [data-rfd-draggable-id^="WishlistItem-"], .game_purchase_action';
@@ -342,12 +361,14 @@
             if (!keys.size) return;
             if (GM_getValue('fac_cart', '').trim() && !window.confirm(text('用当前商品列表覆盖已保存的文本？', 'Replace the saved text with these items?'))) return;
             GM_setValue('fac_cart', [...keys].join('\n'));
+            log.info('extract.complete', '已提取当前页面商品', { count: keys.size });
             window.alert(text('已保存商品列表，可前往购物车批量导入。', 'List saved. Open the cart to import it.'));
           });
           extract.id = 'sse-cart-extract';
           host.prepend(extract);
         }
       }
+      let mounted = 0;
       document.querySelectorAll(quickSelector).forEach(row => {
         const wishlistRow = row.matches('.wishlist_row, [data-rfd-draggable-id^="WishlistItem-"]');
         const existing = row.querySelector('.sse-quick-add');
@@ -369,7 +390,7 @@
           const options = optionsFor(target, await storeItem(target));
           if (!options.length) throw new Error(text('未找到可购买版本，可能尚未发行、免费或受地区限制。', 'No purchase options: unreleased, free, or region restricted.'));
           const chosen = options.length === 1 ? options[0] : await chooseOption(options);
-          if (!chosen) return;
+          if (!chosen) { log.debug('quick-add.cancel', '已取消加购'); return; }
           await addOptions([chosen]);
           const label = control.querySelector('span') || control;
           label.textContent = text('✓ 已提交加购', '✓ Submitted');
@@ -388,7 +409,9 @@
         } else if (!wishlistRow || !placeWishlistCartButton(row, control)) {
           row.appendChild(control);
         }
+        mounted++;
       });
+      if (mounted) log.debug('quick-add.mount', '已挂载快速加购按钮', { count: mounted });
     }
     let timer = null;
     const observer = new MutationObserver(mutations => {
@@ -396,6 +419,7 @@
       timer = setTimeout(() => { timer = null; scanQuickButtons(); }, 400);
     });
     observer.observe(document.body, { childList: true, subtree: true });
+    log.debug('observer.ready', '购物车动态节点监听已启用');
     window.addEventListener('resize', () => mountPanel(), { passive: true });
     scanQuickButtons();
     if (GM_getValue('sse_cart_country', false)) context().then(current => {
@@ -406,5 +430,5 @@
         label.textContent = ' [' + current.country + ']';
         host.appendChild(label);
       }
-    }).catch(error => log.warn('读取账号地区失败', error.message));
+    }).catch(error => log.warn('country.failed', '读取账号地区失败', { error }));
   }

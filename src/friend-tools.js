@@ -1,7 +1,9 @@
   function initializeFriendTools() {
-    if (location.hostname !== 'steamcommunity.com' || !/\/friends\/?$/i.test(location.pathname)) return;
-    const log = createLogger('好友工具');
-    log.info('留言、分组与统计已启用');
+    const log = diagnostics.scope('friends');
+    if (location.hostname !== 'steamcommunity.com' || !/\/friends\/?$/i.test(location.pathname)) {
+      log.debug('initialize.skip', '当前页面不启用好友工具'); return;
+    }
+    log.info('initialize', '留言、分组与统计已启用');
 
     const ROOT_ID = 'sse-friend-tools';
     const style = document.createElement('style');
@@ -92,6 +94,7 @@
       tab.setAttribute('aria-selected', String(index === 0));
       panel.hidden = index !== 0;
       tab.addEventListener('click', () => {
+        log.debug('tabs.select', '切换好友工具标签', { tab: labels[index] });
         panels.forEach((item, position) => {
           item.hidden = position !== index;
           tabs.children[position].setAttribute('aria-selected', String(position === index));
@@ -104,7 +107,8 @@
     const nativeList = document.querySelector('#search_results');
     if (managePanel) managePanel.after(root);
     else if (nativeList) nativeList.before(root);
-    else return;
+    else { log.warn('panel.missing', '未找到好友管理面板或好友列表'); return; }
+    log.debug('panel.mount', '好友工具已挂载', { nativeManagement: Boolean(managePanel) });
 
     const getFriendRows = () => [...document.querySelectorAll('#search_results .selectable[data-steamid]')]
       .filter(row => /^\d{17}$/.test(row.dataset.steamid || ''));
@@ -117,8 +121,9 @@
     const GROUP_STORAGE_KEY = `sse_friend_groups_v1_${accountId}`;
     let groups = GM_getValue(GROUP_STORAGE_KEY, {});
     if (!groups || typeof groups !== 'object' || Array.isArray(groups)) groups = {};
+    log.debug('groups.load', '本地分组已加载', { count: Object.keys(groups).length });
 
-    function saveGroups() { GM_setValue(GROUP_STORAGE_KEY, groups); log.info('本地分组已保存', { count: Object.keys(groups).length }); }
+    function saveGroups() { GM_setValue(GROUP_STORAGE_KEY, groups); log.debug('groups.save', '本地分组已保存', { count: Object.keys(groups).length }); }
     function renderGroups() {
       const selectedGroup = groupSelect.value;
       groupSelect.replaceChildren(createElement('option', '选择分组'));
@@ -137,6 +142,7 @@
     }
     function renderFriends() {
       const friends = getFriendRows();
+      log.debug('friends.scan', '扫描已加载好友', { count: friends.length });
       for (const friend of friends) {
         const steamId = friend.dataset.steamid;
         const name = friend.querySelector('.friend_block_content')?.textContent.trim().split('\n')[0] || steamId;
@@ -161,9 +167,11 @@
       statValues[0].textContent = String(friends.length);
       statValues[1].textContent = String(online);
       statValues[2].textContent = String(Object.keys(groups).length);
+      log.debug('statistics.update', '好友统计已更新', { loaded: friends.length, online, groups: Object.keys(groups).length });
     }
     function updateSelectionCount() {
       selectionCount.textContent = `已选 ${getSelectedFriends().length} 位`;
+      log.debug('selection.update', '好友选择已更新', { selected: getSelectedFriends().length });
     }
     const getSelectedFriends = () => {
       return getFriendRows().filter(row => row.querySelector('.select_friend_checkbox, .sse-friend-select')?.checked);
@@ -186,6 +194,7 @@
           renderFriends();
         }, 250);
       }).observe(friendList, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'data-steamid'] });
+      log.debug('observer.ready', '好友列表动态监听已启用');
     }
     createGroup.addEventListener('click', () => {
       const name = groupName.value.trim();
@@ -198,6 +207,7 @@
       updateFriendStats();
       groupSelect.value = name;
       groupStatus.textContent = `已创建分组“${name}”。`;
+      log.info('groups.create', '已创建本地分组');
     });
     addToGroup.addEventListener('click', () => {
       const name = groupSelect.value;
@@ -212,6 +222,7 @@
       updateFriendStats();
       groupSelect.value = name;
       groupStatus.textContent = `已将 ${friends.length} 位好友加入“${name}”。`;
+      log.info('groups.add', '已加入本地分组', { count: friends.length });
     });
     removeFromGroup.addEventListener('click', () => {
       const name = groupSelect.value;
@@ -226,6 +237,7 @@
       updateFriendStats();
       groupSelect.value = name;
       groupStatus.textContent = `已从“${name}”移除 ${before - groups[name].length} 位好友。`;
+      log.info('groups.remove', '已从本地分组移除好友', { count: before - groups[name].length });
     });
     deleteGroup.addEventListener('click', () => {
       const name = groupSelect.value;
@@ -236,20 +248,21 @@
       renderGroups();
       updateFriendStats();
       groupStatus.textContent = `已删除分组“${name}”。`;
+      log.info('groups.delete', '已删除本地分组');
     });
 
     send.addEventListener('click', async () => {
       const friends = getSelectedFriends();
       const comment = message.value.trim();
       const sessionId = getSessionId();
-      if (!friends.length) { status.textContent = '请先在 Steam 好友列表中选择至少一位好友。'; return; }
-      if (!comment) { status.textContent = '请输入评论内容。'; message.focus(); return; }
-      if (new TextEncoder().encode(comment).length > 1000) { status.textContent = '评论超过 Steam 的 1000 字节限制。'; return; }
-      if (!sessionId) { status.textContent = '未能读取 Steam 会话，请刷新好友页面后重试。'; return; }
-      if (!window.confirm(`将向 ${friends.length} 位已选好友的个人主页发送相同评论。此操作无法撤回，继续吗？`)) return;
+      if (!friends.length) { log.debug('comments.validate', '未选择好友'); status.textContent = '请先在 Steam 好友列表中选择至少一位好友。'; return; }
+      if (!comment) { log.debug('comments.validate', '未填写评论'); status.textContent = '请输入评论内容。'; message.focus(); return; }
+      if (new TextEncoder().encode(comment).length > 1000) { log.warn('comments.validate', '评论超出字节限制'); status.textContent = '评论超过 Steam 的 1000 字节限制。'; return; }
+      if (!sessionId) { log.warn('comments.validate', '未读取到 Steam 会话'); status.textContent = '未能读取 Steam 会话，请刷新好友页面后重试。'; return; }
+      if (!window.confirm(`将向 ${friends.length} 位已选好友的个人主页发送相同评论。此操作无法撤回，继续吗？`)) { log.debug('comments.cancel', '用户取消批量留言'); return; }
 
       send.disabled = true;
-      log.info('开始批量留言', { count: friends.length });
+      const task = log.begin('comments.send', { count: friends.length }, 'info');
       status.textContent = `已确认，准备向 ${friends.length} 位好友发送……`;
       const results = [];
       try {
@@ -259,6 +272,7 @@
           const name = friend.querySelector('.friend_block_content')?.textContent.trim().split('\n')[0] || steamId;
           status.textContent = `正在处理 ${index + 1}/${friends.length}：${name}`;
           try {
+          task.debug('request', '开始发送留言', { index: index + 1, total: friends.length });
           const body = new URLSearchParams({ comment, count: '6', sessionid: sessionId });
           const response = await fetch(`/comment/Profile/post/${steamId}/-1/`, {
             method: 'POST', credentials: 'same-origin',
@@ -267,18 +281,21 @@
           const result = await response.json();
           if (!response.ok || result.success === false) throw new Error(result.error || `HTTP ${response.status}`);
           results.push(`已发送 ${name}`);
-          log.debug('留言发送成功', { index: index + 1, total: friends.length });
+          task.debug('sent', '留言发送成功', { index: index + 1, total: friends.length });
           } catch (error) {
-            log.warn('留言发送失败', { index: index + 1, message: error.message });
+            task.warn('failed', '留言发送失败', { index: index + 1, error });
             results.push(`发送失败 ${name}：${error.message || '请求失败'}`);
           }
           status.textContent = `${index + 1}/${friends.length}\n${results.slice(-5).join('\n')}`;
-          if (index + 1 < friends.length) await new Promise(resolve => setTimeout(resolve, 4000));
+          if (index + 1 < friends.length) {
+            task.debug('interval', '等待下一次发送', { delayMs: 4000 });
+            await new Promise(resolve => setTimeout(resolve, 4000));
+          }
         }
         status.textContent = `处理完成：${results.filter(result => result.startsWith('已发送')).length} 成功，${results.filter(result => result.startsWith('发送失败')).length} 失败。\n${results.join('\n')}`;
-        log.info('批量留言完成', { success: results.filter(result => result.startsWith('已发送')).length, failed: results.filter(result => result.startsWith('发送失败')).length });
+        task.end('批量留言处理完成', { success: results.filter(result => result.startsWith('已发送')).length, failed: results.filter(result => result.startsWith('发送失败')).length });
       } catch (error) {
-        log.error('批量留言中断', error.message);
+        task.fail(error);
         status.textContent = `批量发送中断：${error.message || String(error)}`;
       } finally {
         send.disabled = false;

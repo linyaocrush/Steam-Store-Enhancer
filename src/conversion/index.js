@@ -92,116 +92,14 @@ static readString(jsonString, cls) {
   }
   const countyInfos = Jsons.readJson(countyObjs, Array).sort((a, b) => a.name.localeCompare(b.name));
   const countyCode2Info = new Map(countyInfos.map((v) => [v.code, v]));
-  class Setting {
-countyCode = "CN";
-currencySymbol = "￥";
-currencySymbolBeforeValue = true;
-rateCacheExpired = 1e3 * 60 * 60;
-useCustomRate = false;
-customRate = 1;
-oldVersion = "0.0.0";
-currVersion = "0.0.0";
-logLevel = "info";
-disableOnMarket = false;
-  }
-  const STORAGE_KEY_PREFIX = "Storage:";
-  const STORAGE_KEY_RATE_CACHES = STORAGE_KEY_PREFIX + "RateCache";
-  const STORAGE_KEY_SETTING = STORAGE_KEY_PREFIX + "Setting";
+  const { SettingManager, storage: GmUtils } = createConversionSettings({ Jsons, countyCode2Info });
   class Attrs {
     static STATUS_KEY = "data-spc-status";
   }
   var _GM_cookie = (() => typeof GM_cookie != "undefined" ? GM_cookie : void 0)();
-  var _GM_deleteValue = (() => typeof GM_deleteValue != "undefined" ? GM_deleteValue : void 0)();
-  var _GM_getValue = (() => typeof GM_getValue != "undefined" ? GM_getValue : void 0)();
-  var _GM_info = (() => typeof GM_info != "undefined" ? GM_info : void 0)();
-  var _GM_setValue = (() => typeof GM_setValue != "undefined" ? GM_setValue : void 0)();
   var _GM_xmlhttpRequest = (() => typeof GM_xmlhttpRequest != "undefined" ? GM_xmlhttpRequest : void 0)();
   var _unsafeWindow = (() => typeof unsafeWindow != "undefined" ? unsafeWindow : void 0)();
-  const Logger = createLogger('汇率转换');
-  class Strings {
-    static format(format, ...args) {
-      args = args || [];
-      let message = format;
-      for (let arg of args) {
-        message = message.replace("%s", arg);
-      }
-      return message;
-    }
-  }
-  class GmUtils {
-    static getSimpleValue(key, defaultValue) {
-      const value = _GM_getValue(key);
-      return value || defaultValue;
-    }
-    static getObjValue(cls, key, defaultValue) {
-      const value = _GM_getValue(key);
-      return value ? Jsons.readString(value, cls) : defaultValue;
-    }
-    static setSimpleValue(key, value) {
-      _GM_setValue(key, value);
-    }
-    static setObjValue(key, value) {
-      _GM_setValue(key, Jsons.toString(value));
-    }
-    static deleteValue(key) {
-      _GM_deleteValue(key);
-    }
-  }
-  class SettingManager {
-    static instance = new SettingManager();
-    setting;
-    constructor() {
-      this.setting = this.loadSetting();
-    }
-    loadSetting() {
-      const setting = GmUtils.getObjValue(Setting, STORAGE_KEY_SETTING, new Setting());
-      setting.oldVersion = setting.currVersion;
-      setting.currVersion = _GM_info.script.version;
-      if (setting.oldVersion === setting.currVersion) {
-        Logger.info("读取设置", setting);
-      } else {
-        Logger.debug(Strings.format(`版本更新重置设置：%s -> %s`, setting.oldVersion, setting.currVersion));
-        this.saveSetting(setting);
-      }
-      return setting;
-    }
-saveSetting(setting) {
-      Logger.info("保存设置", setting);
-      this.setting = setting;
-      GmUtils.setObjValue(STORAGE_KEY_SETTING, setting);
-    }
-    setCountyCode(countyCode) {
-      const county = countyCode2Info.get(countyCode);
-      if (!county) {
-        throw Error(`国家代码不存在：${countyCode}`);
-      }
-      this.setting.countyCode = countyCode;
-      this.saveSetting(this.setting);
-    }
-    setCurrencySymbol(currencySymbol) {
-      this.setting.currencySymbol = currencySymbol;
-      this.saveSetting(this.setting);
-    }
-    setCurrencySymbolBeforeValue(isCurrencySymbolBeforeValue) {
-      this.setting.currencySymbolBeforeValue = isCurrencySymbolBeforeValue;
-      this.saveSetting(this.setting);
-    }
-    reset() {
-      this.saveSetting(new Setting());
-    }
-    setRateCacheExpired(rateCacheExpired) {
-      this.setting.rateCacheExpired = rateCacheExpired;
-      this.saveSetting(this.setting);
-    }
-    setUseCustomRate(isUseCustomRate) {
-      this.setting.useCustomRate = isUseCustomRate;
-      this.saveSetting(this.setting);
-    }
-    setCustomRate(customRate) {
-      this.setting.customRate = customRate;
-      this.saveSetting(this.setting);
-    }
-  }
+  const log = diagnostics.scope('conversion');
   class SpcContext {
     _setting;
     _targetCountyInfo;
@@ -261,9 +159,11 @@ saveSetting(setting) {
       return this.request(cls, details);
     }
     static request(cls, details) {
+      const task = diagnostics.scope('network').begin('conversion.request', { method: details.method });
       return new Promise((resolve, reject) => {
+        const fail = error => { task.fail(error); reject(error); };
         details.onload = (response) => {
-          if (response.status < 200 || response.status >= 300) { reject(new Error("HTTP " + response.status)); return; }
+          if (response.status < 200 || response.status >= 300) { fail(new Error("HTTP " + response.status)); return; }
           try {
           if (cls.name === String.name) {
             resolve(response.response);
@@ -271,12 +171,14 @@ saveSetting(setting) {
             const json = JSON.parse(response.response);
             resolve(Jsons.readJson(json, cls));
           }
-          } catch (error) { reject(error); }
+          task.end('转换模块请求完成', { status: response.status });
+          } catch (error) { fail(error); }
         };
         details.timeout = 20000;
-        details.ontimeout = () => reject(new Error("请求超时"));
-        details.onerror = (error) => reject(error);
-        _GM_xmlhttpRequest(details);
+        details.ontimeout = () => fail(new Error("请求超时"));
+        details.onerror = () => fail(new Error('网络请求失败'));
+        try { _GM_xmlhttpRequest(details); }
+        catch (error) { fail(error); }
       });
     }
   }
@@ -301,7 +203,7 @@ saveSetting(setting) {
           return countyCode;
         }
       } catch (e) {
-        Logger.warn("读取商店页面区域代码变量失败： " + e.message);
+        log.warn('country.page', '读取商店页面区域代码变量失败', { error: e });
       }
       const dataConfig = storeDom.querySelector("div#application_config")?.getAttribute("data-config");
       if (dataConfig) {
@@ -345,7 +247,7 @@ saveSetting(setting) {
           const code = _unsafeWindow.g_strCountryCode;
           if (code) return resolve(code);
         } catch (err) {
-          Logger.error(err);
+          log.debug('country.market', '读取市场区域失败', { error: err });
         }
         reject();
       });
@@ -363,135 +265,29 @@ saveSetting(setting) {
       ];
     }
     async getCountyCode() {
-      Logger.info("尝试获取区域代码");
+      const task = log.begin('country.resolve');
       for (let provider of this.providers) {
         if (!provider.match()) {
           continue;
         }
-        Logger.debug(`尝试通过[${provider.name()}]获取区域代码`);
+        task.debug('provider', '尝试区域来源', { provider: provider.name() });
         try {
           const countyCode = await provider.getCountyCode();
-          Logger.info(`通过[${provider.name()}]获取区域代码成功`);
+          task.end('区域读取成功', { provider: provider.name(), country: countyCode });
           return countyCode.toUpperCase();
         } catch (e) {
-          Logger.debug(`通过[${provider.name()}]获取区域代码失败`, e?.message || e);
+          task.debug('fallback', '尝试下一个区域来源', { provider: provider.name(), error: e });
         }
       }
-      throw new Error("所有获取区域代码策略都获取失败");
+      const error = new Error("所有获取区域代码策略都获取失败");
+      task.fail(error);
+      throw error;
     }
   }
-  class RateCache {
-    constructor(from, to, rate, createdAt) {
-      this.from = from;
-      this.to = to;
-      this.createdAt = createdAt || 0;
-      this.rate = rate || 0;
-    }
-    from;
-    to;
-    createdAt;
-    rate;
-  }
-  class RateCaches {
-    caches = new Map();
-    getCache(from, to) {
-      const key = this.buildCacheKey(from, to);
-      return this.caches.get(key);
-    }
-    setCache(cache) {
-      this.caches.set(this.buildCacheKey(cache.from, cache.to), cache);
-    }
-    buildCacheKey(from, to) {
-      return `${from}:${to}`;
-    }
-  }
-  class RateManager {
-    static instance = new RateManager();
-    memoryCache = null;
-    pendingRequests = new Map();
-    isBroken = false;
-constructor() {
-    }
-    getName() {
-      return "RateManager";
-    }
-    async getRate4Remote(sourceCurrency, targetCurrency) {
-      Logger.info(`[Rate] 远程获取汇率: ${sourceCurrency} -> ${targetCurrency}...`);
-      let rate;
-      const url = `https://api.augmentedsteam.com/rates/v1?to=${sourceCurrency}`;
-      try {
-        const res = await Http.get(Map, url);
-        rate = res.get(targetCurrency)?.[sourceCurrency];
-      } catch (e) {
-        Logger.error(`[Rate] 获取汇率对(${sourceCurrency} -> ${targetCurrency})失败`, e);
-      }
-      if (rate) return rate;
-      throw Error(`所有汇率获取实现对币种对(${sourceCurrency} -> ${targetCurrency})均失败`);
-    }
-    async getRate(sourceCurrencyCode, targetCurrencyCode) {
-      if (this.isBroken) {
-        throw new Error("[Rate] 汇率服务已熔断，停止请求");
-      }
-      const context = SpcContext.getContext();
-      const from = sourceCurrencyCode || context.currentCountyInfo.currencyCode;
-      const to = targetCurrencyCode || context.targetCountyInfo.currencyCode;
-      const cacheKey = `${from}:${to}`;
-      const pending = this.pendingRequests.get(cacheKey);
-      if (pending) return pending;
-      const requestPromise = (async () => {
-        try {
-          if (!this.memoryCache) {
-            this.memoryCache = this.loadRateCache();
-            Logger.info(`[Rate] 内存缓存加载:`, this.memoryCache);
-          }
-          let cache = this.memoryCache.getCache(from, to);
-          const now = Date.now();
-          const expired = context.setting.rateCacheExpired;
-          if (!cache || !cache.rate || now > cache.createdAt + expired) {
-            Logger.info(`[Rate] 缓存缺失或过期: ${from} -> ${to}`);
-            try {
-              const remoteRate = await this.getRate4Remote(from, to);
-              cache = new RateCache(from, to, remoteRate, now);
-              this.memoryCache.setCache(cache);
-              this.saveRateCache();
-            } catch (e) {
-              if (cache && cache.rate) {
-                Logger.warn(`[Rate] 远程刷新失败，回退至旧缓存: ${from} -> ${to}`);
-                return cache.rate;
-              }
-              this.isBroken = true;
-              Logger.error(`[Rate] 汇率获取彻底失败，触发全局熔断: ${from} -> ${to}`);
-              throw e;
-            }
-          }
-          return cache.rate;
-        } finally {
-          this.pendingRequests.delete(cacheKey);
-        }
-      })();
-      this.pendingRequests.set(cacheKey, requestPromise);
-      return requestPromise;
-    }
-    loadRateCache() {
-      const setting = SpcContext.getContext().setting;
-      if (setting.oldVersion !== setting.currVersion) {
-        Logger.info(`脚本版本发生变化需要刷新汇率缓存`);
-        this.clear();
-        return new RateCaches();
-      }
-      Logger.info(`读取汇率缓存`);
-      return GmUtils.getObjValue(RateCaches, STORAGE_KEY_RATE_CACHES, new RateCaches());
-    }
-    saveRateCache() {
-      if (!this.memoryCache) return;
-      Logger.info("保存汇率缓存", this.memoryCache);
-      GmUtils.setObjValue(STORAGE_KEY_RATE_CACHES, this.memoryCache);
-    }
-    clear() {
-      this.memoryCache = null;
-      GmUtils.deleteValue(STORAGE_KEY_RATE_CACHES);
-    }
-  }
+  const RateManager = { instance: createRateService({ storage: GmUtils,
+    getContext: () => SpcContext.getContext(),
+    fetchRates: from => Http.get(Map, `https://api.augmentedsteam.com/rates/v1?to=${from}`)
+  }) };
   class SpcManager {
     static instance = new SpcManager();
     constructor() {
@@ -561,180 +357,10 @@ afterConvert(elementSnap, result) {
       }
     }
   }
-  function escapeRegex(str) {
-    return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  }
-  const allSepChars = Array.from(new Set(
-    countyInfos.flatMap((c) => [c.decimalSep, c.thousandsSep].filter(Boolean))
-  )).map((s) => s === " " ? "\\s" : escapeRegex(s)).join("");
-  const NUMBER_BLOCK_REGEX = new RegExp(`\\d[\\d${allSepChars}]*\\d|\\d`, "g");
-  const SORTED_RULES_TEMPLATE = [...countyInfos].sort((a, b) => b.symbol.length - a.symbol.length || Number(a.fractionDigits === 0) - Number(b.fractionDigits === 0) || a.currencyCode.localeCompare(b.currencyCode));
-  function tryMatchSymbol(text, numStart, numEnd, info) {
-    if (info.symbolPos === "front") {
-      const prefix = info.symbol + info.symbolGap;
-      const start2 = numStart - prefix.length;
-      if (start2 < 0) return null;
-      const slice = text.substring(start2, numStart);
-      if (slice.toUpperCase() !== prefix.toUpperCase()) return null;
-      return { matchStart: start2, matchEnd: numEnd };
-    } else {
-      const suffix = info.symbolGap + info.symbol;
-      const end = numEnd + suffix.length;
-      if (end > text.length) return null;
-      const slice = text.substring(numEnd, end);
-      if (slice.toUpperCase() !== suffix.toUpperCase()) return null;
-      return { matchStart: numStart, matchEnd: end };
-    }
-  }
-  function tryMatchSymbolRelaxed(text, numStart, numEnd, info) {
-    if (info.symbolPos === "front") {
-      let cursor = numStart;
-      while (cursor > 0 && /\s/.test(text[cursor - 1])) cursor--;
-      const start2 = cursor - info.symbol.length;
-      if (start2 < 0) return null;
-      const slice = text.substring(start2, cursor);
-      if (slice.toUpperCase() !== info.symbol.toUpperCase()) return null;
-      return { matchStart: start2, matchEnd: numEnd };
-    } else {
-      let cursor = numEnd;
-      while (cursor < text.length && /\s/.test(text[cursor])) cursor++;
-      const end = cursor + info.symbol.length;
-      if (end > text.length) return null;
-      const slice = text.substring(cursor, end);
-      if (slice.toUpperCase() !== info.symbol.toUpperCase()) return null;
-      return { matchStart: numStart, matchEnd: end };
-    }
-  }
-  function validateNumberDNA(numStr, info) {
-    const seps = new Set(
-      numStr.replace(/\d/g, "").split("").filter(Boolean).map((s) => /\s/.test(s) ? " " : s)
-    );
-    for (const sep of seps) {
-      if (sep !== info.thousandsSep && sep !== info.decimalSep) {
-        return false;
-      }
-    }
-    if (info.fractionDigits === 0 && info.decimalSep && seps.has(info.decimalSep)) {
-      return false;
-    }
-    return true;
-  }
-  function parseNumber(numStr, info) {
-    let clean = numStr;
-    if (info.thousandsSep) {
-      clean = clean.split(info.thousandsSep).join("");
-    }
-    if (info.decimalSep && info.decimalSep !== ".") {
-      clean = clean.replace(info.decimalSep, ".");
-    }
-    const val = parseFloat(clean);
-    return isNaN(val) ? null : val;
-  }
-  class PriceProcessor {
-static async convertContent(text) {
-      const setting = SettingManager.instance.setting;
-      const targetCode = SpcContext.getContext().currentCountyInfo.code;
-      return await this.processTextAsync(
-        text,
-        setting.countyCode,
-        setting.currencySymbol,
-        setting.currencySymbolBeforeValue,
-        targetCode
-      );
-    }
-static async processTextAsync(text, countryCode, targetSymbol, isBefore, targetCode) {
-      if (!/\d/.test(text)) return text;
-      const currentRule = countyInfos.find((c) => c.code === targetCode);
-      const isCart = isCartPage();
-      const otherRules = SORTED_RULES_TEMPLATE.filter((c) => {
-        return c.code !== targetCode && (isCart || (c.code !== countryCode && c.currencyCode !== countyCode2Info.get(countryCode)?.currencyCode));
-      });
-      const matches = [];
-      for (const numMatch of text.matchAll(NUMBER_BLOCK_REGEX)) {
-        const numStr = numMatch[0];
-        const numStart = numMatch.index;
-        const numEnd = numStart + numStr.length;
-        let matched = false;
-        const relaxedOut = { candidate: null };
-        if (currentRule && currentRule.code !== countryCode) {
-          matched = this.tryRule(text, numStr, numStart, numEnd, currentRule, matches, relaxedOut);
-        }
-        if (!matched) {
-          for (const rule of otherRules) {
-            if (this.tryRule(text, numStr, numStart, numEnd, rule, matches, relaxedOut)) {
-              matched = true;
-              break;
-            }
-          }
-        }
-        if (!matched && relaxedOut.candidate) {
-          matches.push(relaxedOut.candidate);
-        }
-      }
-      if (matches.length === 0) return text;
-      const uniqueCurrencies = [...new Set(matches.map((m) => m.info.currencyCode))];
-      const rateMap = new Map();
-      let setting = SpcContext.getContext().setting;
-      if (setting.useCustomRate) {
-        Logger.info(`[PriceProcessor] 使用自定义汇率，当前自定义汇率为${setting.customRate}`);
-        uniqueCurrencies.forEach((code) => rateMap.set(code, setting.customRate));
-      } else {
-        await Promise.all(uniqueCurrencies.map(async (code) => {
-          try {
-            const rate = await RateManager.instance.getRate(code);
-            rateMap.set(code, rate);
-          } catch (e) {
-            Logger.error(`[PriceProcessor] 获取币种汇率失败: ${code}`, e);
-          }
-        }));
-      }
-      let result = text;
-      matches.sort((a, b) => b.index - a.index);
-      for (const m of matches) {
-        const rate = rateMap.get(m.info.currencyCode);
-        if (!rate) continue;
-        const converted = Number.parseFloat((m.value / rate).toFixed(2));
-        const formatted = isBefore ? `(${targetSymbol}${converted})` : `(${converted}${targetSymbol})`;
-        result = result.substring(0, m.index) + m.raw + formatted + result.substring(m.index + m.length);
-      }
-      Logger.debug(`[PriceProcessor] 转换成功，命中 ${matches.length} 处价格`);
-      return result;
-    }
-static tryRule(text, numStr, numStart, numEnd, info, matches, relaxedOut) {
-      const range = tryMatchSymbol(text, numStart, numEnd, info);
-      if (range && validateNumberDNA(numStr, info)) {
-        const value = parseNumber(numStr, info);
-        if (value !== null) {
-          const raw = text.substring(range.matchStart, range.matchEnd);
-          matches.push({
-            index: range.matchStart,
-            length: raw.length,
-            value,
-            info,
-            raw
-          });
-          return true;
-        }
-      }
-      if (relaxedOut && !relaxedOut.candidate) {
-        const relaxedRange = tryMatchSymbolRelaxed(text, numStart, numEnd, info);
-        if (relaxedRange) {
-          const value = parseNumber(numStr, info);
-          if (value !== null) {
-            const raw = text.substring(relaxedRange.matchStart, relaxedRange.matchEnd);
-            relaxedOut.candidate = {
-              index: relaxedRange.matchStart,
-              length: raw.length,
-              value,
-              info,
-              raw
-            };
-          }
-        }
-      }
-      return false;
-    }
-  }
+  const PriceProcessor = createPriceProcessor({ countries: countyInfos, countryMap: countyCode2Info,
+    getSetting: () => SettingManager.instance.setting, getContext: () => SpcContext.getContext(),
+    getRate: code => RateManager.instance.getRate(code), isCart: isCartPage
+  });
   class ElementConverter extends AbstractConverter {
     getCssSelectors() {
       const home = [
@@ -894,7 +520,7 @@ targets = new Map([
             return node;
           }
         } catch (e) {
-          Logger.debug("获取文本节点失败，但不确定该节点是否一定会出现。selector：" + selector);
+          log.debug('nodes.fallback', '文本节点路径不适用，尝试其他路径', { selector });
         }
       }
       return null;
@@ -932,7 +558,7 @@ targets = new Map([
                 converter.afterConvert(elementSnap, elementConverted);
               }
             } catch (e) {
-              Logger.error('价格转换失败', e.message, element);
+              log.error('nodes.convert-failed', '价格转换失败', { error: e, element });
             }
           })();
           tasks.push(task);
@@ -942,36 +568,41 @@ targets = new Map([
     }
   }
   async function initializeConversion() {
-    if (!GM_getValue("sse_convert_enabled", true)) return;
+    if (!GM_getValue("sse_convert_enabled", true)) { log.debug('initialize.skip', '价格转换已关闭'); return; }
+    const task = log.begin('initialize', undefined, 'info');
     try {
       // SSR text must stay intact until React has adopted the server-rendered cart.
       if (isCartPage() && _unsafeWindow.SSR) {
+        task.debug('hydrate.wait', '等待购物车页面接管服务端内容');
         const deadline = Date.now() + 15000;
         while (!_unsafeWindow.SSR.hydrated && Date.now() < deadline) {
           await new Promise(resolve => setTimeout(resolve, 100));
         }
+        task.debug('hydrate.ready', '结束页面就绪等待', { hydrated: Boolean(_unsafeWindow.SSR.hydrated) });
       }
       await initContext();
       await start();
+      task.end('价格转换初始化完成');
     }
-    catch (error) { Logger.error("价格转换初始化失败", error); }
+    catch (error) { task.fail(error); }
   }
   async function start() {
     const context = SpcContext.getContext();
     if (context.setting.disableOnMarket && window.location.href === "https://steamcommunity.com/market/") {
-      Logger.info("已开启市场首页禁用，跳过转换");
+      log.info('start.skip', '已开启市场首页禁用，跳过转换');
       return;
     }
     if (context.currentCountyInfo.code === context.targetCountyInfo.code && !isCartPage()) {
-      Logger.info(`${context.currentCountyInfo.name}无需转换`);
+      log.info('start.skip', '当前区域与目标一致，无需转换', { country: context.currentCountyInfo.code });
       return;
     }
-    Logger.info(` 核心启动：目标：${context.targetCountyInfo.name}`);
+    log.info('start.ready', '开始价格转换', { target: context.targetCountyInfo.code });
     await convert();
   }
   async function convert() {
     const exchangerManager = ConverterManager.instance;
     const elements = document.querySelectorAll(exchangerManager.getSelector());
+    log.debug('scan.initial', '扫描初始价格节点', { count: elements.length });
     await exchangerManager.convert(elements);
     const selector = exchangerManager.getSelector();
     const priceObserver = new MutationObserver(async (mutations) => {
@@ -994,6 +625,7 @@ targets = new Map([
         }
       });
       if (uniqueTargets.size > 0) {
+        log.debug('scan.mutation', '处理变化的价格节点', { count: uniqueTargets.size });
         await exchangerManager.convert(uniqueTargets);
       }
     });
@@ -1002,32 +634,33 @@ targets = new Map([
       subtree: true,
       characterData: true
     });
+    log.debug('observer.ready', '价格变化监听已启用');
   }
   async function initContext() {
     const setting = SettingManager.instance.setting;
     let targetCountyInfo = countyCode2Info.get(setting.countyCode);
     if (!targetCountyInfo) {
-      Logger.warn(`获取转换后的国家(${setting.countyCode})信息失败，默认为美国：` + setting.countyCode);
+      log.warn('context.target-fallback', '目标区域未知，使用美国', { country: setting.countyCode });
       targetCountyInfo = countyCode2Info.get("US");
     }
-    Logger.info("目标区域：", targetCountyInfo);
+    log.debug('context.target', '目标区域已就绪', targetCountyInfo);
     let currCountyCode;
     try {
       currCountyCode = await CountyCodeProviderManager.instance.getCountyCode();
     } catch (error) {
       if (!isCartPage()) throw error;
       currCountyCode = 'US';
-      Logger.warn('购物车无法读取账号地区，改按商品价格中的币种符号识别原币种', error.message);
+      log.warn('context.cart-fallback', '账号地区不可用，按商品币种符号识别', { error });
     }
     if (currCountyCode) {
-      Logger.info("区域代码：", currCountyCode);
+      log.debug('context.country', '账号区域已就绪', { country: currCountyCode });
     }
     let currCountInfo = countyCode2Info.get(currCountyCode);
     if (!currCountInfo) {
-      Logger.warn("缺少当前国家的信息映射：county: " + currCountyCode + ", 默认为美国");
+      log.warn('context.source-fallback', '当前区域缺少映射，使用美国', { country: currCountyCode });
       currCountInfo = countyCode2Info.get("US");
     }
-    Logger.info("当前区域：", currCountInfo);
+    log.debug('context.source', '原币种区域已就绪', currCountInfo);
     _unsafeWindow.SpcManager = SpcManager.instance;
     _unsafeWindow.spcContext = new SpcContext(setting, targetCountyInfo, currCountInfo);
   }

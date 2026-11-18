@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import vm from 'node:vm';
+import { loggingSource } from './helpers/logging.mjs';
 
 test('friend tools mount after native management and use native card selection', async () => {
   function element(tag) {
@@ -44,7 +45,7 @@ test('friend tools mount after native management and use native card selection',
   });
   const shared = await readFile(new URL('../src/shared.js', import.meta.url), 'utf8');
   const source = await readFile(new URL('../src/friend-tools.js', import.meta.url), 'utf8');
-  vm.runInContext(shared + '\n' + source + '\ninitializeFriendTools();', context);
+  vm.runInContext(await loggingSource() + '\n' + shared + '\n' + source + '\ninitializeFriendTools();', context);
   assert.equal(opened, true);
   const root = manage.next;
   assert.equal(root.id, 'sse-friend-tools');
