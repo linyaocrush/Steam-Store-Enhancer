@@ -22,7 +22,7 @@ test('wishlist replacement moves into the native slot and survives repeated scan
     parent.children.push(node);
     return node;
   }
-  const row = { children: [], querySelector: () => native };
+  const row = { children: [], querySelector: () => native, querySelectorAll: () => native ? [native] : [] };
   const slot = { children: [] };
   const control = element(row);
   let native = null;
@@ -40,4 +40,46 @@ test('wishlist replacement moves into the native slot and survives repeated scan
   place(row, control);
   assert.deepEqual(newSlot.children, [control, native]);
   assert.equal(slot.children.length, 1);
+});
+
+test('wishlist replacement recognizes the already-in-cart control', async () => {
+  const source = await readFile(new URL('../src/cart-tools.js', import.meta.url), 'utf8');
+  const context = vm.createContext({});
+  vm.runInContext(source, context);
+  const place = context.placeWishlistCartButton;
+  const slot = { children: [] };
+  const native = {
+    parent: slot,
+    textContent: '在购物车中',
+    getAttribute: () => null,
+    classList: { add() {} },
+    get previousElementSibling() { return this.parent.children[this.parent.children.indexOf(this) - 1]; },
+    before(other) {
+      if (other.parent) other.parent.children.splice(other.parent.children.indexOf(other), 1);
+      other.parent = this.parent;
+      this.parent.children.splice(this.parent.children.indexOf(this), 0, other);
+    }
+  };
+  slot.children.push(native);
+  const row = {
+    querySelector: () => null,
+    querySelectorAll: () => [native]
+  };
+  const control = {
+    parent: null,
+    classList: { add() {} }
+  };
+
+  assert.equal(place(row, control), true);
+  assert.deepEqual(slot.children, [control, native]);
+});
+
+test('already-in-cart labels are detected in Chinese and English', async () => {
+  const source = await readFile(new URL('../src/cart-tools.js', import.meta.url), 'utf8');
+  const context = vm.createContext({});
+  vm.runInContext(source, context);
+  const detects = context.isInCartButton;
+  assert.equal(detects({ getAttribute: () => null, textContent: '在购物车中' }), true);
+  assert.equal(detects({ getAttribute: () => null, textContent: 'In Cart' }), true);
+  assert.equal(detects({ getAttribute: () => null, textContent: 'Add to Cart' }), false);
 });

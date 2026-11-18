@@ -1,6 +1,23 @@
+  function findWishlistCartButton(row) {
+    const nativeButton = row.querySelector('.E4PXslhR-fI- > button:not(.sse-quick-add), button.LrqeL6o22aQ-:not(.sse-quick-add), .purchase_area .btnv6_green_white_innerfade:not(.sse-quick-add), .purchase_area .btn_addtocart:not(.sse-quick-add)');
+    if (nativeButton) return nativeButton;
+    return Array.from(row.querySelectorAll('a, button')).find(element => {
+      const label = [element.getAttribute('aria-label'), element.getAttribute('title'), element.getAttribute('data-tooltip-text'), element.textContent]
+        .filter(Boolean).join(' ');
+      return /加入购物车|在购物车中|已在购物车|已加入购物车|购物车中|add(?:ed)?\s+to\s+cart|in\s+cart|view\s+cart/i.test(label);
+    }) || null;
+  }
+
+  function isInCartButton(element) {
+    if (!element) return false;
+    const label = [element.getAttribute('aria-label'), element.getAttribute('title'), element.getAttribute('data-tooltip-text'), element.textContent]
+      .filter(Boolean).join(' ');
+    return /在购物车中|已在购物车|已加入购物车|购物车中|added\s+to\s+cart|in\s+cart|view\s+cart/i.test(label);
+  }
+
   function placeWishlistCartButton(row, control) {
     // Keep React-owned controls in place; hide them only while our replacement is adjacent.
-    const nativeButton = row.querySelector('.E4PXslhR-fI- > button:not(.sse-quick-add), button.LrqeL6o22aQ-:not(.sse-quick-add), .purchase_area .btnv6_green_white_innerfade:not(.sse-quick-add), .purchase_area .btn_addtocart:not(.sse-quick-add)');
+    const nativeButton = findWishlistCartButton(row);
     if (!nativeButton) return false;
     control.classList.add('sse-wishlist-cart');
     nativeButton.classList.add('sse-wishlist-native-cart');
@@ -373,7 +390,16 @@
         const wishlistRow = row.matches('.wishlist_row, [data-rfd-draggable-id^="WishlistItem-"]');
         const existing = row.querySelector('.sse-quick-add');
         if (existing) {
-          if (wishlistRow) placeWishlistCartButton(row, existing);
+          if (wishlistRow) {
+            const native = findWishlistCartButton(row);
+            if (native) {
+              const alreadyInCart = isInCartButton(native);
+              existing.disabled = alreadyInCart;
+              const label = existing.querySelector('span') || existing;
+              label.textContent = alreadyInCart ? text('✓ 已在购物车中', '✓ In cart') : text('＋ 加入购物车', '＋ Add to cart');
+            }
+            placeWishlistCartButton(row, existing);
+          }
           return;
         }
         const inferred = inferItemFromScope(row);
@@ -381,9 +407,10 @@
         const item = { type: inferred.type === 'package' ? 'sub' : inferred.type, id: Number(inferred.id) };
         if (!Number.isSafeInteger(item.id) || item.id <= 0) return;
         const purchaseRow = row.matches('.game_purchase_action');
-        const nativeButton = purchaseRow ? row.querySelector('a[href*="addToCart"], a[onclick*="addToCart"], button[onclick*="addToCart"], a[href*="addBundleToCart"], a[onclick*="addBundleToCart"], button[onclick*="addBundleToCart"], a.btn_addtocart, button.btn_addtocart') : null;
+        const nativeButton = purchaseRow ? row.querySelector('a[href*="addToCart"], a[onclick*="addToCart"], button[onclick*="addToCart"], a[href*="addBundleToCart"], a[onclick*="addBundleToCart"], button[onclick*="addBundleToCart"], a.btn_addtocart, button.btn_addtocart') || findWishlistCartButton(row) : null;
         if (purchaseRow && !nativeButton) return;
-        const control = button(text('＋ 加入购物车', '＋ Add to cart'), async () => {
+        const alreadyInCart = isInCartButton(nativeButton || (wishlistRow ? findWishlistCartButton(row) : null));
+        const control = button(alreadyInCart ? text('✓ 已在购物车中', '✓ In cart') : text('＋ 加入购物车', '＋ Add to cart'), async () => {
           const currentItem = inferItemFromScope(row);
           if (!currentItem) return;
           const target = { type: currentItem.type === 'package' ? 'sub' : currentItem.type, id: Number(currentItem.id) };
@@ -398,10 +425,11 @@
           if (cartButton) cartButton.style.display = '';
         });
         control.classList.add('sse-quick-add');
+        control.disabled = alreadyInCart;
         if (nativeButton) {
           control.className = nativeButton.className + ' sse-quick-add sse-native-cart';
           const label = document.createElement('span');
-          label.textContent = text('加入购物车', 'Add to Cart');
+          label.textContent = alreadyInCart ? text('已在购物车中', 'In Cart') : text('加入购物车', 'Add to Cart');
           control.replaceChildren(label);
           // Keep purchase IDs available after replacing the native button.
           control.setAttribute(item.type === 'bundle' ? 'data-ds-bundleid' : item.type === 'sub' ? 'data-ds-packageid' : 'data-ds-appid', String(item.id));
