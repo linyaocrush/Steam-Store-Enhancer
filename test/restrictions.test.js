@@ -127,9 +127,9 @@ test('badge mounts next to game title, updates recycled AppIDs and ignores its o
     appendChild(badge) { badges.push(badge); }
   };
   const context = await harness({
-    location: { hostname: 'store.steampowered.com', pathname: '/search/' },
+    location: { hostname: 'store.steampowered.com', pathname: '/search/' }, AbortController,
     setTimeout: callback => { scheduled = callback; return 1; },
-    setInterval() { return 1; }, clearInterval() {}, window: { addEventListener() {} },
+    clearTimeout() {}, setInterval() { return 1; }, clearInterval() {}, window: { addEventListener() {} },
     MutationObserver: class { constructor(callback) { observer = callback; } observe() {} },
     document: {
       head: { appendChild() {} }, body: {}, querySelectorAll: () => [title],

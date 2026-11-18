@@ -99,7 +99,6 @@
         throw new Error(text('Steam 拒绝了购物车操作。', 'Steam rejected the cart operation.'));
       }
       const response = validateCartResponse(data, method);
-      if (payload !== undefined && resultCode !== '1' && data.response.result !== 1) throw invalidResponse('Steam 未确认购物车操作成功');
       task.end('购物车接口操作完成');
       return response;
       } catch (error) { task.fail(error); throw error; }
@@ -299,6 +298,7 @@
       toolbar.append(button(text('导出', 'Export'), run(async () => {
         log.info('export.start', '开始导出购物车');
         const { cart } = await account('GetCart');
+        if (!Array.isArray(cart?.line_items)) throw invalidResponse('购物车列表无效，未执行修改。');
         const lines = [];
         for (const item of cart?.line_items || []) {
           const target = { type: item.packageid ? 'sub' : 'bundle', id: Number(item.packageid || item.bundleid) };
@@ -340,6 +340,7 @@
           }
         }
         const { cart } = await account('GetCart');
+        if (!Array.isArray(cart?.line_items)) throw invalidResponse('购物车列表无效，无法导出。');
         const items = cart?.line_items || [];
         for (const [index, item] of items.entries()) {
           await account('ModifyLineItem', { line_item_id: item.line_item_id, gift_info: giftInfo, flags: { is_gift: gift, is_private: false } });

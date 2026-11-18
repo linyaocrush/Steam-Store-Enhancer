@@ -4,7 +4,10 @@
   function createFeatureScope(name) {
     featureScopes.get(name)?.dispose();
     const disposers = new Set();
-    const controller = new AbortController();
+    const controller = typeof AbortController === 'function' ? new AbortController() : {
+      signal: { aborted: false, addEventListener() {}, removeEventListener() {} },
+      abort() { this.signal.aborted = true; }
+    };
     const scope = {
       signal: controller.signal,
       get active() { return !controller.signal.aborted; },
@@ -107,7 +110,14 @@
     observer.observe(root, { childList: true, subtree: true, characterData: true,
       ...(attributes.length ? { attributes: true, attributeFilter: attributes } : {}) });
     scope.own(() => { observer.disconnect(); cancelTimer?.(); pending.clear(); });
-    const scan = () => { metrics.fullScans++; collect(root); dirty = true; schedule(); };
+    const scan = () => {
+      metrics.fullScans++;
+      if (root === document.body && document.querySelectorAll) {
+        for (const match of document.querySelectorAll(selector)) if (!owned(match)) pending.add(match);
+      } else collect(root);
+      dirty = true;
+      schedule();
+    };
     if (initial) scan();
     return { scan, notify, flush, metrics };
   }

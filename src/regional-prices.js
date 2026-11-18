@@ -113,7 +113,7 @@
       const p = (block.data && (block.data.price || block.data.price_overview)) || null;
       if (!p) return null;
       return normalizePrice({
-        currency: p.currency,
+        currency: p.currency || currencyFallback,
         final: p.final,
         initial: p.initial,
         finalFormatted: p.final_formatted,

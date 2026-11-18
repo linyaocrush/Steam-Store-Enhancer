@@ -18,7 +18,7 @@ async function harness() {
     }
   };
   const context = vm.createContext({
-    unsafeWindow: page, document, NodeFilter: { SHOW_TEXT: 4 },
+    unsafeWindow: page, document, NodeFilter: { SHOW_TEXT: 4 }, AbortController,
     isCartPage: () => true,
     GM_getValue: () => undefined, GM_setValue() {}, GM_info: { script: { version: '1.3.1' } },
     MutationObserver: class { constructor(callback) { observer = callback; } observe() {} }
@@ -46,7 +46,7 @@ async function harness() {
     element.text = { nodeType: 3, nodeValue: value, parentElement: element, isConnected: true };
     return element;
   }
-  return { api, document, price, notify: mutations => observer(mutations) };
+  return { api, document, price, notify: async mutations => { observer(mutations); for (let i = 0; i < 20; i++) await Promise.resolve(); } };
 }
 
 test('SSR cart original, final and both summary prices are converted with the USD source used for PK', async () => {

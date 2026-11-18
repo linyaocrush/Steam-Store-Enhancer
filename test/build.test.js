@@ -26,7 +26,7 @@ test('shared session and DOM helpers are used by feature modules', async () => {
   assert.match(await readFile(new URL('../src/conversion/index.js', import.meta.url), 'utf8'), /\?\.COUNTRY/);
   assert.match(cart, /if \(!contextPromise\) \{/);
   assert.match(await readFile(new URL('../src/conversion/index.js', import.meta.url), 'utf8'), /context\.currentCountyInfo\.code === context\.targetCountyInfo\.code && !isCartPage\(\)/);
-  assert.ok((await readFile(new URL('../src/conversion/index.js', import.meta.url), 'utf8')).includes('main [class*="price" i]'));
+  assert.ok((await readFile(new URL('../src/pages.js', import.meta.url), 'utf8')).includes('main [class*="price" i]'));
   const conversion = await readFile(new URL('../src/conversion/index.js', import.meta.url), 'utf8');
   assert.match(conversion, /if \(!isCartPage\(\)\) throw error/);
   const processor = await readFile(new URL('../src/conversion/price-processor.js', import.meta.url), 'utf8');
@@ -60,5 +60,5 @@ test('friend comment tool is included and requires explicit confirmation', async
   assert.match(source, /已加载好友/);
   assert.match(source, /在线好友/);
   assert.match(source, /new MutationObserver/);
-  assert.match(main, /initializeFriendTools\(\)/);
+  assert.match(main, /start: initializeFriendTools/);
 });

@@ -20,13 +20,13 @@
           ...options, method: options.method || 'GET', url, timeout,
           ...(probe ? { headers: { ...options.headers, Range: 'bytes=0-16383' } } : {}),
           onprogress: event => {
-            if (probe && event.loaded >= 16384 && event.status >= 200 && event.status < 300) {
-              finish(null, { status: event.status, responseText: '' });
+            if (probe && event.loaded >= 16384) {
+              finish(null, { status: event.status || 206, responseText: '' });
               handle?.abort();
             }
           },
           onload: response => {
-            if (response.status >= 200 && response.status < 300) finish(null, response);
+            if ((response.status >= 200 && response.status < 300) || (response.status === 0 && response.responseText)) finish(null, response);
             else finish(requestError('http', 'HTTP ' + response.status, response.status));
           },
           onerror: () => finish(requestError('network', '网络请求失败')),

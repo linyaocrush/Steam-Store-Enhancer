@@ -4,7 +4,7 @@
     return canonical && /^\d+$/.test(String(id)) && Number.isSafeInteger(number) && number > 0
       ? { type: canonical, id: String(number) } : null;
   }
-  function itemField(item) { return { app: 'appid', package: 'packageid', bundle: 'bundleid' }[itemRef(item.type, item.id)?.type]; }
+  function itemField(item) { return { app: 'appid', package: 'packageid', sub: 'packageid', bundle: 'bundleid' }[itemRef(item.type, item.id)?.type]; }
   function itemKey(item) { const ref = itemRef(item.type, item.id); return ref ? `${ref.type}:${ref.id}` : null; }
   function itemFromLink(href) {
     const match = String(href || '').match(/\/(app|sub|bundle)\/(\d+)(?:\/|$|\?)/);
@@ -23,6 +23,9 @@
         const ref = itemRef('bundle', id);
         if (ref) return ref;
       }
+      const bundleHolder = scopeEl.closest('[data-ds-bundleid]');
+      const bundleId = bundleHolder?.getAttribute('data-ds-bundleid')?.split(',')[0];
+      if (itemRef('bundle', bundleId)) return itemRef('bundle', bundleId);
       const sub = purchase.querySelector('input[name="subid"]');
       const ref = itemRef('package', sub?.value);
       if (ref) return ref;

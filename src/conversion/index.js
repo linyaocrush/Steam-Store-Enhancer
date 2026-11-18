@@ -496,10 +496,12 @@ targets = new Map([
     const exchangerManager = ConverterManager.instance;
     const selector = exchangerManager.getSelector();
     const scope = conversionScope || (conversionScope = createFeatureScope('conversion'));
+    const initial = document.querySelectorAll(selector);
+    await exchangerManager.convert(initial);
+    if (!scope.active) return;
     const scanner = createDomScanner({ scope, selector, name: 'conversion', initial: false,
       process: nodes => exchangerManager.convert(nodes) });
-    scanner.scan();
-    await scanner.flush();
+    return scanner;
     log.debug('observer.ready', '价格变化监听已启用');
   }
   async function initContext() {

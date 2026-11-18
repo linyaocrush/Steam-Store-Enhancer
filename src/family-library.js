@@ -42,7 +42,12 @@
     try { if (onStore) accountId = readIdentity().steamid; }
     catch (error) { notice = '暂时无法读取登录信息，请刷新 Steam 商店页面。'; log.warn('session.read', notice, { error }); }
     function validCache() {
-      return cache && cache.apps && Array.isArray(cache.members) && (!onStore || (accountId && cache.steamid === accountId));
+      return cache && cache.apps && typeof cache.apps === 'object' && !Array.isArray(cache.apps) &&
+        Array.isArray(cache.members) && cache.members.length > 0 && /^\d{17}$/.test(String(cache.steamid)) &&
+        cache.members.every(id => /^\d{17}$/.test(String(id))) &&
+        Object.entries(cache.apps).every(([id, game]) => itemRef('app', id) && game && typeof game.name === 'string' &&
+          Array.isArray(game.owners) && game.owners.every(owner => /^\d{17}$/.test(String(owner)))) &&
+        (!onStore || (accountId && cache.steamid === accountId));
     }
     function ownerName(id) { return cache?.names?.[String(id)] || String(id); }
     function gameDescription(game) {

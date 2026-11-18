@@ -82,7 +82,12 @@
     const adv = root.querySelector('#sapx-adv');
     adv.removeAttribute('open');
     const cur = getTargetRegion();
-    select.innerHTML = REGIONS.map(r => '<option value="' + r.id + '">' + r.label + '</option>').join('');
+    select.replaceChildren(...REGIONS.map(region => {
+      const option = document.createElement('option');
+      option.value = region.id;
+      option.textContent = region.label;
+      return option;
+    }));
     select.value = cur.id;
     showCode.checked = getShowRegionCode();
     const field = id => root.querySelector('#sse-' + id);

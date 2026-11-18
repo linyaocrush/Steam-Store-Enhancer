@@ -15,7 +15,7 @@
         try {
           const response = await fetchRates(from);
           const rate = response.get(to)?.[from];
-          if (!rate) throw new Error(`汇率接口没有返回有效币种对：${from} -> ${to}`);
+          if (!Number.isFinite(Number(rate)) || Number(rate) <= 0) throw new Error(`汇率接口没有返回有效币种对：${from} -> ${to}`);
           task.end('汇率读取成功', { rate });
           return rate;
         } catch (error) { task.fail(error); throw error; }

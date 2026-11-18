@@ -317,7 +317,10 @@
   function createFeatureScope(name) {
     featureScopes.get(name)?.dispose();
     const disposers = new Set();
-    const controller = new AbortController();
+    const controller = typeof AbortController === 'function' ? new AbortController() : {
+      signal: { aborted: false, addEventListener() {}, removeEventListener() {} },
+      abort() { this.signal.aborted = true; }
+    };
     const scope = {
       signal: controller.signal,
       get active() { return !controller.signal.aborted; },
@@ -490,7 +493,7 @@
     return canonical && /^\d+$/.test(String(id)) && Number.isSafeInteger(number) && number > 0
       ? { type: canonical, id: String(number) } : null;
   }
-  function itemField(item) { return { app: 'appid', package: 'packageid', bundle: 'bundleid' }[itemRef(item.type, item.id)?.type]; }
+  function itemField(item) { return { app: 'appid', package: 'packageid', sub: 'packageid', bundle: 'bundleid' }[itemRef(item.type, item.id)?.type]; }
   function itemKey(item) { const ref = itemRef(item.type, item.id); return ref ? `${ref.type}:${ref.id}` : null; }
   function itemFromLink(href) {
     const match = String(href || '').match(/\/(app|sub|bundle)\/(\d+)(?:\/|$|\?)/);
@@ -631,13 +634,13 @@
           ...options, method: options.method || 'GET', url, timeout,
           ...(probe ? { headers: { ...options.headers, Range: 'bytes=0-16383' } } : {}),
           onprogress: event => {
-            if (probe && event.loaded >= 16384 && event.status >= 200 && event.status < 300) {
-              finish(null, { status: event.status, responseText: '' });
+            if (probe && event.loaded >= 16384) {
+              finish(null, { status: event.status || 206, responseText: '' });
               handle?.abort();
             }
           },
           onload: response => {
-            if (response.status >= 200 && response.status < 300) finish(null, response);
+            if ((response.status >= 200 && response.status < 300) || (response.status === 0 && response.responseText)) finish(null, response);
             else finish(requestError('http', 'HTTP ' + response.status, response.status));
           },
           onerror: () => finish(requestError('network', '网络请求失败')),
@@ -1056,7 +1059,7 @@
       const p = (block.data && (block.data.price || block.data.price_overview)) || null;
       if (!p) return null;
       return normalizePrice({
-        currency: p.currency,
+        currency: p.currency || currencyFallback,
         final: p.final,
         initial: p.initial,
         finalFormatted: p.final_formatted,
@@ -2153,10 +2156,12 @@ targets = new Map([
     const exchangerManager = ConverterManager.instance;
     const selector = exchangerManager.getSelector();
     const scope = conversionScope || (conversionScope = createFeatureScope('conversion'));
+    const initial = document.querySelectorAll(selector);
+    await exchangerManager.convert(initial);
+    if (!scope.active) return;
     const scanner = createDomScanner({ scope, selector, name: 'conversion', initial: false,
       process: nodes => exchangerManager.convert(nodes) });
-    scanner.scan();
-    await scanner.flush();
+    return scanner;
     log.debug('observer.ready', '价格变化监听已启用');
   }
   async function initContext() {
@@ -2684,7 +2689,6 @@ targets = new Map([
         throw new Error(text('Steam 拒绝了购物车操作。', 'Steam rejected the cart operation.'));
       }
       const response = validateCartResponse(data, method);
-      if (payload !== undefined && resultCode !== '1' && data.response.result !== 1) throw invalidResponse('Steam 未确认购物车操作成功');
       task.end('购物车接口操作完成');
       return response;
       } catch (error) { task.fail(error); throw error; }
