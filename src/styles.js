@@ -5,6 +5,7 @@
       style.textContent =
         '.sapx-extra-price{margin-left:6px;font-size:0.9em;opacity:1;white-space:nowrap;pointer-events:none;color:#67c1f5;display:inline-block;font-weight:normal;text-decoration:none!important}' +
         '.sapx-extra-price::before,.sapx-extra-price::after{content:none!important;display:none!important}' +
+        '.sapx-region-locked{display:inline-block;margin-left:6px;color:#e46767!important;font-size:0.9em;font-weight:700;white-space:nowrap;pointer-events:none}' +
         'strike .sapx-extra-price,.discount_original_price .sapx-extra-price,.StoreOriginalPrice .sapx-extra-price{opacity:0.65;font-size:0.85em;color:#acb2b8;text-decoration:none!important}' +
         '#sapx-cart-summary{margin-top:8px;margin-bottom:8px;padding:8px 0;border-top:1px solid rgba(255,255,255,0.1);color:#c6d4df;font-size:12px;line-height:1.4}' +
         '#sapx-cart-summary .sapx-row{display:flex;justify-content:space-between;gap:8px;align-items:center}' +

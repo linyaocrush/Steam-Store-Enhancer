@@ -371,6 +371,17 @@
     }
   }
 
+  function markRegionLocked(priceEl, region) {
+    let badge = priceEl.querySelector('.sapx-region-locked');
+    if (!badge) {
+      badge = document.createElement('span');
+      badge.className = 'sapx-region-locked';
+      badge.textContent = '锁区';
+      priceEl.appendChild(badge);
+    }
+    badge.setAttribute(MARK_ATTR, region.id);
+  }
+
   async function enhancePriceElement(priceEl, forceType = 'auto') {
     if (!priceEl || priceEl.nodeType !== 1 || priceEl.classList.contains(EXTRA_CLASS)) return;
     if (pendingElements.has(priceEl)) return;
@@ -385,11 +396,19 @@
     const item = inferItemFromScope(priceEl);
     if (!item) return;
 
+    const locked = priceEl.querySelector('.sapx-region-locked');
+    if (locked && locked.getAttribute(MARK_ATTR) === region.id) return;
+
     pendingElements.add(priceEl);
     let price;
     try { price = await getPriceForItem(item, region); }
     finally { pendingElements.delete(priceEl); }
-    if (!price || !priceEl.isConnected) return;
+    if (!priceEl.isConnected) return;
+    if (!price || !price.ok) {
+      markRegionLocked(priceEl, region);
+      return;
+    }
+    priceEl.querySelector('.sapx-region-locked')?.remove();
 
     let wantInitial = false;
     if (forceType === 'initial') {
@@ -409,8 +428,17 @@
   async function updateCartSummary() {
     if (!isCartPage()) return;
     const region = getTargetRegion();
-    const items = document.querySelectorAll('._3ypRUtQoOfOrCsyHlzfGm4 > div.Panel.Focusable');
-    if (!items.length) return;
+    const itemNodes = document.querySelectorAll('.i-xXuvHLioU-[role="button"]');
+    const items = itemNodes.length ? itemNodes : document.querySelectorAll('.bKkQiLkI-vk-');
+    const totalValue = Array.from(document.querySelectorAll('.i1XZFikuzME- .n9HLAjXXhvI-'))
+      .find(element => element.getClientRects().length > 0) || document.querySelector('.i1XZFikuzME- .n9HLAjXXhvI-');
+    const totalRow = totalValue?.closest('._1mIUrXeHG3k-') || Array.from(document.querySelectorAll('.i1XZFikuzME- > div'))
+      .find(row => /预计总额/.test(row.textContent));
+    if (!items.length || !totalRow) {
+      createLogger('地区价格').debug('购物车汇总等待页面节点', { items: items.length, totalRow: Boolean(totalRow) });
+      scheduleCartSummaryRetry();
+      return;
+    }
 
     let sumMinor = 0;
     let missingCount = 0;
@@ -423,22 +451,34 @@
       else missingCount++;
     }
 
-    const cartSummaryRow = document.querySelector('._2DjadWLFH3keW9rGWZKxSk._1G8JdfmCwhonn-pZk-tfwP');
-    if (!cartSummaryRow) return;
-
     let box = document.getElementById(CART_SUMMARY_ID);
-    if (!box) {
+    if (!box || !box.isConnected) {
       box = document.createElement('div');
       box.id = CART_SUMMARY_ID;
-      cartSummaryRow.appendChild(box);
+      totalRow.after(box);
     }
 
     const totalText = formatMinorToCurrency(sumMinor, region.currency);
     const label = getShowRegionCode() ? '目标地区预计付款 (' + region.short + ')' : '目标地区预计付款';
 
     let html = '<div class="sapx-row"><div class="sapx-label">' + label + '：</div><div class="sapx-value">' + totalText + '</div></div>';
-    if (missingCount > 0) html += '<div class="sapx-warn">注意：有 ' + missingCount + ' 项商品无法在目标地区购买（已从合计剔除）</div>';
+    if (missingCount > 0) html += '<div class="sapx-warn">目标地区有 ' + missingCount + ' 款锁区游戏，未计入小计</div>';
     if (box.innerHTML !== html) box.innerHTML = html;
+    createLogger('地区价格').info('购物车额外地区汇总完成', {
+      region: region.id,
+      total: totalText,
+      items: items.length,
+      missing: missingCount
+    });
+  }
+
+  let cartSummaryRetry = null;
+  function scheduleCartSummaryRetry() {
+    if (cartSummaryRetry || !isCartPage()) return;
+    cartSummaryRetry = setTimeout(() => {
+      cartSummaryRetry = null;
+      updateCartSummary();
+    }, 800);
   }
 
   const PRICE_SELECTORS = [
@@ -447,7 +487,8 @@
     '.col.search_price.responsive_secondrow .discount_final_price',
     '.Panel.Focusable .StoreOriginalPrice', '.Panel.Focusable .pk-LoKoNmmPK4GBiC9DR8',
     '._2WLaY5TxjBGVyuWe_6KS3N', '.game_area_purchase_game_dropdown_selection > span',
-    '.game_area_purchase_game_dropdown_menu_item_text'
+    '.game_area_purchase_game_dropdown_menu_item_text',
+    '.StoreOriginalPrice', '.j3jr1YqpBGk- > .-nS4ZC0Bruo-'
   ].join(',');
 
   function isPriceLeaf(el) {
@@ -461,6 +502,13 @@
     if (!/[\d]|Free|免费/i.test(txt)) return false;
     if (/^\d+$/.test(txt)) return false;
     return true;
+  }
+
+  function scanCartFallback() {
+    document.querySelectorAll('.i-xXuvHLioU-[role="button"]').forEach(row => {
+      row.querySelectorAll('.StoreOriginalPrice, .j3jr1YqpBGk- > .-nS4ZC0Bruo-')
+        .forEach(price => enhancePriceElement(price));
+    });
   }
 
   function scanWishlistFallback() {
@@ -513,7 +561,7 @@
       scanTimer = null;
       document.querySelectorAll(PRICE_SELECTORS).forEach(el => { enhancePriceElement(el); });
       if (isWishlistPage()) scanWishlistFallback();
-      if (isCartPage()) updateCartSummary();
+      if (isCartPage()) { scanCartFallback(); updateCartSummary(); }
     }, 450);
   }
 

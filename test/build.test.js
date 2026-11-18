@@ -31,6 +31,15 @@ test('shared session and DOM helpers are used by feature modules', async () => {
   const conversion = await readFile(new URL('../src/conversion.js', import.meta.url), 'utf8');
   assert.match(conversion, /if \(!isCartPage\(\)\) throw error/);
   assert.ok(conversion.includes('c.code !== targetCode && (isCart || (c.code !== countryCode'));
+  const regional = await readFile(new URL('../src/regional-prices.js', import.meta.url), 'utf8');
+  assert.match(regional, /function markRegionLocked/);
+  assert.match(regional, /有 ' \+ missingCount \+ ' 款锁区游戏/);
+  assert.match(regional, /function scanCartFallback/);
+  assert.match(regional, /预计总额/);
+  assert.ok(regional.includes('.i1XZFikuzME- .n9HLAjXXhvI-'));
+  assert.match(regional, /function scheduleCartSummaryRetry/);
+  assert.match(regional, /购物车额外地区汇总完成/);
+  assert.match(regional, /getClientRects\(\)\.length > 0/);
 });
 
 test('friend comment tool is included and requires explicit confirmation', async () => {
