@@ -3614,6 +3614,21 @@ targets = new Map([
     return null;
   }
 
+  function findWishlistSaleBadgePosition(row, price) {
+    const priceLink = price.closest?.('a[href*="/app/"]') || price;
+    // Find the nearest wrapper containing both the price and cart actions, then
+    // place the badge after that wrapper rather than inside the bordered price card.
+    for (let parent = priceLink.parentElement; parent && parent !== row; parent = parent.parentElement) {
+      if (parent.querySelector('button, [role="button"]') && parent.parentElement) {
+        return { container: parent.parentElement, reference: parent.nextSibling };
+      }
+    }
+    const priceContainer = priceLink.parentElement;
+    return priceContainer?.parentElement
+      ? { container: priceContainer.parentElement, reference: priceContainer.nextSibling }
+      : { container: priceContainer, reference: priceLink.nextSibling };
+  }
+
   function initializeWishlistSaleCountdown() {
     if (location.hostname !== 'store.steampowered.com' || !isWishlistPage()) return;
 
@@ -3657,7 +3672,9 @@ targets = new Map([
         const badge = document.createElement('span');
         badge.className = 'sse-wishlist-sale-expiration';
         badge.dataset.endTime = String(endTime);
-        if (price.matches('a[href*="/app/"]')) price.appendChild(badge);
+        // Mount below the price/action flex row so Steam's layout cannot squeeze it beside the price.
+        const position = findWishlistSaleBadgePosition(row, price);
+        if (position.container) position.container.insertBefore(badge, position.reference || null);
         else price.after(badge);
       }
       updateCountdowns();

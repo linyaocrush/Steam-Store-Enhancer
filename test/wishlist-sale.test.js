@@ -45,3 +45,28 @@ test('new React wishlist discount prices are detected without relying on hashed 
 
   assert.equal(context.findWishlistSalePrice(row), priceLink);
 });
+
+test('wishlist sale badge is placed after the price/cart area, outside its inner flex card', async () => {
+  const source = await readFile(new URL('../src/wishlist-sale.js', import.meta.url), 'utf8');
+  const button = {};
+  const priceLink = {};
+  const row = {};
+  const outerLayout = { parentElement: row };
+  const afterPurchase = {};
+  const purchaseRow = {
+    parentElement: outerLayout,
+    nextSibling: afterPurchase,
+    querySelector: () => button
+  };
+  const priceCard = { parentElement: purchaseRow };
+  purchaseRow.querySelector = selector => selector === 'button, [role="button"]' ? button : null;
+  priceCard.querySelector = () => null;
+  priceLink.parentElement = priceCard;
+  priceLink.closest = () => priceLink;
+  const context = vm.createContext({});
+  vm.runInContext(source, context);
+
+  const position = context.findWishlistSaleBadgePosition(row, priceLink);
+  assert.equal(position.container, outerLayout);
+  assert.equal(position.reference, afterPurchase);
+});
