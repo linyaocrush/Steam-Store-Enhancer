@@ -6,6 +6,7 @@ import { loggingSource } from './helpers/logging.mjs';
 
 async function harness() {
   const source = (await Promise.all(['settings', 'rates', 'price-processor', 'index'].map(name => readFile(new URL(`../src/conversion/${name}.js`, import.meta.url), 'utf8')))).join('\n');
+  const pageSources = await Promise.all(['pages.js', 'items.js', 'runtime.js'].map(name => readFile(new URL(`../src/${name}`, import.meta.url), 'utf8')));
   const page = {};
   let observer;
   const document = {
@@ -22,7 +23,7 @@ async function harness() {
     GM_getValue: () => undefined, GM_setValue() {}, GM_info: { script: { version: '1.3.1' } },
     MutationObserver: class { constructor(callback) { observer = callback; } observe() {} }
   });
-  vm.runInContext(await loggingSource(), context);
+  vm.runInContext(await loggingSource() + '\n' + pageSources.join('\n'), context);
   vm.runInContext(source.replace('get setting() { return SettingManager.instance.setting; },',
     'get setting() { return SettingManager.instance.setting; }, ElementConverter, SpcContext, countyCode2Info, convert,'), context);
   const api = vm.runInContext('conversion', context);

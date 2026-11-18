@@ -20,8 +20,7 @@ test('shared session and DOM helpers are used by feature modules', async () => {
   assert.match(family, /createElement\('div', undefined, 'sse-family-window'\)/);
   assert.doesNotMatch(family, /\bnode\(/);
   assert.match(cart, /readStoreSession\(doc, globals\)/);
-  assert.doesNotMatch(shared, /BigInt\(/);
-  assert.match(shared, /76561197960265728 \+ accountId/);
+  assert.match(shared, /76561197960265728n \+ BigInt\(accountId\)/);
   assert.match(shared, /settings\.COUNTRY_CODE/);
   assert.match(await readFile(new URL('../src/conversion/index.js', import.meta.url), 'utf8'), /readStoreSession\(storeDom, sessionGlobals\)\.country/);
   assert.match(await readFile(new URL('../src/conversion/index.js', import.meta.url), 'utf8'), /\?\.COUNTRY/);

@@ -26,6 +26,7 @@
   }
 
   function initializeCartTools() {
+    const scope = createFeatureScope('cart');
     const log = diagnostics.scope('cart');
     log.info('initialize', '快速加购与购物车管理已启用');
     const page = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
@@ -50,9 +51,15 @@
       .sse-cart-dialog h3{color:#e5e5e5;margin-top:0}.sse-cart-dialog .sse-cart-button{display:block;width:100%;margin-top:8px;text-align:left}
     `;
     document.head.appendChild(style);
+    const nativeReplacements = new Map();
+    scope.own(() => {
+      for (const [control, native] of nativeReplacements) if (control.isConnected) control.replaceWith(native);
+      document.querySelectorAll('.sse-quick-add, #sse-cart-extract, #sse-cart-tools, .sse-cart-dialog, .sse-account-country').forEach(node => node.remove());
+      document.querySelectorAll('.sse-wishlist-native-cart').forEach(node => node.classList.remove('sse-wishlist-native-cart'));
+      style.remove();
+    });
     let contextPromise;
     let busy = false;
-    const itemRequests = new Map();
 
     function readContext(doc, globals = {}) {
       const session = readStoreSession(doc, globals);
@@ -66,7 +73,7 @@
           log.debug('session.read', '读取当前页面账号信息', { hasToken: Boolean(result.token), country: result.country });
           if (!result.token || !result.country) {
             log.debug('session.fallback', '从购物车页面补充账号信息');
-            const html = await gmGet('https://store.steampowered.com/cart/');
+            const html = await gmGet('https://store.steampowered.com/cart/', { signal: scope.signal });
             const remote = new DOMParser().parseFromString(html, 'text/html');
             const fallback = readContext(remote);
             result = { ...result, token: result.token || fallback.token, country: result.country || fallback.country };
@@ -84,36 +91,35 @@
       const current = await context();
       const url = new URL('https://api.steampowered.com/IAccountCartService/' + method + '/v1/');
       url.searchParams.set('access_token', current.token);
-      const options = { method: payload === undefined ? 'GET' : 'POST', signal: AbortSignal.timeout(20000) };
+      const options = { method: payload === undefined ? 'GET' : 'POST', signal: scope.signal };
       if (payload !== undefined) options.body = new URLSearchParams({ input_json: JSON.stringify({ user_country: current.country, ...payload }) });
-      const response = await fetch(url.href, options);
-      if (!response.ok) throw new Error('HTTP ' + response.status);
-      const data = await response.json();
-      const resultCode = response.headers?.get('x-eresult');
+      const { data, headers } = await fetchJson(url.href, options);
+      const resultCode = headers?.get('x-eresult');
       if ((resultCode && resultCode !== '1') || (data.response?.result != null && data.response.result !== 1)) {
         throw new Error(text('Steam 拒绝了购物车操作。', 'Steam rejected the cart operation.'));
       }
-      if (!data.response) throw new Error(text('Steam 返回了无效结果。', 'Invalid Steam response.'));
+      const response = validateCartResponse(data, method);
+      if (payload !== undefined && resultCode !== '1' && data.response.result !== 1) throw invalidResponse('Steam 未确认购物车操作成功');
       task.end('购物车接口操作完成');
-      return data.response;
+      return response;
       } catch (error) { task.fail(error); throw error; }
     }
 
-    async function storeItem(item) {
-      const key = item.type + '/' + item.id;
-      if (itemRequests.has(key)) log.debug('item.cache', '复用商品查询', { item: key });
-      if (!itemRequests.has(key)) itemRequests.set(key, (async () => {
+    const itemCache = createAsyncCache({ load: async (key, item) => {
         log.debug('item.fetch', '读取商品购买选项', { item: key });
         const current = await context();
-        const field = { app: 'appid', sub: 'packageid', bundle: 'bundleid' }[item.type];
+        const field = itemField(item);
         const payload = { ids: [{ [field]: item.id }], context: { language: current.language, country_code: current.country, steam_realm: 1 }, data_request: { include_all_purchase_options: true } };
-        const response = JSON.parse(await requestQueue.enqueue(() => gmGet('https://api.steampowered.com/IStoreBrowseService/GetItems/v1/?input_json=' + encodeURIComponent(JSON.stringify(payload)))));
-        const result = response.response?.store_items?.[0];
+        const signal = scope.signal;
+        const response = JSON.parse(await requestQueue.enqueue(() => gmGet('https://api.steampowered.com/IStoreBrowseService/GetItems/v1/?input_json=' + encodeURIComponent(JSON.stringify(payload)), { signal }), { signal }));
+        const result = validateStoreItems(response)[0];
         if (!result) throw new Error(text('无法读取商品：', 'Cannot read item: ') + key);
         log.debug('item.ready', '商品购买选项已读取', { item: key });
         return result;
-      })().catch(error => { itemRequests.delete(key); log.warn('item.failed', '商品读取失败', { item: key, error }); throw error; }));
-      return itemRequests.get(key);
+      } });
+    scope.own(() => itemCache.clear());
+    async function storeItem(item) {
+      return itemCache.get(itemKey(item), item);
     }
 
     function parseItems(input) {
@@ -150,13 +156,15 @@
         const heading = document.createElement('h3');
         heading.textContent = title;
         panel.appendChild(heading);
-        const close = value => { log.debug('option.close', value ? '已选择选项' : '已取消选择'); overlay.remove(); window.removeEventListener('keydown', escape); resolve(value); };
+        let dispose;
+        const close = value => { log.debug('option.close', value ? '已选择选项' : '已取消选择'); overlay.remove(); window.removeEventListener('keydown', escape); if (dispose) scope.release(dispose); resolve(value); };
         const escape = event => { if (event.key === 'Escape') close(null); };
         for (const option of options) panel.appendChild(button((option.purchase_option_name || '') + ' · ' + (option.formatted_final_price || ''), () => close(option)));
         panel.appendChild(button(text('取消', 'Cancel'), () => close(null)));
         overlay.appendChild(panel);
         overlay.addEventListener('click', event => { if (event.target === overlay) close(null); });
         window.addEventListener('keydown', escape);
+        dispose = scope.own(() => close(null));
         document.body.appendChild(overlay);
         panel.querySelector('button').focus();
       });
@@ -214,7 +222,7 @@
       // Keep the Steam right column intact and place the tool immediately below its price card.
       if (anchor.nextElementSibling !== panel) anchor.after(panel);
       cartPanelAnchor = anchor;
-      panel.style.width = '100%';
+      if (panel.style.width !== '100%') panel.style.width = '100%';
     }
 
     function mountPanel() {
@@ -363,8 +371,8 @@
       log.debug('panel.mount', '购物车工具面板已挂载');
     }
 
-    const quickSelector = 'a.search_result_row, a.tab_item, a.recommendation_link, .wishlist_row, [data-rfd-draggable-id^="WishlistItem-"], .game_purchase_action';
-    function scanQuickButtons() {
+    const quickSelector = PAGE_ADAPTERS.quick.rows;
+    function scanQuickButtons(rows = document.querySelectorAll(quickSelector)) {
       mountPanel();
       if (!isCartPage() && document.querySelector(quickSelector) && !document.getElementById('sse-cart-extract')) {
         const host = document.querySelector('.wishlist_header, #search_results, .home_tabs_content, .page_content, main');
@@ -386,7 +394,7 @@
         }
       }
       let mounted = 0;
-      document.querySelectorAll(quickSelector).forEach(row => {
+      rows.forEach(row => {
         const wishlistRow = row.matches('.wishlist_row, [data-rfd-draggable-id^="WishlistItem-"]');
         const existing = row.querySelector('.sse-quick-add');
         if (existing) {
@@ -434,6 +442,7 @@
           // Keep purchase IDs available after replacing the native button.
           control.setAttribute(item.type === 'bundle' ? 'data-ds-bundleid' : item.type === 'sub' ? 'data-ds-packageid' : 'data-ds-appid', String(item.id));
           nativeButton.replaceWith(control);
+          nativeReplacements.set(control, nativeButton);
         } else if (!wishlistRow || !placeWishlistCartButton(row, control)) {
           row.appendChild(control);
         }
@@ -441,14 +450,16 @@
       });
       if (mounted) log.debug('quick-add.mount', '已挂载快速加购按钮', { count: mounted });
     }
-    let timer = null;
-    const observer = new MutationObserver(mutations => {
-      if (timer || !mutations.some(mutation => !mutation.target.parentElement?.closest('#sse-cart-tools, .sse-cart-dialog, #sapx-ui-root'))) return;
-      timer = setTimeout(() => { timer = null; scanQuickButtons(); }, 400);
-    });
-    observer.observe(document.body, { childList: true, subtree: true });
+    createDomScanner({ scope, selector: quickSelector, process: scanQuickButtons, name: 'cart',
+      attributes: ITEM_ATTRIBUTES, changed: mountPanel,
+      removed: () => { for (const [control] of nativeReplacements) if (!control.isConnected) nativeReplacements.delete(control); } });
     log.debug('observer.ready', '购物车动态节点监听已启用');
-    window.addEventListener('resize', () => mountPanel(), { passive: true });
+    let resizePending = false;
+    scope.listen(window, 'resize', () => {
+      if (resizePending) return;
+      resizePending = true;
+      scope.timeout(() => { resizePending = false; mountPanel(); }, 150);
+    }, { passive: true });
     scanQuickButtons();
     if (GM_getValue('sse_cart_country', false)) context().then(current => {
       const host = document.querySelector('#header_wallet_ctn');

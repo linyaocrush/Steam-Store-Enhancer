@@ -1,4 +1,5 @@
   function initializeFamilyLibrary() {
+    const scope = createFeatureScope('family');
     const log = diagnostics.scope('family');
     const KEY = 'sse_family_cache_v1';
     const DAY = 86400000;
@@ -32,6 +33,7 @@
       #sse-family-dialog .sse-family-scroll{overflow:auto;max-height:350px}#sse-family-dialog input{box-sizing:border-box;padding:8px;background:#0f141b;color:#c6d4df;border:1px solid #34465a;width:100%;margin:8px 0}
     `;
     document.head.appendChild(style);
+    scope.own(() => { style.remove(); close(); document.querySelectorAll('.sse-family-badge, .sse-family-banner, #sse-family-nav').forEach(node => node.remove()); });
 
     function readIdentity() {
       const session = readStoreSession(document, page);
@@ -40,7 +42,7 @@
     try { if (onStore) accountId = readIdentity().steamid; }
     catch (error) { notice = '暂时无法读取登录信息，请刷新 Steam 商店页面。'; log.warn('session.read', notice, { error }); }
     function validCache() {
-      return cache && cache.apps && (!onStore || !accountId || cache.steamid === accountId);
+      return cache && cache.apps && Array.isArray(cache.members) && (!onStore || (accountId && cache.steamid === accountId));
     }
     function ownerName(id) { return cache?.names?.[String(id)] || String(id); }
     function gameDescription(game) {
@@ -53,8 +55,8 @@
       const url = new URL('https://api.steampowered.com/' + method + '/v1/');
       url.searchParams.set('access_token', token);
       Object.entries(params).forEach(([key, value]) => url.searchParams.set(key, value));
-      const parsed = JSON.parse(await gmGet(url.href));
-      if (!parsed.response) throw new Error('Steam 返回了无效的家庭库数据。');
+      const parsed = JSON.parse(await gmGet(url.href, { signal: scope.signal }));
+      if (!parsed.response || typeof parsed.response !== 'object') throw invalidResponse('Steam 返回了无效的家庭库数据。');
       task.end('家庭库接口请求完成');
       return parsed.response;
       } catch (error) { task.fail(error); throw error; }
@@ -72,16 +74,18 @@
         notice = '正在读取家庭组……'; refreshNotice();
         const family = await api('IFamilyGroupsService/GetFamilyGroupForUser', identity.token, { include_family_group_response: true });
         if (!family.family_groupid || !family.family_group) throw new Error('当前账号没有可读取的 Steam 家庭组。');
-        const members = family.family_group.members || [];
+        const members = family.family_group.members;
+        if (!Array.isArray(members) || !members.length || members.some(member => !/^\d{17}$/.test(String(member?.steamid)))) throw invalidResponse('家庭成员列表无效，原缓存已保留。');
         task.debug('members', '家庭成员已读取', { count: members.length });
         // The API identifies the signed-in member even when the SSR page omits its SteamID.
         const self = identity.steamid || String(family.steamid || '');
-        if (!self) throw new Error('无法确认当前账号 SteamID，未覆盖已保存的家庭库。');
+        if (!/^\d{17}$/.test(self)) throw new Error('无法确认当前账号 SteamID，未覆盖已保存的家庭库。');
         notice = '正在扫描家庭库游戏……'; refreshNotice();
         const library = await api('IFamilyGroupsService/GetSharedLibraryApps', identity.token, {
           family_groupid: family.family_groupid, include_own: true, include_excluded: false, include_non_games: false
         });
-        if (!Array.isArray(library.apps)) throw new Error('家庭库接口没有返回游戏列表，原缓存已保留。');
+        if (!Array.isArray(library.apps) || library.apps.some(app => !itemRef('app', app?.appid) ||
+            !Array.isArray(app.owner_steamids) || app.owner_steamids.some(id => !/^\d{17}$/.test(String(id))))) throw invalidResponse('家庭库游戏列表无效，原缓存已保留。');
         task.debug('library', '共享游戏列表已读取', { count: library.apps.length });
         const names = Object.fromEntries(members.map(member => [String(member.steamid), String(member.steamid)]));
         try {
@@ -96,6 +100,7 @@
           if (Number(app.exclude_reason || 0) !== 0 || !Number.isSafeInteger(Number(app.appid))) continue;
           apps[app.appid] = { name: app.name || String(app.appid), owners: [...new Set((app.owner_steamids || []).map(String))], time: Number(app.rt_time_acquired) || 0 };
         }
+        if (!scope.active || (readIdentity().steamid && readIdentity().steamid !== self)) return;
         cache = { steamid: self, familyId: String(family.family_groupid), name: family.family_group.name || 'Steam 家庭', members: members.map(member => String(member.steamid)), names, apps, updated: Date.now() };
         accountId = self;
         GM_setValue(KEY, cache);
@@ -116,6 +121,7 @@
       return control;
     }
     function open() {
+      if (!scope.active) return;
       log.debug('panel.open', '打开家庭库管理');
       if (!root) {
         root = createElement('div');
@@ -127,16 +133,31 @@
     }
     function close() { if (root) log.debug('panel.close', '关闭家庭库管理'); hideChartTooltip(); root?.remove(); root = null; }
     let chartTooltip = null;
-    function hideChartTooltip() { chartTooltip?.remove(); chartTooltip = null; }
+    let tooltipSize;
+    let tooltipContent;
+    let tooltipFrame;
+    function hideChartTooltip() {
+      if (tooltipFrame) cancelAnimationFrame(tooltipFrame);
+      tooltipFrame = null; tooltipSize = null; tooltipContent = null;
+      chartTooltip?.remove(); chartTooltip = null;
+    }
     function showChartTooltip(content, x, y) {
       if (!chartTooltip) {
         chartTooltip = createElement('div'); chartTooltip.id = 'sse-family-chart-tooltip'; chartTooltip.setAttribute('role', 'tooltip');
         document.documentElement.appendChild(chartTooltip);
       }
-      chartTooltip.textContent = content;
-      const bounds = chartTooltip.getBoundingClientRect();
-      chartTooltip.style.left = Math.max(12, Math.min(x + 14, window.innerWidth - bounds.width - 12)) + 'px';
-      chartTooltip.style.top = Math.max(12, Math.min(y + 14, window.innerHeight - bounds.height - 12)) + 'px';
+      if (tooltipContent !== content || !tooltipSize) {
+        chartTooltip.textContent = content;
+        tooltipContent = content;
+        tooltipSize = chartTooltip.getBoundingClientRect();
+      }
+      if (tooltipFrame) cancelAnimationFrame(tooltipFrame);
+      tooltipFrame = requestAnimationFrame(() => {
+        tooltipFrame = null;
+        if (!chartTooltip || !scope.active) return;
+        chartTooltip.style.left = Math.max(12, Math.min(x + 14, window.innerWidth - tooltipSize.width - 12)) + 'px';
+        chartTooltip.style.top = Math.max(12, Math.min(y + 14, window.innerHeight - tooltipSize.height - 12)) + 'px';
+      });
     }
     function ensureFamilyNav() {
       if (!onStore || !enabled) return;
@@ -191,7 +212,7 @@
       if (label.textContent !== count) label.textContent = count;
       control.title = '查看家庭库贡献统计、最近购入与扫描管理';
     }
-    window.addEventListener('keydown', event => { if (event.key === 'Escape') close(); });
+    scope.listen(window, 'keydown', event => { if (event.key === 'Escape') close(); });
     function renderDialog() {
       if (!root) return;
       hideChartTooltip();
@@ -257,7 +278,8 @@
       log.debug('panel.render', '家庭库面板已更新', { cacheValid: Boolean(validCache()), scanning: Boolean(scanPromise) });
     }
 
-    const targets = 'a[href*="/app/"], [data-ds-appid], [data-app-id], [data-rfd-draggable-id^="WishlistItem-"]';
+    const targets = PAGE_ADAPTERS.family.rows;
+    const marked = new Set();
     function appId(element) {
       const value = element.getAttribute('data-ds-appid') || element.getAttribute('data-app-id');
       if (value && /^\d+$/.test(value)) return value;
@@ -267,37 +289,42 @@
       const match = href.match(/^(?:https?:\/\/(?:store\.steampowered\.com|steamcommunity\.com))?\/app\/(\d+)/);
       return match?.[1] || null;
     }
-    function updateMarks() {
-      ensureFamilyNav();
+    function updateMarks(elements) {
+      if (!scope.active) return;
       const active = enabled && validCache();
-      document.querySelectorAll('[data-sse-family-app]').forEach(element => {
+      for (const element of marked) {
         const id = element.getAttribute('data-sse-family-app');
         const game = active ? cache.apps[id] : null;
-        if (!game || game.owners.includes(cache.steamid) || appId(element) !== id) {
+        if (!element.isConnected || !game || game.owners.includes(cache.steamid) || appId(element) !== id) {
           element.querySelector(':scope > .sse-family-badge')?.remove(); element.removeAttribute('data-sse-family-app');
+          marked.delete(element);
         }
-      });
-      document.querySelectorAll('.sse-family-banner').forEach(element => element.remove());
+      }
+      if (!elements) { ensureFamilyNav(); updateBanner(); }
       if (!active) return;
       let added = 0;
-      document.querySelectorAll(targets).forEach(element => {
+      (elements || document.querySelectorAll(targets)).forEach(element => {
         if (element.closest('#sse-family-dialog, #sapx-ui-root, #sse-cart-tools, .sse-family-banner, .sse-family-badge')) return;
         const id = appId(element); const game = cache.apps[id];
         if (!game || game.owners.includes(cache.steamid) || element.classList.contains('ds_owned') || element.querySelector('.ds_owned_flag:not(.sse-family-badge)')) return;
         const owner = element.parentElement?.closest(targets);
         if (owner && appId(owner) === id) return;
         element.setAttribute('data-sse-family-app', id);
+        marked.add(element);
         let badge = element.querySelector(':scope > .sse-family-badge');
         if (!badge) { badge = createElement('span', '在家庭库中', 'sse-family-badge'); element.appendChild(badge); added++; }
         const title = gameDescription(game);
         if (badge.title !== title) badge.title = title;
       });
       if (added) log.debug('marks.render', '家庭库标记已添加', { count: added });
+    }
+    function updateBanner() {
+      if (!enabled || !validCache()) { document.querySelectorAll('.sse-family-banner').forEach(node => node.remove()); return; }
       const detailId = location.pathname.match(/^\/app\/(\d+)/)?.[1];
       const detail = cache.apps[detailId];
       if (onStore && detail) {
         const host = document.querySelector('.queue_and_playtime, #game_area_purchase, .game_area_purchase');
-        if (host) {
+        if (host && !host.querySelector('.sse-family-banner')) {
           const banner = createElement('div', detail.owners.includes(cache.steamid) ? '您和家庭成员拥有此游戏' : '您的 Steam 家庭库中已有此游戏', 'sse-family-banner');
           banner.title = gameDescription(detail);
           banner.appendChild(action('查看贡献者（' + detail.owners.length + '）', () => window.alert(gameDescription(detail))));
@@ -307,28 +334,19 @@
       }
       if (location.hostname === 'steamdb.keylol.com') {
         const id = location.hash.match(/app\/(\d+)/)?.[1]; const game = cache.apps[id]; const host = document.querySelector('#game_score');
-        if (game && !game.owners.includes(cache.steamid) && host) host.after(createElement('div', '家庭组：' + gameDescription(game), 'sse-family-banner'));
+        if (game && !game.owners.includes(cache.steamid) && host && !document.querySelector('.sse-family-banner')) host.after(createElement('div', '家庭组：' + gameDescription(game), 'sse-family-banner'));
       }
     }
     if (enabled) {
-      let timer = null;
-      const observer = new MutationObserver(mutations => {
-        const relevant = mutations.some(mutation => {
-          const element = mutation.target.nodeType === 1 ? mutation.target : mutation.target.parentElement;
-          if (element?.closest('#sse-family-dialog, #sapx-ui-root, .sse-family-banner, .sse-family-badge')) return false;
-          if (mutation.type === 'attributes') return true;
-          return [...mutation.addedNodes, ...mutation.removedNodes].some(item => item.nodeType === 1 && !item.matches('.sse-family-badge, .sse-family-banner'));
-        });
-        if (timer || !relevant) return;
-        timer = setTimeout(() => { timer = null; updateMarks(); }, 350);
-      });
-      observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['href', 'data-ds-appid', 'data-app-id', 'data-rfd-draggable-id'] });
+      createDomScanner({ scope, name: 'family', selector: targets, process: updateMarks,
+        attributes: ITEM_ATTRIBUTES, changed: () => { ensureFamilyNav(); updateBanner(); },
+        removed: () => { for (const node of marked) if (!node.isConnected) marked.delete(node); } });
       log.debug('observer.ready', '家庭库标记动态监听已启用');
-      window.addEventListener('hashchange', updateMarks);
+      scope.listen(window, 'hashchange', () => updateMarks());
       updateMarks();
       if (onStore && GM_getValue('sse_family_auto', true) && (!validCache() || Date.now() - cache.updated >= DAY)) {
         log.debug('scan.auto', '缓存缺失或过期，触发自动扫描'); scan();
       } else log.debug('scan.skip', '无需自动扫描');
     }
-    return { open };
+    return { open, dispose: scope.dispose };
   }

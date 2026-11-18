@@ -8,13 +8,14 @@ test('friend tools mount after native management and use native card selection',
   function element(tag) {
     return {
       tag, children: [], attributes: {}, events: {}, style: {}, value: '',
-      append(...items) { this.children.push(...items); },
+       append(...items) { this.children.push(...items); },
       appendChild(item) { this.append(item); return item; },
       replaceChildren(...items) { this.children = items; },
       get lastElementChild() { return this.children.at(-1); },
       setAttribute(key, value) { this.attributes[key] = value; },
       addEventListener(name, handler) { this.events[name] = handler; },
-      after(item) { this.next = item; }
+       after(item) { this.next = item; },
+       remove() { this.removed = true; }
     };
   }
   const checkbox = element('input');
@@ -43,10 +44,10 @@ test('friend tools mount after native management and use native card selection',
     GM_getValue: (_, fallback) => fallback, GM_setValue() {},
     MutationObserver: class { observe() {} }
   });
-  const shared = await readFile(new URL('../src/shared.js', import.meta.url), 'utf8');
+  const support = await Promise.all(['shared.js', 'runtime.js', 'pages.js', 'items.js'].map(path => readFile(new URL('../src/' + path, import.meta.url), 'utf8')));
   const source = await readFile(new URL('../src/friend-tools.js', import.meta.url), 'utf8');
-  vm.runInContext(await loggingSource() + '\n' + shared + '\n' + source + '\ninitializeFriendTools();', context);
-  assert.equal(opened, true);
+  vm.runInContext(await loggingSource() + '\n' + support.join('\n') + '\n' + source + '\ninitializeFriendTools();', context);
+  assert.equal(opened, false);
   const root = manage.next;
   assert.equal(root.id, 'sse-friend-tools');
   const tabs = root.children.find(item => item.attributes.role === 'tablist');

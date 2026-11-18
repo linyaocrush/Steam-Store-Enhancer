@@ -48,8 +48,8 @@
   function getRegionById(id) { return REGIONS.find(r => r.id === id) || null; }
   function getTargetRegion() { const id = GM_getValue(STORAGE_KEY_REGION_ID, 'CNY'); return getRegionById(id) || getRegionById('CNY'); }
   function getShowRegionCode() { return Boolean(GM_getValue(STORAGE_KEY_SHOW_CODE, true)); }
-  function isCartPage() { return location.pathname === '/cart/' || location.pathname.startsWith('/cart'); }
-  function isWishlistPage() { return /\/wishlist/i.test(location.pathname); }
+  function isCartPage() { return /^\/cart(?:\/|$)/i.test(location.pathname); }
+  function isWishlistPage() { return /^\/wishlist(?:\/|$)/i.test(location.pathname); }
 
   const STYLE_ID = 'sapx-style';
   const EXTRA_CLASS = 'sapx-extra-price';

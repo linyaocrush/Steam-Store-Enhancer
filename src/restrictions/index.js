@@ -80,10 +80,11 @@
     const log = diagnostics.scope('restrictions');
     if (!/^(store\.steampowered\.com|steamcommunity\.com)$/.test(location.hostname) ||
         !GM_getValue('sse_restrictions_enabled', true)) return;
+    const scope = createFeatureScope('restrictions');
     const read = key => GM_getValue(key, null);
     const write = (key, value) => GM_setValue(key, value);
-    const database = createRestrictionDatabase({ read, write });
-    const resolve = createRestrictionResolver(database, createSteamRestrictionLookup({ read, write }));
+    const database = createRestrictionDatabase({ read, write, request: (url, options) => restrictionRequest(url, { ...options, signal: scope.signal }) });
+    const resolve = createRestrictionResolver(database, createSteamRestrictionLookup({ read, write, signal: scope.signal }));
     const style = createElement('style');
     style.textContent = `
       .sse-restriction-badge{display:inline-block!important;vertical-align:middle;margin-left:6px;padding:2px 5px;border-radius:2px;font:600 11px/1.4 Arial,sans-serif;white-space:nowrap;text-decoration:none!important;letter-spacing:normal;text-shadow:none;pointer-events:none}
@@ -96,13 +97,14 @@
       .sse-restriction-wishlist-title>.sse-restriction-badge{flex:0 0 auto}
     `;
     document.head.appendChild(style);
-    const selector = '#appHubAppName, .search_result_row .title, .tab_item_name, .wishlist_row .title, ' +
-      '[data-rfd-draggable-id^="WishlistItem-"] a[href*="/app/"], .gameListRow .gameListRowItemName, ' +
-      '.recommendation_link .game_name, .capsule .title, .store_capsule .title, ' +
-      '.tab_item_title, .store_main_capsule .app_name, .store_main_capsule .app_name > div, ' +
-      '.dailydeal_desc .game_name, .home_content .game_name, ' +
-      '.community_recommendation_app .app_name, .home_content.single .single_title, ' +
-      '[data-ds-appid] [class*="StoreSaleWidgetTitle"], [data-ds-appid] [class*="GameName"]';
+    scope.own(() => {
+      revision++;
+      style.remove();
+      document.querySelectorAll('.sse-restriction-badge').forEach(node => node.remove());
+      document.querySelectorAll('.sse-restriction-title-text').forEach(node => node.replaceWith(...node.childNodes));
+      document.querySelectorAll('.sse-restriction-wishlist-title').forEach(node => node.classList.remove('sse-restriction-wishlist-title'));
+    });
+    const selector = PAGE_ADAPTERS.restrictions.titles;
     let states = new WeakMap();
     let revision = 0;
     async function enhance(title) {
@@ -129,7 +131,7 @@
       const startedRevision = revision;
       states.set(title, state);
       const result = await resolve(appid);
-      if (!title.isConnected || revision !== startedRevision || states.get(title) !== state || restrictionAppId(title) !== appid) return;
+      if (!scope.active || !title.isConnected || revision !== startedRevision || states.get(title) !== state || restrictionAppId(title) !== appid) return;
       state.pending = false;
       if (!result || result.status === 3) state.retryAt = Date.now() + 15 * 60 * 1000;
       if (!result) return;
@@ -143,35 +145,25 @@
       title.appendChild(badge);
       log.debug('badge.render', '游戏受限状态已显示', { appid, ...result });
     }
-    const scan = createScheduledTask(() => {
-      const titles = document.querySelectorAll(selector);
+    const scanner = createDomScanner({ scope, selector, name: 'restrictions', attributes: ITEM_ATTRIBUTES, process: titles => {
       log.debug('scan', '扫描游戏标题', { count: titles.length });
       titles.forEach(title => { enhance(title).catch(error => log.error('badge.failed', '游戏受限标记失败', { error })); });
-    }, 250);
-    database.subscribe?.(() => {
+    } });
+    const scan = () => scanner.scan();
+    const unsubscribe = database.subscribe?.(() => {
       revision++;
       states = new WeakMap();
       scan();
     });
+    if (unsubscribe) scope.own(unsubscribe);
     // Recheck on long-lived tabs and when returning from a suspended/background tab.
     const refresh = () => {
       database.load().catch(error => log.warn('refresh.failed', '数据库刷新失败', { error }));
       scan();
     };
-    const refreshTimer = setInterval(refresh, 60 * 1000);
-    window.addEventListener('pageshow', refresh);
-    document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
-    window.addEventListener('pagehide', event => { if (!event.persisted) clearInterval(refreshTimer); });
-    new MutationObserver(mutations => {
-      if (mutations.some(mutation => {
-        const target = mutation.target.nodeType === 1 ? mutation.target : mutation.target.parentElement;
-        if (target?.closest('.sse-restriction-badge, #sapx-ui-root, #sse-family-dialog')) return false;
-        if (mutation.type !== 'childList') return true;
-        return [...mutation.addedNodes, ...mutation.removedNodes].some(node =>
-          node.nodeType !== 1 || !node.matches('.sse-restriction-badge'));
-      })) scan();
-    }).observe(document.body, { childList: true, subtree: true, characterData: true, attributes: true,
-      attributeFilter: ['href', 'data-ds-appid', 'data-app-id', 'data-rfd-draggable-id'] });
+    scope.interval(() => { if (!document.hidden) refresh(); }, 60 * 1000);
+    scope.listen(window, 'pageshow', refresh);
+    scope.listen(document, 'visibilitychange', () => { if (!document.hidden) refresh(); });
     log.info('initialize', '游戏受限状态标记已启用');
     scan();
   }

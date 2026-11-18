@@ -87,8 +87,8 @@
   function getRegionById(id) { return REGIONS.find(r => r.id === id) || null; }
   function getTargetRegion() { const id = GM_getValue(STORAGE_KEY_REGION_ID, 'CNY'); return getRegionById(id) || getRegionById('CNY'); }
   function getShowRegionCode() { return Boolean(GM_getValue(STORAGE_KEY_SHOW_CODE, true)); }
-  function isCartPage() { return location.pathname === '/cart/' || location.pathname.startsWith('/cart'); }
-  function isWishlistPage() { return /\/wishlist/i.test(location.pathname); }
+  function isCartPage() { return /^\/cart(?:\/|$)/i.test(location.pathname); }
+  function isWishlistPage() { return /^\/wishlist(?:\/|$)/i.test(location.pathname); }
 
   const STYLE_ID = 'sapx-style';
   const EXTRA_CLASS = 'sapx-extra-price';
@@ -280,9 +280,18 @@
 
   function readStoreSession(doc, globals = {}) {
     const config = doc.querySelector('#application_config');
-    const settings = JSON.parse(config?.getAttribute('data-config') || 'null') || globals.Config || {};
-    const user = JSON.parse(config?.getAttribute('data-store_user_config') || '{}');
-    const info = JSON.parse(config?.getAttribute('data-userinfo') || '{}');
+    const read = name => {
+      try {
+        const value = JSON.parse(config?.getAttribute(name) || '{}');
+        return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+      } catch (_) {
+        diagnostics.scope('session').debug('config.invalid', '页面配置不可解析，尝试其他来源', { attribute: name });
+        return {};
+      }
+    };
+    const settings = { ...globals.Config, ...read('data-config') };
+    const user = read('data-store_user_config');
+    const info = read('data-userinfo');
     let steamid = String(info.steamid || globals.UserConfig?.steamid || globals.g_steamID || '');
     let token = user.webapi_token;
     for (const entry of globals.SSR?.loaderData || []) {
@@ -295,41 +304,389 @@
     const account = globals.g_AccountID || globals.UserConfig?.accountid;
     if (!steamid && account) {
       const accountId = Number(account);
-      const steamId64 = 76561197960265728 + accountId;
-      if (Number.isSafeInteger(accountId) && accountId >= 0 && Number.isSafeInteger(steamId64)) steamid = String(steamId64);
+      if (Number.isInteger(accountId) && accountId > 0 && accountId <= 4294967295) steamid = String(76561197960265728n + BigInt(accountId));
     }
     const country = settings.COUNTRY || settings.COUNTRY_CODE || settings.country_code || globals.UserConfig?.country || '';
     return { steamid, token, country: String(country).toUpperCase(), language: settings.LANGUAGE || 'schinese' };
   }
 
-  // ---- network.js ----
-  function gmGet(url) {
-    // The endpoint is sufficient for diagnosis; query strings can contain tokens.
-    const address = new URL(url);
-    const task = diagnostics.scope('network').begin('get', { endpoint: address.origin + address.pathname });
-    return new Promise((resolve, reject) => {
-      const fail = error => { task.fail(error); reject(error); };
+  // ---- runtime.js ----
+  const featureScopes = new Map();
+  const SCRIPT_OWNED_SELECTOR = '#sapx-ui-root, #sapx-cart-summary, #sse-cart-tools, .sse-cart-dialog, #sse-family-dialog, #sse-family-chart-tooltip, #sse-family-nav, #sse-cart-extract, #sse-friend-tools, .sapx-extra-price, .sapx-region-locked, .sse-family-badge, .sse-family-banner, .sse-quick-add, .sse-restriction-badge, .sse-wishlist-sale-expiration';
+
+  function createFeatureScope(name) {
+    featureScopes.get(name)?.dispose();
+    const disposers = new Set();
+    const controller = new AbortController();
+    const scope = {
+      signal: controller.signal,
+      get active() { return !controller.signal.aborted; },
+      own(dispose) { disposers.add(dispose); return dispose; },
+      release(dispose) { disposers.delete(dispose); },
+      listen(target, event, callback, options) {
+        target.addEventListener(event, callback, options);
+        scope.own(() => target.removeEventListener(event, callback, options));
+      },
+      timeout(callback, delay) {
+        const cancel = () => clearTimeout(id);
+        const id = setTimeout(() => { disposers.delete(cancel); if (scope.active) callback(); }, delay);
+        scope.own(cancel);
+        return cancel;
+      },
+      interval(callback, delay) {
+        const id = setInterval(() => { if (scope.active) callback(); }, delay);
+        return scope.own(() => clearInterval(id));
+      },
+      dispose() {
+        if (!scope.active) return;
+        controller.abort();
+        for (const dispose of disposers) {
+          try { dispose(); } catch (error) { diagnostics.scope('core').warn('dispose.failed', '功能清理失败', { name, error }); }
+        }
+        disposers.clear();
+        if (featureScopes.get(name) === scope) featureScopes.delete(name);
+      }
+    };
+    featureScopes.set(name, scope);
+    return scope;
+  }
+
+  function queryIncluding(root, selector) {
+    const result = root.matches?.(selector) ? [root] : [];
+    return result.concat(Array.from(root.querySelectorAll?.(selector) || []));
+  }
+
+  // One observer per feature, bounded to changed subtrees. Ancestors are only
+  // matched, never searched recursively for each mutation.
+  function createDomScanner({ scope, selector, process, changed, removed, delay = 200,
+    attributes = [], root = document.body, name = 'dom', initial = true }) {
+    const log = diagnostics.scope(name);
+    const pending = new Set();
+    const metrics = { fullScans: 0, batches: 0, candidates: 0, mutations: 0, durationMs: 0 };
+    let cancelTimer;
+    let dirty = false;
+    let lost = false;
+    const owned = node => Boolean(node?.closest?.(SCRIPT_OWNED_SELECTOR));
+    function collect(node, descendants = true) {
+      if (!node || owned(node)) return;
+      if (node.nodeType === 3) node = node.parentElement;
+      if (!node) return;
+      if (node.matches?.(selector)) pending.add(node);
+      const parent = node.parentElement?.closest?.(selector);
+      if (parent && !owned(parent)) pending.add(parent);
+      if (descendants) for (const match of node.querySelectorAll?.(selector) || []) {
+        if (!owned(match)) pending.add(match);
+      }
+    }
+    async function flush() {
+      const cancel = cancelTimer;
+      cancelTimer = null;
+      cancel?.();
+      if (!scope.active) return;
+      const targets = [...pending].filter(node => node.isConnected !== false);
+      pending.clear();
+      const hadChanges = dirty, hadRemovals = lost;
+      dirty = lost = false;
+      const start = Date.now();
       try {
-        GM_xmlhttpRequest({
-          method: 'GET', url, timeout: 20000,
-          onload: response => {
-            if ((response.status >= 200 && response.status < 300) || (response.status === 0 && response.responseText)) {
-              task.end('请求完成', { status: response.status });
-              resolve(response.responseText);
-            } else fail(Object.assign(new Error('HTTP ' + response.status), { status: response.status }));
+        if (hadRemovals) removed?.();
+        if (hadChanges) changed?.();
+        if (targets.length) await process(targets);
+      } catch (error) { if (scope.active) log.error('scan.failed', '动态节点处理失败', { error }); }
+      metrics.batches++;
+      metrics.candidates += targets.length;
+      metrics.durationMs += Date.now() - start;
+      log.debug('scan.batch', '局部扫描完成', { ...metrics, targets: targets.length });
+    }
+    function schedule() { if (!cancelTimer) cancelTimer = scope.timeout(flush, delay); }
+    function notify(mutations) {
+      for (const mutation of mutations) {
+        if (owned(mutation.target.nodeType === 3 ? mutation.target.parentElement : mutation.target)) continue;
+        metrics.mutations++;
+        if (mutation.type === 'childList') {
+          const additions = Array.from(mutation.addedNodes || []);
+          const removals = Array.from(mutation.removedNodes || []);
+          const external = node => node.nodeType === 3 || (node.nodeType === 1 && !owned(node));
+          if (![...additions, ...removals].some(external)) continue;
+          collect(mutation.target, false);
+          additions.filter(external).forEach(node => collect(node));
+          if (removals.some(external)) lost = true;
+        } else collect(mutation.target, mutation.type === 'attributes');
+        dirty = true;
+      }
+      if (dirty) schedule();
+    }
+    const observer = new MutationObserver(notify);
+    observer.observe(root, { childList: true, subtree: true, characterData: true,
+      ...(attributes.length ? { attributes: true, attributeFilter: attributes } : {}) });
+    scope.own(() => { observer.disconnect(); cancelTimer?.(); pending.clear(); });
+    const scan = () => { metrics.fullScans++; collect(root); dirty = true; schedule(); };
+    if (initial) scan();
+    return { scan, notify, flush, metrics };
+  }
+
+  // ---- pages.js ----
+  const PAGE_ADAPTERS = Object.freeze({
+    wishlist: { rows: '.wishlist_row, .wishlistRowItem, [data-rfd-draggable-id^="WishlistItem-"], .Panel div[data-index]' },
+    cart: { rows: '.i-xXuvHLioU-[role="button"], .bKkQiLkI-vk-', total: '.i1XZFikuzME- .n9HLAjXXhvI-' },
+    quick: { rows: 'a.search_result_row, a.tab_item, a.recommendation_link, .wishlist_row, [data-rfd-draggable-id^="WishlistItem-"], .game_purchase_action' },
+    family: { rows: 'a[href*="/app/"], [data-ds-appid], [data-app-id], [data-rfd-draggable-id^="WishlistItem-"]' },
+    restrictions: { titles: '#appHubAppName, .search_result_row .title, .tab_item_name, .wishlist_row .title, ' +
+      '[data-rfd-draggable-id^="WishlistItem-"] a[href*="/app/"], .gameListRow .gameListRowItemName, ' +
+      '.recommendation_link .game_name, .capsule .title, .store_capsule .title, .tab_item_title, ' +
+      '.store_main_capsule .app_name, .store_main_capsule .app_name > div, .dailydeal_desc .game_name, ' +
+      '.home_content .game_name, .community_recommendation_app .app_name, .home_content.single .single_title, ' +
+      '[data-ds-appid] [class*="StoreSaleWidgetTitle"], [data-ds-appid] [class*="GameName"]' }
+  });
+  const ITEM_ATTRIBUTES = ['href', 'data-ds-appid', 'data-ds-packageid', 'data-ds-bundleid', 'data-app-id', 'data-rfd-draggable-id'];
+  const PRICE_SELECTORS = [
+    '.discount_final_price', '.discount_original_price', '.game_purchase_price',
+    '.game_area_dlc_price', '.col.search_price.responsive_secondrow strike',
+    '.col.search_price.responsive_secondrow .discount_final_price',
+    '.Panel.Focusable .StoreOriginalPrice', '.Panel.Focusable .pk-LoKoNmmPK4GBiC9DR8',
+    '._2WLaY5TxjBGVyuWe_6KS3N', '.game_area_purchase_game_dropdown_selection > span',
+    '.game_area_purchase_game_dropdown_menu_item_text',
+    '.StoreOriginalPrice', '.j3jr1YqpBGk- > .-nS4ZC0Bruo-'
+  ].join(',');
+  const CONVERSION_SELECTORS = [
+    '.discount_prices > .discount_final_price', '.Hxi-pnf9XlwQ- span.HOrB6lehQpg-',
+    '.Hxi-pnf9Xlw- span.HOrB6lehQpg-', '.btnv6_white_transparent > span',
+    '.Wh0L8EnwsPV_8VAu8TOYr', '._3j4dI1yA7cRfCvK8h406OB', '._1EKGZBnKFWOr3RqVdnLMRN', '._3fFFsvII7Y2KXNLDk_krOW',
+    'div.accountData.price', '.addfunds_area_purchase_game.game_area_purchase_game > h1',
+    '.addfunds_area_purchase_game.game_area_purchase_game.es_custom_money > p',
+    'div.vTro5UlZ-gU- > div.QO6CjVPSFuI-', 'a.En-WtuWIGUc- > span.nikULGV-7Q0-',
+    'div.-OkCLv-56oQ- > div._9Rf9BwU0xAQ-', 'div.-OkCLv-56oQ- > div.-HQzBzl6lqI-',
+    'label.qhUI2RnjHYw-', 'button.cDJOlrqyRq8-.n5jTCXrzS8A-.Focusable', 'div.f6hU22EA7Z8peFWZVBJU',
+    '.Panel.Focusable ._3-o3G9jt3lqcvbRXt8epsn.StoreOriginalPrice', '.Panel.Focusable .pk-LoKoNmmPK4GBiC9DR8',
+    '._2WLaY5TxjBGVyuWe_6KS3N', '#checkout_review_cart_area .checkout_review_item_price > .price',
+    '#review_subtotal_value.price', '#review_total_value.price', '#account_dropdown .account_name',
+    '#es_summary .es_market_summary_item', '#marketWalletBalanceAmount', 'span.normal_price[data-price]',
+    'button.inqz7Zdx9Xg-.ob-nIzzquk8-.fkz-MePtKwI-.D8IENuW8Q7w-', 'span.IokSIloSPlA-',
+    'text.recharts-text.recharts-cartesian-axis-tick-value > tspan',
+    '.QFW0BtI4l77AFmv1xLAkx._1B1XTNsfuwOaDPAkkr8M42 ._3hEeummFKRey8l5VXxZwxz > span',
+    '.game_area_purchase_game_dropdown_selection > span',
+    '.game_area_purchase_game_dropdown_menu_items_container_background.game_area_purchase_game_dropdown_menu_items_container td.game_area_purchase_game_dropdown_menu_item_text',
+    '.discount_original_price', '.discount_final_price', '.col.search_price.responsive_secondrow strike',
+    '#header_wallet_balance > span.tooltip', '.esi-wishlist-stat > .num',
+    '.salepreviewwidgets_StoreOriginalPrice_1EKGZ', '.salepreviewwidgets_StoreSalePriceBox_Wh0L8',
+    '.contenthubshared_OriginalPrice_3hBh3', '.contenthubshared_FinalPrice_F_tGv',
+    '.salepreviewwidgets_StoreSalePriceBox_Wh0L8:not(.salepreviewwidgets_StoreSalePrepurchaseLabel_Wxeyn)',
+    'tr.wallet_table_row > td.wht_total', 'tr.wallet_table_row > td.wht_wallet_change.wallet_column',
+    'tr.wallet_table_row > td.wht_wallet_balance.wallet_column', '.package_totals_row > .price:not(.bundle_discount)',
+    '#package_savings_bar > .savings.bundle_savings', '.home_page_content_title a.btn_small_tall > span'
+  ];
+  function getConversionSelectors() {
+    return isCartPage() ? CONVERSION_SELECTORS.concat([
+      '.StoreOriginalPrice', '.j3jr1YqpBGk- > .-nS4ZC0Bruo-', '.i1XZFikuzME- .n9HLAjXXhvI-',
+      'main [class*="price" i]', 'main [class*="Price"]', '[role="main"] [class*="price" i]',
+      '[class*="cart" i] [class*="price" i]', '[data-testid*="price" i]'
+    ]) : CONVERSION_SELECTORS;
+  }
+
+  // ---- items.js ----
+  function itemRef(type, id) {
+    const canonical = { app: 'app', sub: 'package', package: 'package', bundle: 'bundle' }[type];
+    const number = Number(id);
+    return canonical && /^\d+$/.test(String(id)) && Number.isSafeInteger(number) && number > 0
+      ? { type: canonical, id: String(number) } : null;
+  }
+  function itemField(item) { return { app: 'appid', package: 'packageid', bundle: 'bundleid' }[itemRef(item.type, item.id)?.type]; }
+  function itemKey(item) { const ref = itemRef(item.type, item.id); return ref ? `${ref.type}:${ref.id}` : null; }
+  function itemFromLink(href) {
+    const match = String(href || '').match(/\/(app|sub|bundle)\/(\d+)(?:\/|$|\?)/);
+    return match ? itemRef(match[1], match[2]) : null;
+  }
+  function inferItemFromScope(scopeEl) {
+    if (!scopeEl) return null;
+    const wishlist = scopeEl.closest('[data-rfd-draggable-id^="WishlistItem-"]');
+    const wishId = wishlist?.getAttribute('data-rfd-draggable-id')?.match(/^WishlistItem-(\d+)/)?.[1];
+    if (wishId) return itemRef('app', wishId);
+    const purchase = scopeEl.closest('.game_area_purchase_game, .game_area_purchase_game_wrapper');
+    if (purchase) {
+      for (const node of purchase.querySelectorAll('[href*="/bundle/"], [onclick*="ShowBundleInfo"], [onclick*="addBundleToCart"], [data-ds-bundleid]')) {
+        const id = node.getAttribute('data-ds-bundleid') ||
+          (node.getAttribute('href') || node.getAttribute('onclick') || '').match(/(?:\/bundle\/|ShowBundleInfo\(['"]?|addBundleToCart\(['"]?)(\d+)/)?.[1];
+        const ref = itemRef('bundle', id);
+        if (ref) return ref;
+      }
+      const sub = purchase.querySelector('input[name="subid"]');
+      const ref = itemRef('package', sub?.value);
+      if (ref) return ref;
+      const add = purchase.querySelector('a[href*="addToCart"], button[onclick*="addToCart"], a[onclick*="addToCart"]');
+      const id = (add?.getAttribute('href') || add?.getAttribute('onclick') || '').match(/(?:addToCart\(|subid=)(\d+)/)?.[1];
+      if (itemRef('package', id)) return itemRef('package', id);
+      for (const [type, attr] of [['bundle', 'data-ds-bundleid'], ['package', 'data-ds-packageid'], ['app', 'data-ds-appid']]) {
+        const holder = purchase.querySelector(`[${attr}]`);
+        const value = holder?.getAttribute(attr)?.split(',')[0];
+        if (itemRef(type, value)) return itemRef(type, value);
+      }
+    }
+    const holder = scopeEl.closest('[data-ds-appid],[data-ds-packageid],[data-ds-bundleid],[data-app-id]');
+    if (holder) {
+      for (const [type, attr] of [['bundle', 'data-ds-bundleid'], ['package', 'data-ds-packageid'], ['app', 'data-ds-appid'], ['app', 'data-app-id']]) {
+        const value = holder.getAttribute(attr);
+        if (!value) continue;
+        // Multi-app capsules must not silently inherit the first unrelated game.
+        return itemRef(type, value);
+      }
+    }
+    const link = scopeEl.closest('a[href]');
+    const own = itemFromLink(link?.getAttribute('href'));
+    if (own) return own;
+    const card = scopeEl.closest('.search_result_row, .tab_item, .recommendation_link, .wishlist_row, .game_area_purchase_game, .game_purchase_action, .i-xXuvHLioU-, .bKkQiLkI-vk-') || scopeEl;
+    const links = card.querySelectorAll('a[href*="/app/"],a[href*="/sub/"],a[href*="/bundle/"]');
+    const refs = new Map();
+    for (const child of links) {
+      const ref = itemFromLink(child.getAttribute('href'));
+      if (ref) refs.set(itemKey(ref), ref);
+    }
+    if (refs.size === 1) return refs.values().next().value;
+    if (!refs.size && purchase) return itemFromLink(location.pathname);
+    return null;
+  }
+
+  function invalidResponse(message = '接口返回了无效数据') { return Object.assign(new Error(message), { kind: 'invalid-response' }); }
+  function validatePurchaseOption(option) {
+    if (!option || typeof option !== 'object' ||
+        (!itemRef('package', option.packageid) && !itemRef('bundle', option.bundleid))) throw invalidResponse('无效购买选项');
+    for (const key of ['final_price_in_cents', 'original_price_in_cents']) {
+      if (option[key] != null && (!/^\d+$/.test(String(option[key])) || !Number.isSafeInteger(Number(option[key])))) throw invalidResponse('无效商品价格');
+    }
+    if (option.discount_pct != null && (!Number.isFinite(Number(option.discount_pct)) || Number(option.discount_pct) < 0 || Number(option.discount_pct) > 100)) throw invalidResponse('无效折扣');
+    return option;
+  }
+  function validateStoreItems(data) {
+    const items = data?.response?.store_items;
+    if (!Array.isArray(items)) throw invalidResponse('缺少商品列表');
+    for (const item of items) {
+      if (!item || typeof item !== 'object') throw invalidResponse('无效商品');
+      if (item.purchase_options != null && !Array.isArray(item.purchase_options)) throw invalidResponse('无效购买选项列表');
+      item.purchase_options?.forEach(validatePurchaseOption);
+      if (item.best_purchase_option) validatePurchaseOption(item.best_purchase_option);
+    }
+    return items;
+  }
+  function validateCartResponse(data, method) {
+    const response = data?.response;
+    if (!response || typeof response !== 'object' || Array.isArray(response)) throw invalidResponse('缺少购物车响应');
+    if (method === 'GetCart') {
+      if (!response.cart || !Array.isArray(response.cart.line_items)) throw invalidResponse('缺少购物车项目列表');
+      for (const item of response.cart.line_items) {
+        if (!item || !/^\d+$/.test(String(item.line_item_id)) ||
+            (!itemRef('package', item.packageid) && !itemRef('bundle', item.bundleid))) throw invalidResponse('无效购物车项目');
+      }
+    }
+    return response;
+  }
+
+  // In-flight entries are never evicted. Settled entries have a TTL and a cap.
+  function createAsyncCache({ load, ttl = 300000, missingTtl = 60000, retryDelay = 30000, maxEntries = 500,
+    now = () => Date.now() }) {
+    const entries = new Map();
+    function prune() {
+      for (const [key, entry] of entries) if (!entry.pending && entry.expires <= now()) entries.delete(key);
+      for (const [key, entry] of entries) {
+        if (entries.size <= maxEntries) break;
+        if (!entry.pending) entries.delete(key);
+      }
+    }
+    return {
+      get(key, ...args) {
+        const saved = entries.get(key);
+        if (saved && (saved.pending || saved.expires > now())) return saved.promise;
+        const entry = { pending: true, expires: Infinity };
+        entry.promise = Promise.resolve().then(() => load(key, ...args)).then(value => {
+          entry.expires = now() + (value == null ? missingTtl : ttl);
+          return value;
+        }, error => { entry.expires = now() + retryDelay; throw error; }).finally(() => { entry.pending = false; prune(); });
+        entries.set(key, entry);
+        prune();
+        return entry.promise;
+      },
+      clear() { entries.clear(); },
+      get size() { return entries.size; }
+    };
+  }
+
+  // ---- network.js ----
+  function requestError(kind, message, status) { return Object.assign(new Error(message), { kind, ...(status == null ? {} : { status }) }); }
+  function gmRequest(url, { signal, timeout = 20000, probe = false, ...options } = {}) {
+    const address = new URL(url);
+    const task = diagnostics.scope('network').begin('request', { method: options.method || 'GET', endpoint: address.origin + address.pathname });
+    return new Promise((resolve, reject) => {
+      let handle;
+      let settled = false;
+      const finish = (error, value) => {
+        if (settled) return;
+        settled = true;
+        signal?.removeEventListener('abort', abort);
+        if (error) { task.fail(error); reject(error); }
+        else { task.end('请求完成', { status: value.status }); resolve(value); }
+      };
+      const abort = () => { finish(requestError('aborted', '请求已取消')); handle?.abort(); };
+      if (signal?.aborted) { abort(); return; }
+      signal?.addEventListener('abort', abort, { once: true });
+      try {
+        handle = GM_xmlhttpRequest({
+          ...options, method: options.method || 'GET', url, timeout,
+          ...(probe ? { headers: { ...options.headers, Range: 'bytes=0-16383' } } : {}),
+          onprogress: event => {
+            if (probe && event.loaded >= 16384 && event.status >= 200 && event.status < 300) {
+              finish(null, { status: event.status, responseText: '' });
+              handle?.abort();
+            }
           },
-          onerror: () => fail(new Error('网络请求失败')),
-          ontimeout: () => fail(new Error('Timeout'))
+          onload: response => {
+            if (response.status >= 200 && response.status < 300) finish(null, response);
+            else finish(requestError('http', 'HTTP ' + response.status, response.status));
+          },
+          onerror: () => finish(requestError('network', '网络请求失败')),
+          ontimeout: () => finish(requestError('timeout', '请求超时')),
+          onabort: () => finish(requestError('aborted', '请求已取消'))
         });
-      } catch (error) { fail(error); }
+      } catch (_) { finish(requestError('network', '网络请求无法启动')); }
     });
+  }
+  async function gmGet(url, options) { return (await gmRequest(url, options)).responseText; }
+
+  // No automatic retries: writes may have succeeded even when their response was lost.
+  async function fetchJson(url, { signal, timeout = 20000, ...options } = {}) {
+    const address = new URL(url, location.href);
+    const task = diagnostics.scope('network').begin('fetch', { method: options.method || 'GET', endpoint: address.origin + address.pathname });
+    const controller = new AbortController();
+    let timedOut = false;
+    const abort = () => controller.abort();
+    if (signal?.aborted) abort();
+    signal?.addEventListener('abort', abort, { once: true });
+    const timer = setTimeout(() => { timedOut = true; abort(); }, timeout);
+    try {
+      const response = await fetch(url, { ...options, signal: controller.signal });
+      if (!response.ok) throw requestError('http', 'HTTP ' + response.status, response.status);
+      let data;
+      try { data = await response.json(); } catch (_) { throw requestError('invalid-response', '接口返回了无效 JSON'); }
+      task.end('请求完成', { status: response.status });
+      return { data, headers: response.headers };
+    } catch (cause) {
+      const error = controller.signal.aborted ? requestError(timedOut ? 'timeout' : 'aborted', timedOut ? '请求超时' : '请求已取消')
+        : cause.kind ? cause : requestError('network', '网络请求失败');
+      task.fail(error);
+      throw error;
+    } finally { clearTimeout(timer); signal?.removeEventListener('abort', abort); }
   }
 
   class RequestQueue {
     constructor(concurrency = 4) { this.concurrency = concurrency; this.running = 0; this.queue = []; }
-    enqueue(task) {
+    enqueue(task, { signal } = {}) {
       return new Promise((resolve, reject) => {
-        this.queue.push({ task, resolve, reject });
+        if (signal?.aborted) { reject(requestError('aborted', '排队任务已取消')); return; }
+        const job = { task, resolve, reject, signal };
+        job.abort = () => {
+          const index = this.queue.indexOf(job);
+          if (index >= 0) this.queue.splice(index, 1);
+          reject(requestError('aborted', '排队任务已取消'));
+        };
+        signal?.addEventListener('abort', job.abort, { once: true });
+        this.queue.push(job);
         diagnostics.scope('network').debug('queue.add', '请求进入队列', { waiting: this.queue.length, running: this.running });
         this._deq();
       });
@@ -338,8 +695,12 @@
       if (this.running >= this.concurrency) return;
       const job = this.queue.shift();
       if (!job) return;
+      job.signal?.removeEventListener('abort', job.abort);
       this.running++;
-      Promise.resolve().then(job.task).then(job.resolve).catch(job.reject).finally(() => { this.running--; this._deq(); });
+      Promise.resolve().then(() => {
+        if (job.signal?.aborted) throw requestError('aborted', '排队任务已取消');
+        return job.task();
+      }).then(job.resolve).catch(job.reject).finally(() => { this.running--; this._deq(); });
     }
   }
   const requestQueue = new RequestQueue(4);
@@ -441,6 +802,7 @@
       '<div class="sapx-field"><label class="sapx-check"><input class="sapx-checkbox" id="sse-cart-enabled" type="checkbox" />启用快速加购与购物车管理</label></div>' +
       '<div class="sapx-field"><label class="sapx-check"><input class="sapx-checkbox" id="sse-family-enabled" type="checkbox" />启用家庭库游戏标记</label></div>' +
       '<div class="sapx-field"><label class="sapx-check"><input class="sapx-checkbox" id="sse-restrictions-enabled" type="checkbox" />显示游戏受限状态</label></div>' +
+      '<div class="sapx-field"><label class="sapx-check"><input class="sapx-checkbox" id="sse-wishlist-sale-enabled" type="checkbox" />显示愿望单折扣倒计时</label></div>' +
       '<div class="sapx-field"><label class="sapx-check"><input class="sapx-checkbox" id="sse-family-auto" type="checkbox" />每隔 24 小时自动扫描家庭库</label></div>' +
       '<div class="sapx-field"><button class="sapx-btn sapx-btn-ghost" type="button" id="sse-family-open">管理家庭库：扫描、贡献统计与最近购入</button></div>' +
       '<div class="sapx-field"><label class="sapx-label" for="sse-convert-region">价格转换目标地区</label><select class="sapx-select" id="sse-convert-region"></select></div>' +
@@ -511,6 +873,7 @@
     field('cart-enabled').checked = GM_getValue('sse_cart_enabled', true);
     field('family-enabled').checked = GM_getValue('sse_family_enabled', true);
     field('restrictions-enabled').checked = GM_getValue('sse_restrictions_enabled', true);
+    field('wishlist-sale-enabled').checked = GM_getValue('sse_wishlist_sale_enabled', true);
     field('family-auto').checked = GM_getValue('sse_family_auto', true);
     field('cart-language').value = GM_getValue('sse_cart_language', 'ZH');
     field('cart-country').checked = GM_getValue('sse_cart_country', false);
@@ -558,6 +921,7 @@
         GM_setValue('sse_cart_enabled', field('cart-enabled').checked);
         GM_setValue('sse_family_enabled', field('family-enabled').checked);
         GM_setValue('sse_restrictions_enabled', field('restrictions-enabled').checked);
+        GM_setValue('sse_wishlist_sale_enabled', field('wishlist-sale-enabled').checked);
         GM_setValue('sse_family_auto', field('family-auto').checked);
         GM_setValue('sse_cart_language', field('cart-language').value);
         GM_setValue('sse_cart_country', field('cart-country').checked);
@@ -598,6 +962,9 @@
   const pendingPrices = new Map();
   const pendingElements = new WeakSet();
   const CACHE_TTL_MS = 5 * 60 * 1000;
+  let regionalScope;
+  let summaryRevision = 0;
+  const enhancedItems = new WeakMap();
 
   function cacheGet(key) {
     const v = priceCache.get(key);
@@ -606,9 +973,14 @@
     return v.value;
   }
 
-  function cacheSet(key, value) { priceCache.set(key, { ts: Date.now(), value }); }
+  function cacheSet(key, value) {
+    priceCache.set(key, { ts: Date.now(), value });
+    if (priceCache.size > 1000) priceCache.delete(priceCache.keys().next().value);
+  }
 
   function normalizePrice(o) {
+    if (!Number.isSafeInteger(o.final) || o.final < 0 || !Number.isSafeInteger(o.initial) || o.initial < 0 ||
+        !/^[A-Z]{3}$/.test(o.currency || '')) throw invalidResponse('地区价格字段无效');
     return {
       ok: Boolean(o.finalFormatted || o.initialFormatted),
       currency: o.currency,
@@ -622,7 +994,8 @@
 
   async function getAppPrice(appid, cc, currencyFallback) {
     const url = 'https://store.steampowered.com/api/appdetails?appids=' + appid + '&cc=' + cc + '&filters=price_overview,is_free';
-    const text = await requestQueue.enqueue(() => gmGet(url));
+    const signal = regionalScope?.signal;
+    const text = await requestQueue.enqueue(() => gmGet(url, { signal }), { signal });
     const parsed = JSON.parse(text);
     const block = parsed && parsed[String(appid)];
     if (!block || !block.success) return null;
@@ -648,9 +1021,10 @@
         data_request: { include_all_purchase_options: true }
       };
       const url = 'https://api.steampowered.com/IStoreBrowseService/GetItems/v1/?input_json=' + encodeURIComponent(JSON.stringify(payload));
-      const text = await requestQueue.enqueue(() => gmGet(url));
+      const signal = regionalScope?.signal;
+      const text = await requestQueue.enqueue(() => gmGet(url, { signal }), { signal });
       const parsed = JSON.parse(text);
-      const items = parsed && parsed.response && parsed.response.store_items;
+      const items = validateStoreItems(parsed);
       if (items && items.length > 0) {
         const item = items[0];
         let po = item.best_purchase_option;
@@ -670,11 +1044,12 @@
           }
         }
       }
-    } catch (error) { regionalLog.debug('package.fallback', '套餐接口失败，尝试备用接口', { packageid, cc, error }); }
+    } catch (error) { if (error.kind === 'aborted') throw error; regionalLog.debug('package.fallback', '套餐接口失败，尝试备用接口', { packageid, cc, error }); }
 
     try {
       const url = 'https://store.steampowered.com/api/packagedetails?packageids=' + packageid + '&cc=' + cc;
-      const text = await requestQueue.enqueue(() => gmGet(url));
+      const signal = regionalScope?.signal;
+      const text = await requestQueue.enqueue(() => gmGet(url, { signal }), { signal });
       const parsed = JSON.parse(text);
       const block = parsed && parsed[String(packageid)];
       if (!block || !block.success) return null;
@@ -690,7 +1065,7 @@
       });
     } catch (e) {
       regionalLog.debug('package.unavailable', '备用套餐接口失败', { packageid, cc, error: e });
-      return null;
+      throw e;
     }
   }
 
@@ -707,9 +1082,10 @@
       }
     };
     const url = 'https://api.steampowered.com/IStoreBrowseService/GetItems/v1/?input_json=' + encodeURIComponent(JSON.stringify(payload));
-    const text = await requestQueue.enqueue(() => gmGet(url));
+    const signal = regionalScope?.signal;
+    const text = await requestQueue.enqueue(() => gmGet(url, { signal }), { signal });
     const parsed = JSON.parse(text);
-    const items = parsed && parsed.response && parsed.response.store_items;
+    const items = validateStoreItems(parsed);
     if (!items || !items.length) return null;
 
     const item = items[0];
@@ -750,6 +1126,7 @@
     const cached = cacheGet(key);
     if (cached !== undefined) { regionalLog.debug('cache.hit', '命中价格缓存', { item: key }); return cached; }
     const task = regionalLog.begin('price.fetch', { item: key });
+    let failure;
     for (const cc of region.ccCandidates) {
       task.debug('candidate', '读取候选地区', { cc });
       try {
@@ -764,124 +1141,15 @@
             return res;
           }
         }
-      } catch (error) { task.debug('candidate.failed', '候选地区价格读取失败', { item: key, country: cc, error }); }
+      } catch (error) {
+        if (error.kind === 'aborted') { task.cancel('查询取消'); throw error; }
+        failure = error;
+        task.debug('candidate.failed', '候选地区价格读取失败', { item: key, country: cc, error });
+      }
     }
+    if (failure) { task.fail(failure); throw failure; }
     cacheSet(key, null);
     task.end('没有可用地区价格', { item: key, available: false });
-    return null;
-  }
-
-  function inferItemFromScope(scopeEl) {
-    if (!scopeEl) return null;
-
-    // 1) 愿望单 React 条目
-    const draggable = scopeEl.closest('[data-rfd-draggable-id^="WishlistItem-"]');
-    if (draggable) {
-      const m = (draggable.getAttribute('data-rfd-draggable-id') || '').match(/^WishlistItem-(\d+)-/);
-      if (m) return { type: 'app', id: m[1] };
-    }
-
-    // 2) 商店页购买区块隔离
-    const targetGame = scopeEl.closest('.game_area_purchase_game, .game_area_purchase_game_wrapper');
-    if (targetGame) {
-      // 优先识别捆绑包，再识别套餐和单个游戏。
-      const bundleEls = targetGame.querySelectorAll('[href*="/bundle/"], [onclick*="ShowBundleInfo"], [onclick*="addBundleToCart"], [data-ds-bundleid]');
-      for (const el of bundleEls) {
-        const attr = el.getAttribute('href') || el.getAttribute('onclick') || el.getAttribute('data-ds-bundleid') || '';
-        const m = attr.match(/\/bundle\/(\d+)/) || attr.match(/ShowBundleInfo\(['"]?(\d+)['"]?\)/) || attr.match(/addBundleToCart\(['"]?(\d+)['"]?/) || attr.match(/^(\d+)/);
-        if (m) return { type: 'bundle', id: m[1] };
-      }
-
-      // 兼容某些老样式下 data-ds-bundleid 在父级容器的情况
-      const closestBnd = scopeEl.closest('[data-ds-bundleid]');
-      if (closestBnd && closestBnd.dataset.dsBundleid) {
-        return { type: 'bundle', id: closestBnd.dataset.dsBundleid.split(',')[0] };
-      }
-
-      // 接下来才是 Package (隐藏表单 input[name="subid"])
-      const subInput = targetGame.querySelector('input[name="subid"]');
-      if (subInput && subInput.value) {
-        return { type: 'package', id: subInput.value };
-      }
-
-      // 查找 Package (data-ds-packageid)
-      const pkgHolder = targetGame.querySelector('[data-ds-packageid]');
-      if (pkgHolder && pkgHolder.dataset.dsPackageid) {
-        return { type: 'package', id: pkgHolder.dataset.dsPackageid.split(',')[0] };
-      }
-
-      // 从 addToCart 按钮提取
-      const addBtn = targetGame.querySelector('a[href*="addToCart"], button[onclick*="addToCart"], a[onclick*="addToCart"]');
-      if (addBtn) {
-        const attr = addBtn.getAttribute('href') || addBtn.getAttribute('onclick') || '';
-        const m = attr.match(/addToCart\((\d+)/) || attr.match(/subid=(\d+)/);
-        if (m) return { type: 'package', id: m[1] };
-      }
-
-      // 查找 App
-      const appHolder = targetGame.querySelector('[data-ds-appid]');
-      if (appHolder && appHolder.dataset.dsAppid) {
-        return { type: 'app', id: appHolder.dataset.dsAppid.split(',')[0] };
-      }
-
-      // 文本兜底 (# 1324561 或 # 87495)
-      const textMatch = targetGame.textContent.match(/#\s*(\d+)/);
-      if (textMatch) {
-        if (/捆绑包|bundle/i.test(targetGame.textContent)) {
-          return { type: 'bundle', id: textMatch[1] };
-        }
-        return { type: 'package', id: textMatch[1] };
-      }
-    }
-
-    // 3) 常规 data 属性
-    const holder = scopeEl.closest('[data-ds-appid],[data-ds-packageid],[data-ds-bundleid]');
-    if (holder) {
-      const bnd = holder.dataset.dsBundleid;
-      const pkg = holder.dataset.dsPackageid && holder.dataset.dsPackageid.split(',')[0];
-      const app = holder.dataset.dsAppid && holder.dataset.dsAppid.split(',')[0];
-      if (bnd) return { type: 'bundle', id: bnd };
-      if (pkg) return { type: 'package', id: pkg };
-      if (app) return { type: 'app', id: app };
-    }
-
-    // 4) data-app-id
-    const appIdHolder = scopeEl.closest('[data-app-id]');
-    if (appIdHolder) {
-      const id = String(appIdHolder.getAttribute('data-app-id')).split(',')[0].trim();
-      if (/^\d+$/.test(id)) return { type: 'app', id };
-    }
-
-    // 5) 向上逐层遍历，找 /app/ 链接
-    let node = scopeEl;
-    while (node && node !== document.body) {
-      if (node.tagName === 'A') {
-        const m = (node.getAttribute('href') || '').match(/\/app\/(\d+)/);
-        if (m) return { type: 'app', id: m[1] };
-      }
-      const link = node.querySelector('a[href*="/app/"]');
-      if (link) {
-        const m = (link.getAttribute('href') || '').match(/\/app\/(\d+)/);
-        if (m) return { type: 'app', id: m[1] };
-      }
-      node = node.parentElement;
-    }
-
-    // 6) 自身或子元素找链接
-    const link = scopeEl.querySelector('a[href*="/app/"],a[href*="/sub/"],a[href*="/bundle/"]');
-    if (link) {
-      const h = link.getAttribute('href') || '';
-      let m = h.match(/\/bundle\/(\d+)/); if (m) return { type: 'bundle', id: m[1] };
-      m = h.match(/\/app\/(\d+)/); if (m) return { type: 'app', id: m[1] };
-      m = h.match(/\/sub\/(\d+)/); if (m) return { type: 'package', id: m[1] };
-    }
-
-    // 7) 当前页面
-    const p = location.pathname;
-    let m = p.match(/^\/bundle\/(\d+)/); if (m) return { type: 'bundle', id: m[1] };
-    m = p.match(/^\/app\/(\d+)/); if (m) return { type: 'app', id: m[1] };
-    m = p.match(/^\/sub\/(\d+)/); if (m) return { type: 'package', id: m[1] };
-
     return null;
   }
 
@@ -935,38 +1203,35 @@
     if (pendingElements.has(priceEl)) return;
     const txt = priceEl.textContent.trim();
     if (!txt || /^-\d+%$/.test(txt) || txt.length > 120) return;
-    if (priceEl.offsetWidth === 0 && !priceEl.closest('.game_area_purchase_game_dropdown_menu')) return;
-
     const region = getTargetRegion();
-    const exist = priceEl.querySelector('.' + EXTRA_CLASS);
-    if (exist && exist.getAttribute(MARK_ATTR) === region.id) return;
-
     const item = inferItemFromScope(priceEl);
     if (!item) return;
+    const identity = itemKey(item) + ':' + region.id;
+    if (enhancedItems.get(priceEl) !== identity) {
+      priceEl.querySelectorAll('.' + EXTRA_CLASS + ', .sapx-region-locked').forEach(node => node.remove());
+    }
+    const exist = priceEl.querySelector('.' + EXTRA_CLASS);
+    if (exist && exist.getAttribute(MARK_ATTR) === region.id) return;
 
     const locked = priceEl.querySelector('.sapx-region-locked');
     if (locked && locked.getAttribute(MARK_ATTR) === region.id) return;
 
     pendingElements.add(priceEl);
+    const scope = regionalScope;
+    const wantInitial = forceType === 'initial' || (forceType === 'auto' && isOriginalPriceElement(priceEl));
     let price;
     try { price = await getPriceForItem(item, region); }
     finally { pendingElements.delete(priceEl); }
-    if (!priceEl.isConnected) return;
+    if (!priceEl.isConnected || scope?.active === false || getTargetRegion().id !== region.id) return;
+    const current = inferItemFromScope(priceEl);
+    if (!current || itemKey(current) !== itemKey(item)) { scheduleScan(); return; }
+    enhancedItems.set(priceEl, identity);
     if (!price || !price.ok) {
       markRegionLocked(priceEl, region);
       regionalLog.debug('render.locked', '标记地区不可用', { item, region: region.id });
       return;
     }
     priceEl.querySelector('.sapx-region-locked')?.remove();
-
-    let wantInitial = false;
-    if (forceType === 'initial') {
-      wantInitial = true;
-    } else if (forceType === 'final') {
-      wantInitial = false;
-    } else {
-      wantInitial = isOriginalPriceElement(priceEl);
-    }
 
     const formatted = wantInitial ? (price.initialFormatted || price.finalFormatted) : price.finalFormatted;
     if (!formatted) return;
@@ -977,6 +1242,9 @@
 
   async function updateCartSummary() {
     if (!isCartPage()) return;
+    const revision = ++summaryRevision;
+    const scope = regionalScope;
+    const path = location.pathname;
     const region = getTargetRegion();
     const itemNodes = document.querySelectorAll('.i-xXuvHLioU-[role="button"]');
     const items = itemNodes.length ? itemNodes : document.querySelectorAll('.bKkQiLkI-vk-');
@@ -993,11 +1261,19 @@
     let sumMinor = 0;
     let missingCount = 0;
 
-    for (const row of items) {
-      const item = inferItemFromScope(row);
-      if (!item) continue;
-      const price = await getPriceForItem(item, region);
-      if (price && price.ok && price.final !== null && Number.isFinite(price.final)) sumMinor += price.final;
+    const refs = Array.from(items, row => inferItemFromScope(row));
+    const results = await Promise.all(refs.map(async item => {
+      if (!item) return { unknown: true };
+      try { return { price: await getPriceForItem(item, region) }; }
+      catch (_) { return { unknown: true }; }
+    }));
+    if (revision !== summaryRevision || scope?.active === false || location.pathname !== path ||
+        getTargetRegion().id !== region.id || !totalRow.isConnected ||
+        Array.from(items).some((row, i) => !row.isConnected || itemKey(inferItemFromScope(row) || {}) !== itemKey(refs[i] || {}))) return;
+    let unknownCount = 0;
+    for (const result of results) {
+      if (result.unknown) unknownCount++;
+      else if (result.price?.ok && Number.isFinite(result.price.final)) sumMinor += result.price.final;
       else missingCount++;
     }
 
@@ -1013,6 +1289,7 @@
 
     let html = '<div class="sapx-row"><div class="sapx-label">' + label + '：</div><div class="sapx-value">' + totalText + '</div></div>';
     if (missingCount > 0) html += '<div class="sapx-warn">目标地区有 ' + missingCount + ' 款锁区游戏，未计入小计</div>';
+    if (unknownCount > 0) html += '<div class="sapx-warn">有 ' + unknownCount + ' 项价格暂时无法确认，未计入小计</div>';
     if (box.innerHTML !== html) box.innerHTML = html;
     regionalLog.debug('summary.complete', '购物车额外地区汇总完成', {
       region: region.id,
@@ -1025,21 +1302,11 @@
   let cartSummaryRetry = null;
   function scheduleCartSummaryRetry() {
     if (cartSummaryRetry || !isCartPage()) return;
-    cartSummaryRetry = setTimeout(() => {
+    cartSummaryRetry = regionalScope.timeout(() => {
       cartSummaryRetry = null;
       updateCartSummary();
     }, 800);
   }
-
-  const PRICE_SELECTORS = [
-    '.discount_final_price', '.discount_original_price', '.game_purchase_price',
-    '.game_area_dlc_price', '.col.search_price.responsive_secondrow strike',
-    '.col.search_price.responsive_secondrow .discount_final_price',
-    '.Panel.Focusable .StoreOriginalPrice', '.Panel.Focusable .pk-LoKoNmmPK4GBiC9DR8',
-    '._2WLaY5TxjBGVyuWe_6KS3N', '.game_area_purchase_game_dropdown_selection > span',
-    '.game_area_purchase_game_dropdown_menu_item_text',
-    '.StoreOriginalPrice', '.j3jr1YqpBGk- > .-nS4ZC0Bruo-'
-  ].join(',');
 
   function isPriceLeaf(el) {
     if (!el || el.children.length > 0) return false;
@@ -1054,15 +1321,15 @@
     return true;
   }
 
-  function scanCartFallback() {
-    document.querySelectorAll('.i-xXuvHLioU-[role="button"]').forEach(row => {
+  function scanCartFallback(rows, enhance = enhancePriceElement) {
+    rows.forEach(row => {
       row.querySelectorAll('.StoreOriginalPrice, .j3jr1YqpBGk- > .-nS4ZC0Bruo-')
-        .forEach(price => enhancePriceElement(price));
+        .forEach(price => enhance(price));
     });
   }
 
-  function scanWishlistFallback() {
-    document.querySelectorAll('[data-rfd-draggable-id^="WishlistItem-"]').forEach(row => {
+  function scanWishlistFallback(rows, enhance = enhancePriceElement) {
+    rows.forEach(row => {
       let priceLeaves = [];
 
       const linkContainer = row.querySelector('div[role="link"]');
@@ -1095,35 +1362,40 @@
       if (priceLeaves.length === 0) return;
 
       if (priceLeaves.length >= 2) {
-        enhancePriceElement(priceLeaves[0], 'initial');
-        enhancePriceElement(priceLeaves[priceLeaves.length - 1], 'final');
+        enhance(priceLeaves[0], 'initial');
+        enhance(priceLeaves[priceLeaves.length - 1], 'final');
       } else if (priceLeaves.length === 1) {
-        enhancePriceElement(priceLeaves[0], 'final');
+        enhance(priceLeaves[0], 'final');
       }
     });
   }
 
-  let scanTimer = null;
-
-  function scheduleScan() {
-    if (scanTimer) return;
-    scanTimer = setTimeout(() => {
-      scanTimer = null;
-      const elements = document.querySelectorAll(PRICE_SELECTORS);
-      regionalLog.debug('scan.start', '扫描价格节点', { count: elements.length });
-      elements.forEach(el => { enhancePriceElement(el); });
-      if (isWishlistPage()) scanWishlistFallback();
-      if (isCartPage()) { scanCartFallback(); updateCartSummary(); }
-    }, 450);
-  }
-
+  let regionalScanner;
+  function scheduleScan() { regionalScanner?.scan(); }
   function startObserver() {
-    regionalLog.info('observer.ready', '地区价格扫描与动态监听已启用');
-    const obs = new MutationObserver(mutations => {
-      if (mutations.some(mutation => !mutation.target.parentElement?.closest('#' + UI_ROOT_ID + ', .' + EXTRA_CLASS + ', #' + CART_SUMMARY_ID) &&
-          !(mutation.target.nodeType === 1 && mutation.target.closest('#' + UI_ROOT_ID + ', .' + EXTRA_CLASS + ', #' + CART_SUMMARY_ID)))) scheduleScan();
+    const scope = regionalScope = createFeatureScope('regional-prices');
+    scope.own(() => {
+      summaryRevision++;
+      regionalScanner = null;
+      cartSummaryRetry = null;
+      document.querySelectorAll('.' + EXTRA_CLASS + ', .sapx-region-locked, #' + CART_SUMMARY_ID).forEach(node => node.remove());
     });
-    obs.observe(document.body, { childList: true, subtree: true, characterData: true });
+    const safeEnhance = (el, type) => enhancePriceElement(el, type).catch(error => {
+      if (scope.active) regionalLog.debug('price.unconfirmed', '价格暂时无法确认', { error });
+    });
+    regionalScanner = createDomScanner({ scope, name: 'regional-prices', attributes: ITEM_ATTRIBUTES,
+      selector: PRICE_SELECTORS + ',' + PAGE_ADAPTERS.wishlist.rows + ',' + PAGE_ADAPTERS.cart.rows,
+      process: elements => {
+        for (const el of elements) if (el.matches(PRICE_SELECTORS)) safeEnhance(el);
+        if (isWishlistPage()) scanWishlistFallback(elements.filter(el => el.matches(PAGE_ADAPTERS.wishlist.rows)), safeEnhance);
+        if (isCartPage()) scanCartFallback(elements.filter(el => el.matches(PAGE_ADAPTERS.cart.rows)), safeEnhance);
+      },
+      changed: () => {
+        summaryRevision++;
+        if (isCartPage()) updateCartSummary().catch(error => regionalLog.debug('summary.failed', '汇总暂不可用', { error }));
+      }
+    });
+    return scope;
   }
 
   // ---- conversion/settings.js ----
@@ -1544,26 +1816,10 @@ static readString(jsonString, cls) {
       return this.request(cls, details);
     }
     static request(cls, details) {
-      const task = diagnostics.scope('network').begin('conversion.request', { method: details.method });
-      return new Promise((resolve, reject) => {
-        const fail = error => { task.fail(error); reject(error); };
-        details.onload = (response) => {
-          if (response.status < 200 || response.status >= 300) { fail(new Error("HTTP " + response.status)); return; }
-          try {
-          if (cls.name === String.name) {
-            resolve(response.response);
-          } else {
-            const json = JSON.parse(response.response);
-            resolve(Jsons.readJson(json, cls));
-          }
-          task.end('转换模块请求完成', { status: response.status });
-          } catch (error) { fail(error); }
-        };
-        details.timeout = 20000;
-        details.ontimeout = () => fail(new Error("请求超时"));
-        details.onerror = () => fail(new Error('网络请求失败'));
-        try { _GM_xmlhttpRequest(details); }
-        catch (error) { fail(error); }
+      return gmRequest(details.url, { ...details, signal: conversionScope?.signal }).then(response => {
+        if (cls === String) return response.responseText;
+        try { return Jsons.readJson(JSON.parse(response.responseText), cls); }
+        catch (_) { throw invalidResponse('转换接口返回了无效 JSON'); }
       });
     }
   }
@@ -1722,13 +1978,8 @@ match(elementSnap) {
       if (/^[,.\d\s]+$/.test(content)) {
         return false;
       }
-      const parent = elementSnap.element.parentElement;
-      if (!parent) {
-        return false;
-      }
       for (const selector of this.getCssSelectors()) {
-        const element = parent.querySelector(selector);
-        if (element && element === elementSnap.element) {
+        if (elementSnap.element.matches(selector)) {
           elementSnap.selector = selector;
           return true;
         }
@@ -1748,102 +1999,7 @@ afterConvert(elementSnap, result) {
   });
   class ElementConverter extends AbstractConverter {
     getCssSelectors() {
-      const home = [
-".discount_prices > .discount_final_price",
-".Hxi-pnf9Xlw- span.HOrB6lehQpg-",
-".btnv6_white_transparent > span"
-      ];
-      const category = [
-".Wh0L8EnwsPV_8VAu8TOYr",
-        "._3j4dI1yA7cRfCvK8h406OB",
-"._1EKGZBnKFWOr3RqVdnLMRN",
-        "._3fFFsvII7Y2KXNLDk_krOW"
-      ];
-      const account = [
-"div.accountData.price",
-".addfunds_area_purchase_game.game_area_purchase_game > h1",
-".addfunds_area_purchase_game.game_area_purchase_game.es_custom_money > p"
-      ];
-      const wishlist = [
-"div.vTro5UlZ-gU- > div.QO6CjVPSFuI-",
-"a.En-WtuWIGUc- > span.nikULGV-7Q0-",
-"div.-OkCLv-56oQ- > div._9Rf9BwU0xAQ-",
-"div.-OkCLv-56oQ- > div.-HQzBzl6lqI-",
-"label.qhUI2RnjHYw-",
-"button.cDJOlrqyRq8-.n5jTCXrzS8A-.Focusable"
-      ];
-      const inventory = [
-"div.f6hU22EA7Z8peFWZVBJU"
-      ];
-      const cart = [
-".Panel.Focusable ._3-o3G9jt3lqcvbRXt8epsn.StoreOriginalPrice",
-".Panel.Focusable .pk-LoKoNmmPK4GBiC9DR8",
-"._2WLaY5TxjBGVyuWe_6KS3N"
-      ];
-      const cartCheckout = [
-"#checkout_review_cart_area .checkout_review_item_price > .price",
-"#review_subtotal_value.price",
-"#review_total_value.price"
-      ];
-      const market = [
-"#account_dropdown .account_name",
-"#es_summary .es_market_summary_item",
-"#marketWalletBalanceAmount",
-"span.normal_price[data-price]",
-"button.inqz7Zdx9Xg-.ob-nIzzquk8-.fkz-MePtKwI-.D8IENuW8Q7w-",
-"span.IokSIloSPlA-",
-
-"text.recharts-text.recharts-cartesian-axis-tick-value > tspan"
-      ];
-      const notify = [
-".QFW0BtI4l77AFmv1xLAkx._1B1XTNsfuwOaDPAkkr8M42 ._3hEeummFKRey8l5VXxZwxz > span"
-      ];
-      const app = [
-".game_area_purchase_game_dropdown_selection > span",
-".game_area_purchase_game_dropdown_menu_items_container_background.game_area_purchase_game_dropdown_menu_items_container  td.game_area_purchase_game_dropdown_menu_item_text"
-      ];
-      const selectors = [
-
-".discount_original_price",
-        ".discount_final_price",
-        ".col.search_price.responsive_secondrow strike",
-"#header_wallet_balance > span.tooltip",
-".esi-wishlist-stat > .num",
-".salepreviewwidgets_StoreOriginalPrice_1EKGZ",
-        ".salepreviewwidgets_StoreSalePriceBox_Wh0L8",
-".contenthubshared_OriginalPrice_3hBh3",
-        ".contenthubshared_FinalPrice_F_tGv",
-        ".salepreviewwidgets_StoreSalePriceBox_Wh0L8:not(.salepreviewwidgets_StoreSalePrepurchaseLabel_Wxeyn)",
-"tr.wallet_table_row > td.wht_total",
-        "tr.wallet_table_row > td.wht_wallet_change.wallet_column",
-        "tr.wallet_table_row > td.wht_wallet_balance.wallet_column",
-".package_totals_row > .price:not(.bundle_discount)",
-        "#package_savings_bar > .savings.bundle_savings",
-".home_page_content_title a.btn_small_tall > span"
-      ];
-      selectors.push(...home);
-      selectors.push(...category);
-      selectors.push(...account);
-      selectors.push(...wishlist);
-      selectors.push(...inventory);
-      selectors.push(...cart);
-      selectors.push(...cartCheckout);
-      selectors.push(...market);
-      selectors.push(...notify);
-      selectors.push(...app);
-      if (isCartPage()) {
-        selectors.push(
-          '.StoreOriginalPrice',
-          '.j3jr1YqpBGk- > .-nS4ZC0Bruo-',
-          '.i1XZFikuzME- .n9HLAjXXhvI-',
-          'main [class*="price" i]',
-          'main [class*="Price"]',
-          '[role="main"] [class*="price" i]',
-          '[class*="cart" i] [class*="price" i]',
-          '[data-testid*="price" i]'
-        );
-      }
-      return selectors;
+      return getConversionSelectors();
     }
     async convert(elementSnap) {
       await convertPriceTextNodes(elementSnap.element);
@@ -1881,9 +2037,8 @@ targets = new Map([
     }
     async convert(elementSnap) {
       const selector = elementSnap.selector;
-      this.targets.get(selector);
       const parseNodeFns = this.targets.get(selector) || [];
-      if (!parseNodeFns) {
+      if (!parseNodeFns.length) {
         return { converted: false };
       }
       const textNode = this.safeParseNode(selector, elementSnap.element, parseNodeFns);
@@ -1952,20 +2107,30 @@ targets = new Map([
       await Promise.all(tasks);
     }
   }
+  let conversionScope;
   async function initializeConversion() {
     if (!GM_getValue("sse_convert_enabled", true)) { log.debug('initialize.skip', '价格转换已关闭'); return; }
+    const scope = conversionScope = createFeatureScope('conversion');
+    scope.own(() => {
+      for (const [node, state] of convertedOriginals) {
+        if (node.isConnected && node.nodeValue === state.result) node.nodeValue = state.original;
+      }
+      convertedOriginals.clear();
+      document.querySelectorAll('[' + Attrs.STATUS_KEY + ']').forEach(node => node.removeAttribute(Attrs.STATUS_KEY));
+    });
     const task = log.begin('initialize', undefined, 'info');
     try {
       // SSR text must stay intact until React has adopted the server-rendered cart.
       if (isCartPage() && _unsafeWindow.SSR) {
         task.debug('hydrate.wait', '等待购物车页面接管服务端内容');
         const deadline = Date.now() + 15000;
-        while (!_unsafeWindow.SSR.hydrated && Date.now() < deadline) {
+        while (scope.active && !_unsafeWindow.SSR.hydrated && Date.now() < deadline) {
           await new Promise(resolve => setTimeout(resolve, 100));
         }
         task.debug('hydrate.ready', '结束页面就绪等待', { hydrated: Boolean(_unsafeWindow.SSR.hydrated) });
       }
       await initContext();
+      if (!scope.active) return;
       await start();
       task.end('价格转换初始化完成');
     }
@@ -1986,39 +2151,12 @@ targets = new Map([
   }
   async function convert() {
     const exchangerManager = ConverterManager.instance;
-    const elements = document.querySelectorAll(exchangerManager.getSelector());
-    log.debug('scan.initial', '扫描初始价格节点', { count: elements.length });
-    await exchangerManager.convert(elements);
     const selector = exchangerManager.getSelector();
-    const priceObserver = new MutationObserver(async (mutations) => {
-      const uniqueTargets = new Set();
-      mutations.forEach((mutation) => {
-        if (mutation.type === "characterData") {
-          const parentEl = mutation.target.parentElement;
-          if (parentEl && parentEl.matches(selector)) {
-            uniqueTargets.add(parentEl);
-          }
-          const closestEl = parentEl?.closest(selector);
-          if (closestEl) {
-            uniqueTargets.add(closestEl);
-          }
-        } else {
-          const target = mutation.target;
-          if (target.matches?.(selector)) uniqueTargets.add(target);
-          const priceEls = target.querySelectorAll(selector);
-          priceEls.forEach((el) => uniqueTargets.add(el));
-        }
-      });
-      if (uniqueTargets.size > 0) {
-        log.debug('scan.mutation', '处理变化的价格节点', { count: uniqueTargets.size });
-        await exchangerManager.convert(uniqueTargets);
-      }
-    });
-    priceObserver.observe(document.body, {
-      childList: true,
-      subtree: true,
-      characterData: true
-    });
+    const scope = conversionScope || (conversionScope = createFeatureScope('conversion'));
+    const scanner = createDomScanner({ scope, selector, name: 'conversion', initial: false,
+      process: nodes => exchangerManager.convert(nodes) });
+    scanner.scan();
+    await scanner.flush();
     log.debug('observer.ready', '价格变化监听已启用');
   }
   async function initContext() {
@@ -2053,7 +2191,9 @@ targets = new Map([
 
   const convertedNodes = new WeakMap();
   const convertingNodes = new WeakSet();
+  const convertedOriginals = new Map();
   async function convertPriceTextNodes(root) {
+    const scope = conversionScope;
     const nodes = [];
     if (root.nodeType === 3) nodes.push(root);
     else {
@@ -2068,12 +2208,16 @@ targets = new Map([
       convertingNodes.add(node);
       try {
         const result = await PriceProcessor.convertContent(original);
-        if (node.isConnected && node.nodeValue === original) {
+        if (scope?.active !== false && node.isConnected && node.nodeValue === original) {
           convertedNodes.set(node, result);
-          if (result !== original) node.nodeValue = result;
+          if (result !== original) {
+            convertedOriginals.set(node, { original, result });
+            node.nodeValue = result;
+          }
         }
       } finally { convertingNodes.delete(node); }
     }));
+    for (const node of convertedOriginals.keys()) if (!node.isConnected) convertedOriginals.delete(node);
   }
   return {
     get setting() { return SettingManager.instance.setting; },
@@ -2086,6 +2230,7 @@ targets = new Map([
 
   // ---- family-library.js ----
   function initializeFamilyLibrary() {
+    const scope = createFeatureScope('family');
     const log = diagnostics.scope('family');
     const KEY = 'sse_family_cache_v1';
     const DAY = 86400000;
@@ -2119,6 +2264,7 @@ targets = new Map([
       #sse-family-dialog .sse-family-scroll{overflow:auto;max-height:350px}#sse-family-dialog input{box-sizing:border-box;padding:8px;background:#0f141b;color:#c6d4df;border:1px solid #34465a;width:100%;margin:8px 0}
     `;
     document.head.appendChild(style);
+    scope.own(() => { style.remove(); close(); document.querySelectorAll('.sse-family-badge, .sse-family-banner, #sse-family-nav').forEach(node => node.remove()); });
 
     function readIdentity() {
       const session = readStoreSession(document, page);
@@ -2127,7 +2273,7 @@ targets = new Map([
     try { if (onStore) accountId = readIdentity().steamid; }
     catch (error) { notice = '暂时无法读取登录信息，请刷新 Steam 商店页面。'; log.warn('session.read', notice, { error }); }
     function validCache() {
-      return cache && cache.apps && (!onStore || !accountId || cache.steamid === accountId);
+      return cache && cache.apps && Array.isArray(cache.members) && (!onStore || (accountId && cache.steamid === accountId));
     }
     function ownerName(id) { return cache?.names?.[String(id)] || String(id); }
     function gameDescription(game) {
@@ -2140,8 +2286,8 @@ targets = new Map([
       const url = new URL('https://api.steampowered.com/' + method + '/v1/');
       url.searchParams.set('access_token', token);
       Object.entries(params).forEach(([key, value]) => url.searchParams.set(key, value));
-      const parsed = JSON.parse(await gmGet(url.href));
-      if (!parsed.response) throw new Error('Steam 返回了无效的家庭库数据。');
+      const parsed = JSON.parse(await gmGet(url.href, { signal: scope.signal }));
+      if (!parsed.response || typeof parsed.response !== 'object') throw invalidResponse('Steam 返回了无效的家庭库数据。');
       task.end('家庭库接口请求完成');
       return parsed.response;
       } catch (error) { task.fail(error); throw error; }
@@ -2159,16 +2305,18 @@ targets = new Map([
         notice = '正在读取家庭组……'; refreshNotice();
         const family = await api('IFamilyGroupsService/GetFamilyGroupForUser', identity.token, { include_family_group_response: true });
         if (!family.family_groupid || !family.family_group) throw new Error('当前账号没有可读取的 Steam 家庭组。');
-        const members = family.family_group.members || [];
+        const members = family.family_group.members;
+        if (!Array.isArray(members) || !members.length || members.some(member => !/^\d{17}$/.test(String(member?.steamid)))) throw invalidResponse('家庭成员列表无效，原缓存已保留。');
         task.debug('members', '家庭成员已读取', { count: members.length });
         // The API identifies the signed-in member even when the SSR page omits its SteamID.
         const self = identity.steamid || String(family.steamid || '');
-        if (!self) throw new Error('无法确认当前账号 SteamID，未覆盖已保存的家庭库。');
+        if (!/^\d{17}$/.test(self)) throw new Error('无法确认当前账号 SteamID，未覆盖已保存的家庭库。');
         notice = '正在扫描家庭库游戏……'; refreshNotice();
         const library = await api('IFamilyGroupsService/GetSharedLibraryApps', identity.token, {
           family_groupid: family.family_groupid, include_own: true, include_excluded: false, include_non_games: false
         });
-        if (!Array.isArray(library.apps)) throw new Error('家庭库接口没有返回游戏列表，原缓存已保留。');
+        if (!Array.isArray(library.apps) || library.apps.some(app => !itemRef('app', app?.appid) ||
+            !Array.isArray(app.owner_steamids) || app.owner_steamids.some(id => !/^\d{17}$/.test(String(id))))) throw invalidResponse('家庭库游戏列表无效，原缓存已保留。');
         task.debug('library', '共享游戏列表已读取', { count: library.apps.length });
         const names = Object.fromEntries(members.map(member => [String(member.steamid), String(member.steamid)]));
         try {
@@ -2183,6 +2331,7 @@ targets = new Map([
           if (Number(app.exclude_reason || 0) !== 0 || !Number.isSafeInteger(Number(app.appid))) continue;
           apps[app.appid] = { name: app.name || String(app.appid), owners: [...new Set((app.owner_steamids || []).map(String))], time: Number(app.rt_time_acquired) || 0 };
         }
+        if (!scope.active || (readIdentity().steamid && readIdentity().steamid !== self)) return;
         cache = { steamid: self, familyId: String(family.family_groupid), name: family.family_group.name || 'Steam 家庭', members: members.map(member => String(member.steamid)), names, apps, updated: Date.now() };
         accountId = self;
         GM_setValue(KEY, cache);
@@ -2203,6 +2352,7 @@ targets = new Map([
       return control;
     }
     function open() {
+      if (!scope.active) return;
       log.debug('panel.open', '打开家庭库管理');
       if (!root) {
         root = createElement('div');
@@ -2214,16 +2364,31 @@ targets = new Map([
     }
     function close() { if (root) log.debug('panel.close', '关闭家庭库管理'); hideChartTooltip(); root?.remove(); root = null; }
     let chartTooltip = null;
-    function hideChartTooltip() { chartTooltip?.remove(); chartTooltip = null; }
+    let tooltipSize;
+    let tooltipContent;
+    let tooltipFrame;
+    function hideChartTooltip() {
+      if (tooltipFrame) cancelAnimationFrame(tooltipFrame);
+      tooltipFrame = null; tooltipSize = null; tooltipContent = null;
+      chartTooltip?.remove(); chartTooltip = null;
+    }
     function showChartTooltip(content, x, y) {
       if (!chartTooltip) {
         chartTooltip = createElement('div'); chartTooltip.id = 'sse-family-chart-tooltip'; chartTooltip.setAttribute('role', 'tooltip');
         document.documentElement.appendChild(chartTooltip);
       }
-      chartTooltip.textContent = content;
-      const bounds = chartTooltip.getBoundingClientRect();
-      chartTooltip.style.left = Math.max(12, Math.min(x + 14, window.innerWidth - bounds.width - 12)) + 'px';
-      chartTooltip.style.top = Math.max(12, Math.min(y + 14, window.innerHeight - bounds.height - 12)) + 'px';
+      if (tooltipContent !== content || !tooltipSize) {
+        chartTooltip.textContent = content;
+        tooltipContent = content;
+        tooltipSize = chartTooltip.getBoundingClientRect();
+      }
+      if (tooltipFrame) cancelAnimationFrame(tooltipFrame);
+      tooltipFrame = requestAnimationFrame(() => {
+        tooltipFrame = null;
+        if (!chartTooltip || !scope.active) return;
+        chartTooltip.style.left = Math.max(12, Math.min(x + 14, window.innerWidth - tooltipSize.width - 12)) + 'px';
+        chartTooltip.style.top = Math.max(12, Math.min(y + 14, window.innerHeight - tooltipSize.height - 12)) + 'px';
+      });
     }
     function ensureFamilyNav() {
       if (!onStore || !enabled) return;
@@ -2278,7 +2443,7 @@ targets = new Map([
       if (label.textContent !== count) label.textContent = count;
       control.title = '查看家庭库贡献统计、最近购入与扫描管理';
     }
-    window.addEventListener('keydown', event => { if (event.key === 'Escape') close(); });
+    scope.listen(window, 'keydown', event => { if (event.key === 'Escape') close(); });
     function renderDialog() {
       if (!root) return;
       hideChartTooltip();
@@ -2344,7 +2509,8 @@ targets = new Map([
       log.debug('panel.render', '家庭库面板已更新', { cacheValid: Boolean(validCache()), scanning: Boolean(scanPromise) });
     }
 
-    const targets = 'a[href*="/app/"], [data-ds-appid], [data-app-id], [data-rfd-draggable-id^="WishlistItem-"]';
+    const targets = PAGE_ADAPTERS.family.rows;
+    const marked = new Set();
     function appId(element) {
       const value = element.getAttribute('data-ds-appid') || element.getAttribute('data-app-id');
       if (value && /^\d+$/.test(value)) return value;
@@ -2354,37 +2520,42 @@ targets = new Map([
       const match = href.match(/^(?:https?:\/\/(?:store\.steampowered\.com|steamcommunity\.com))?\/app\/(\d+)/);
       return match?.[1] || null;
     }
-    function updateMarks() {
-      ensureFamilyNav();
+    function updateMarks(elements) {
+      if (!scope.active) return;
       const active = enabled && validCache();
-      document.querySelectorAll('[data-sse-family-app]').forEach(element => {
+      for (const element of marked) {
         const id = element.getAttribute('data-sse-family-app');
         const game = active ? cache.apps[id] : null;
-        if (!game || game.owners.includes(cache.steamid) || appId(element) !== id) {
+        if (!element.isConnected || !game || game.owners.includes(cache.steamid) || appId(element) !== id) {
           element.querySelector(':scope > .sse-family-badge')?.remove(); element.removeAttribute('data-sse-family-app');
+          marked.delete(element);
         }
-      });
-      document.querySelectorAll('.sse-family-banner').forEach(element => element.remove());
+      }
+      if (!elements) { ensureFamilyNav(); updateBanner(); }
       if (!active) return;
       let added = 0;
-      document.querySelectorAll(targets).forEach(element => {
+      (elements || document.querySelectorAll(targets)).forEach(element => {
         if (element.closest('#sse-family-dialog, #sapx-ui-root, #sse-cart-tools, .sse-family-banner, .sse-family-badge')) return;
         const id = appId(element); const game = cache.apps[id];
         if (!game || game.owners.includes(cache.steamid) || element.classList.contains('ds_owned') || element.querySelector('.ds_owned_flag:not(.sse-family-badge)')) return;
         const owner = element.parentElement?.closest(targets);
         if (owner && appId(owner) === id) return;
         element.setAttribute('data-sse-family-app', id);
+        marked.add(element);
         let badge = element.querySelector(':scope > .sse-family-badge');
         if (!badge) { badge = createElement('span', '在家庭库中', 'sse-family-badge'); element.appendChild(badge); added++; }
         const title = gameDescription(game);
         if (badge.title !== title) badge.title = title;
       });
       if (added) log.debug('marks.render', '家庭库标记已添加', { count: added });
+    }
+    function updateBanner() {
+      if (!enabled || !validCache()) { document.querySelectorAll('.sse-family-banner').forEach(node => node.remove()); return; }
       const detailId = location.pathname.match(/^\/app\/(\d+)/)?.[1];
       const detail = cache.apps[detailId];
       if (onStore && detail) {
         const host = document.querySelector('.queue_and_playtime, #game_area_purchase, .game_area_purchase');
-        if (host) {
+        if (host && !host.querySelector('.sse-family-banner')) {
           const banner = createElement('div', detail.owners.includes(cache.steamid) ? '您和家庭成员拥有此游戏' : '您的 Steam 家庭库中已有此游戏', 'sse-family-banner');
           banner.title = gameDescription(detail);
           banner.appendChild(action('查看贡献者（' + detail.owners.length + '）', () => window.alert(gameDescription(detail))));
@@ -2394,30 +2565,21 @@ targets = new Map([
       }
       if (location.hostname === 'steamdb.keylol.com') {
         const id = location.hash.match(/app\/(\d+)/)?.[1]; const game = cache.apps[id]; const host = document.querySelector('#game_score');
-        if (game && !game.owners.includes(cache.steamid) && host) host.after(createElement('div', '家庭组：' + gameDescription(game), 'sse-family-banner'));
+        if (game && !game.owners.includes(cache.steamid) && host && !document.querySelector('.sse-family-banner')) host.after(createElement('div', '家庭组：' + gameDescription(game), 'sse-family-banner'));
       }
     }
     if (enabled) {
-      let timer = null;
-      const observer = new MutationObserver(mutations => {
-        const relevant = mutations.some(mutation => {
-          const element = mutation.target.nodeType === 1 ? mutation.target : mutation.target.parentElement;
-          if (element?.closest('#sse-family-dialog, #sapx-ui-root, .sse-family-banner, .sse-family-badge')) return false;
-          if (mutation.type === 'attributes') return true;
-          return [...mutation.addedNodes, ...mutation.removedNodes].some(item => item.nodeType === 1 && !item.matches('.sse-family-badge, .sse-family-banner'));
-        });
-        if (timer || !relevant) return;
-        timer = setTimeout(() => { timer = null; updateMarks(); }, 350);
-      });
-      observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['href', 'data-ds-appid', 'data-app-id', 'data-rfd-draggable-id'] });
+      createDomScanner({ scope, name: 'family', selector: targets, process: updateMarks,
+        attributes: ITEM_ATTRIBUTES, changed: () => { ensureFamilyNav(); updateBanner(); },
+        removed: () => { for (const node of marked) if (!node.isConnected) marked.delete(node); } });
       log.debug('observer.ready', '家庭库标记动态监听已启用');
-      window.addEventListener('hashchange', updateMarks);
+      scope.listen(window, 'hashchange', () => updateMarks());
       updateMarks();
       if (onStore && GM_getValue('sse_family_auto', true) && (!validCache() || Date.now() - cache.updated >= DAY)) {
         log.debug('scan.auto', '缓存缺失或过期，触发自动扫描'); scan();
       } else log.debug('scan.skip', '无需自动扫描');
     }
-    return { open };
+    return { open, dispose: scope.dispose };
   }
 
   // ---- cart-tools.js ----
@@ -2449,6 +2611,7 @@ targets = new Map([
   }
 
   function initializeCartTools() {
+    const scope = createFeatureScope('cart');
     const log = diagnostics.scope('cart');
     log.info('initialize', '快速加购与购物车管理已启用');
     const page = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
@@ -2473,9 +2636,15 @@ targets = new Map([
       .sse-cart-dialog h3{color:#e5e5e5;margin-top:0}.sse-cart-dialog .sse-cart-button{display:block;width:100%;margin-top:8px;text-align:left}
     `;
     document.head.appendChild(style);
+    const nativeReplacements = new Map();
+    scope.own(() => {
+      for (const [control, native] of nativeReplacements) if (control.isConnected) control.replaceWith(native);
+      document.querySelectorAll('.sse-quick-add, #sse-cart-extract, #sse-cart-tools, .sse-cart-dialog, .sse-account-country').forEach(node => node.remove());
+      document.querySelectorAll('.sse-wishlist-native-cart').forEach(node => node.classList.remove('sse-wishlist-native-cart'));
+      style.remove();
+    });
     let contextPromise;
     let busy = false;
-    const itemRequests = new Map();
 
     function readContext(doc, globals = {}) {
       const session = readStoreSession(doc, globals);
@@ -2489,7 +2658,7 @@ targets = new Map([
           log.debug('session.read', '读取当前页面账号信息', { hasToken: Boolean(result.token), country: result.country });
           if (!result.token || !result.country) {
             log.debug('session.fallback', '从购物车页面补充账号信息');
-            const html = await gmGet('https://store.steampowered.com/cart/');
+            const html = await gmGet('https://store.steampowered.com/cart/', { signal: scope.signal });
             const remote = new DOMParser().parseFromString(html, 'text/html');
             const fallback = readContext(remote);
             result = { ...result, token: result.token || fallback.token, country: result.country || fallback.country };
@@ -2507,36 +2676,35 @@ targets = new Map([
       const current = await context();
       const url = new URL('https://api.steampowered.com/IAccountCartService/' + method + '/v1/');
       url.searchParams.set('access_token', current.token);
-      const options = { method: payload === undefined ? 'GET' : 'POST', signal: AbortSignal.timeout(20000) };
+      const options = { method: payload === undefined ? 'GET' : 'POST', signal: scope.signal };
       if (payload !== undefined) options.body = new URLSearchParams({ input_json: JSON.stringify({ user_country: current.country, ...payload }) });
-      const response = await fetch(url.href, options);
-      if (!response.ok) throw new Error('HTTP ' + response.status);
-      const data = await response.json();
-      const resultCode = response.headers?.get('x-eresult');
+      const { data, headers } = await fetchJson(url.href, options);
+      const resultCode = headers?.get('x-eresult');
       if ((resultCode && resultCode !== '1') || (data.response?.result != null && data.response.result !== 1)) {
         throw new Error(text('Steam 拒绝了购物车操作。', 'Steam rejected the cart operation.'));
       }
-      if (!data.response) throw new Error(text('Steam 返回了无效结果。', 'Invalid Steam response.'));
+      const response = validateCartResponse(data, method);
+      if (payload !== undefined && resultCode !== '1' && data.response.result !== 1) throw invalidResponse('Steam 未确认购物车操作成功');
       task.end('购物车接口操作完成');
-      return data.response;
+      return response;
       } catch (error) { task.fail(error); throw error; }
     }
 
-    async function storeItem(item) {
-      const key = item.type + '/' + item.id;
-      if (itemRequests.has(key)) log.debug('item.cache', '复用商品查询', { item: key });
-      if (!itemRequests.has(key)) itemRequests.set(key, (async () => {
+    const itemCache = createAsyncCache({ load: async (key, item) => {
         log.debug('item.fetch', '读取商品购买选项', { item: key });
         const current = await context();
-        const field = { app: 'appid', sub: 'packageid', bundle: 'bundleid' }[item.type];
+        const field = itemField(item);
         const payload = { ids: [{ [field]: item.id }], context: { language: current.language, country_code: current.country, steam_realm: 1 }, data_request: { include_all_purchase_options: true } };
-        const response = JSON.parse(await requestQueue.enqueue(() => gmGet('https://api.steampowered.com/IStoreBrowseService/GetItems/v1/?input_json=' + encodeURIComponent(JSON.stringify(payload)))));
-        const result = response.response?.store_items?.[0];
+        const signal = scope.signal;
+        const response = JSON.parse(await requestQueue.enqueue(() => gmGet('https://api.steampowered.com/IStoreBrowseService/GetItems/v1/?input_json=' + encodeURIComponent(JSON.stringify(payload)), { signal }), { signal }));
+        const result = validateStoreItems(response)[0];
         if (!result) throw new Error(text('无法读取商品：', 'Cannot read item: ') + key);
         log.debug('item.ready', '商品购买选项已读取', { item: key });
         return result;
-      })().catch(error => { itemRequests.delete(key); log.warn('item.failed', '商品读取失败', { item: key, error }); throw error; }));
-      return itemRequests.get(key);
+      } });
+    scope.own(() => itemCache.clear());
+    async function storeItem(item) {
+      return itemCache.get(itemKey(item), item);
     }
 
     function parseItems(input) {
@@ -2573,13 +2741,15 @@ targets = new Map([
         const heading = document.createElement('h3');
         heading.textContent = title;
         panel.appendChild(heading);
-        const close = value => { log.debug('option.close', value ? '已选择选项' : '已取消选择'); overlay.remove(); window.removeEventListener('keydown', escape); resolve(value); };
+        let dispose;
+        const close = value => { log.debug('option.close', value ? '已选择选项' : '已取消选择'); overlay.remove(); window.removeEventListener('keydown', escape); if (dispose) scope.release(dispose); resolve(value); };
         const escape = event => { if (event.key === 'Escape') close(null); };
         for (const option of options) panel.appendChild(button((option.purchase_option_name || '') + ' · ' + (option.formatted_final_price || ''), () => close(option)));
         panel.appendChild(button(text('取消', 'Cancel'), () => close(null)));
         overlay.appendChild(panel);
         overlay.addEventListener('click', event => { if (event.target === overlay) close(null); });
         window.addEventListener('keydown', escape);
+        dispose = scope.own(() => close(null));
         document.body.appendChild(overlay);
         panel.querySelector('button').focus();
       });
@@ -2637,7 +2807,7 @@ targets = new Map([
       // Keep the Steam right column intact and place the tool immediately below its price card.
       if (anchor.nextElementSibling !== panel) anchor.after(panel);
       cartPanelAnchor = anchor;
-      panel.style.width = '100%';
+      if (panel.style.width !== '100%') panel.style.width = '100%';
     }
 
     function mountPanel() {
@@ -2786,8 +2956,8 @@ targets = new Map([
       log.debug('panel.mount', '购物车工具面板已挂载');
     }
 
-    const quickSelector = 'a.search_result_row, a.tab_item, a.recommendation_link, .wishlist_row, [data-rfd-draggable-id^="WishlistItem-"], .game_purchase_action';
-    function scanQuickButtons() {
+    const quickSelector = PAGE_ADAPTERS.quick.rows;
+    function scanQuickButtons(rows = document.querySelectorAll(quickSelector)) {
       mountPanel();
       if (!isCartPage() && document.querySelector(quickSelector) && !document.getElementById('sse-cart-extract')) {
         const host = document.querySelector('.wishlist_header, #search_results, .home_tabs_content, .page_content, main');
@@ -2809,7 +2979,7 @@ targets = new Map([
         }
       }
       let mounted = 0;
-      document.querySelectorAll(quickSelector).forEach(row => {
+      rows.forEach(row => {
         const wishlistRow = row.matches('.wishlist_row, [data-rfd-draggable-id^="WishlistItem-"]');
         const existing = row.querySelector('.sse-quick-add');
         if (existing) {
@@ -2857,6 +3027,7 @@ targets = new Map([
           // Keep purchase IDs available after replacing the native button.
           control.setAttribute(item.type === 'bundle' ? 'data-ds-bundleid' : item.type === 'sub' ? 'data-ds-packageid' : 'data-ds-appid', String(item.id));
           nativeButton.replaceWith(control);
+          nativeReplacements.set(control, nativeButton);
         } else if (!wishlistRow || !placeWishlistCartButton(row, control)) {
           row.appendChild(control);
         }
@@ -2864,14 +3035,16 @@ targets = new Map([
       });
       if (mounted) log.debug('quick-add.mount', '已挂载快速加购按钮', { count: mounted });
     }
-    let timer = null;
-    const observer = new MutationObserver(mutations => {
-      if (timer || !mutations.some(mutation => !mutation.target.parentElement?.closest('#sse-cart-tools, .sse-cart-dialog, #sapx-ui-root'))) return;
-      timer = setTimeout(() => { timer = null; scanQuickButtons(); }, 400);
-    });
-    observer.observe(document.body, { childList: true, subtree: true });
+    createDomScanner({ scope, selector: quickSelector, process: scanQuickButtons, name: 'cart',
+      attributes: ITEM_ATTRIBUTES, changed: mountPanel,
+      removed: () => { for (const [control] of nativeReplacements) if (!control.isConnected) nativeReplacements.delete(control); } });
     log.debug('observer.ready', '购物车动态节点监听已启用');
-    window.addEventListener('resize', () => mountPanel(), { passive: true });
+    let resizePending = false;
+    scope.listen(window, 'resize', () => {
+      if (resizePending) return;
+      resizePending = true;
+      scope.timeout(() => { resizePending = false; mountPanel(); }, 150);
+    }, { passive: true });
     scanQuickButtons();
     if (GM_getValue('sse_cart_country', false)) context().then(current => {
       const host = document.querySelector('#header_wallet_ctn');
@@ -2891,6 +3064,7 @@ targets = new Map([
       log.debug('initialize.skip', '当前页面不启用好友工具'); return;
     }
     log.info('initialize', '留言、分组与统计已启用');
+    const scope = createFeatureScope('friends');
 
     const ROOT_ID = 'sse-friend-tools';
     const style = document.createElement('style');
@@ -2910,6 +3084,7 @@ targets = new Map([
       #manage_friends .selected_msg{margin:0;padding:5px 8px;border-radius:3px;background:#0f141b;color:#d7e8f2}#manage_friends .selected_msg.error{color:#f29b9b}#manage_friends #selected_count{font-weight:bold;color:#67c1f5}#manage_friends .hidden{display:none!important}
     `;
     document.head.appendChild(style);
+    scope.own(() => style.remove());
 
     const root = createElement('section');
     root.id = ROOT_ID;
@@ -2996,14 +3171,11 @@ targets = new Map([
     else if (nativeList) nativeList.before(root);
     else { log.warn('panel.missing', '未找到好友管理面板或好友列表'); return; }
     log.debug('panel.mount', '好友工具已挂载', { nativeManagement: Boolean(managePanel) });
+    scope.own(() => root.remove());
 
     const getFriendRows = () => [...document.querySelectorAll('#search_results .selectable[data-steamid]')]
       .filter(row => /^\d{17}$/.test(row.dataset.steamid || ''));
     const page = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
-    // The original assistant opens Steam's native management mode to show card checkboxes.
-    if (managePanel && window.getComputedStyle(managePanel).display === 'none' && typeof page.ToggleManageFriends === 'function') {
-      page.ToggleManageFriends();
-    }
     const accountId = String(page.g_steamID || page.UserConfig?.steamid || 'anonymous');
     const GROUP_STORAGE_KEY = `sse_friend_groups_v1_${accountId}`;
     let groups = GM_getValue(GROUP_STORAGE_KEY, {});
@@ -3072,15 +3244,17 @@ targets = new Map([
     renderGroups();
     const friendList = document.querySelector('#search_results');
     if (friendList) {
-      friendList.addEventListener('change', updateSelectionCount);
+      scope.listen(friendList, 'change', updateSelectionCount);
       let refreshTimer = null;
-      new MutationObserver(() => {
+      const observer = new MutationObserver(() => {
         if (refreshTimer) return;
-        refreshTimer = setTimeout(() => {
+        refreshTimer = scope.timeout(() => {
           refreshTimer = null;
           renderFriends();
         }, 250);
-      }).observe(friendList, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'data-steamid'] });
+      });
+      observer.observe(friendList, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'data-steamid'] });
+      scope.own(() => observer.disconnect());
       log.debug('observer.ready', '好友列表动态监听已启用');
     }
     createGroup.addEventListener('click', () => {
@@ -3154,6 +3328,7 @@ targets = new Map([
       const results = [];
       try {
         for (let index = 0; index < friends.length; index++) {
+          if (!scope.active) break;
           const friend = friends[index];
           const steamId = friend.dataset.steamid;
           const name = friend.querySelector('.friend_block_content')?.textContent.trim().split('\n')[0] || steamId;
@@ -3161,12 +3336,12 @@ targets = new Map([
           try {
           task.debug('request', '开始发送留言', { index: index + 1, total: friends.length });
           const body = new URLSearchParams({ comment, count: '6', sessionid: sessionId });
-          const response = await fetch(`/comment/Profile/post/${steamId}/-1/`, {
+          const { data: result } = await fetchJson(`/comment/Profile/post/${steamId}/-1/`, {
             method: 'POST', credentials: 'same-origin',
+            signal: scope.signal,
             headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' }, body
           });
-          const result = await response.json();
-          if (!response.ok || result.success === false) throw new Error(result.error || `HTTP ${response.status}`);
+          if (result?.success !== true && result?.success !== 1) throw new Error(result?.error || 'Steam 未确认留言成功');
           results.push(`已发送 ${name}`);
           task.debug('sent', '留言发送成功', { index: index + 1, total: friends.length });
           } catch (error) {
@@ -3197,39 +3372,10 @@ targets = new Map([
     { id: 'jsdelivr-fastly', url: ref => `https://fastly.jsdelivr.net/gh/F1NN1ER/getSteamRestrictedGameLIst@${ref}/data/fulllist.json` }
   ];
 
-  function restrictionRequest(url, { probe = false, timeout = probe ? 6000 : 60000 } = {}) {
-    return new Promise((resolve, reject) => {
-      const started = Date.now();
-      let request;
-      let settled = false;
-      const finish = (error, result) => {
-        if (settled) return;
-        settled = true;
-        if (error) reject(error); else resolve(result);
-      };
-      try {
-        request = GM_xmlhttpRequest({
-          method: 'GET', url, anonymous: true, timeout,
-          ...(probe ? { headers: { Range: 'bytes=0-16383' } } : {}),
-          onprogress: event => {
-            // Stop a server ignoring Range instead of downloading the database for each probe.
-            if (probe && event.loaded >= 16384) {
-              finish(null, { ms: Date.now() - started });
-              request?.abort();
-            }
-          },
-          onload: response => {
-            if (response.status !== 200 && !(probe && response.status === 206)) {
-              finish(new Error('HTTP ' + response.status)); return;
-            }
-            finish(null, { text: response.responseText, ms: Date.now() - started });
-          },
-          onerror: () => finish(new Error('数据源请求失败')),
-          ontimeout: () => finish(new Error('数据源请求超时')),
-          onabort: () => finish(new Error('数据源请求已中止'))
-        });
-      } catch (error) { finish(error); }
-    });
+  async function restrictionRequest(url, { probe = false, timeout = probe ? 6000 : 60000, signal } = {}) {
+    const started = Date.now();
+    const response = await gmRequest(url, { anonymous: true, probe, timeout, signal });
+    return { text: response.responseText, ms: Date.now() - started };
   }
 
   function parseRestrictionDatabase(text) {
@@ -3339,7 +3485,7 @@ targets = new Map([
     return 0;
   }
 
-  function createSteamRestrictionLookup({ read, write, request = url => gmGet(url), parse = (html, id) =>
+  function createSteamRestrictionLookup({ read, write, signal, request = url => gmGet(url, { signal }), parse = (html, id) =>
     parseSteamRestriction(new DOMParser().parseFromString(html, 'text/html'), id), now = () => Date.now(),
     wait = ms => new Promise(resolve => setTimeout(resolve, ms)) }) {
     const log = diagnostics.scope('restrictions.steam');
@@ -3376,11 +3522,13 @@ targets = new Map([
       const attempt = attempted.get(appid);
       if (attempt && now() < attempt.retryAt) return null;
       const run = async () => {
+        if (signal?.aborted) return null;
         try { cache = { ...cache, ...read(key) }; } catch (_) {}
         if ([0, 1, 2].includes(cache[appid]?.status)) return cache[appid].status;
         if (now() < (readControl().cooldownUntil || 0)) return null;
         const delay = Math.max(0, (control.nextAt || 0) - now());
         if (delay) await wait(delay);
+        if (signal?.aborted) return null;
         if (now() < (readControl().cooldownUntil || 0)) return null;
         saveControl({ ...control, nextAt: now() + 4000 });
         const task = log.begin('lookup', { appid });
@@ -3401,6 +3549,7 @@ targets = new Map([
           task.end('Steam 状态读取完成', { appid, status });
           return status;
         } catch (error) {
+          if (signal?.aborted) { task.cancel('页面已离开'); return null; }
           task.fail(error);
           failed([403, 429].includes(error?.status) || /HTTP (403|429)\b/.test(error?.message || ''));
           attempted.set(appid, { retryAt: now() + 15 * 60 * 1000 });
@@ -3409,7 +3558,7 @@ targets = new Map([
       };
       // Coordinate same-origin tabs where Web Locks are available.
       const promise = queue.enqueue(() => typeof navigator !== 'undefined' && navigator.locks?.request
-        ? navigator.locks.request('sse-steam-restriction-lookup', run) : run())
+        ? navigator.locks.request('sse-steam-restriction-lookup', { ...(signal ? { signal } : {}) }, run) : run(), { signal })
         .finally(() => pending.delete(appid));
       pending.set(appid, promise);
       return promise;
@@ -3500,10 +3649,11 @@ targets = new Map([
     const log = diagnostics.scope('restrictions');
     if (!/^(store\.steampowered\.com|steamcommunity\.com)$/.test(location.hostname) ||
         !GM_getValue('sse_restrictions_enabled', true)) return;
+    const scope = createFeatureScope('restrictions');
     const read = key => GM_getValue(key, null);
     const write = (key, value) => GM_setValue(key, value);
-    const database = createRestrictionDatabase({ read, write });
-    const resolve = createRestrictionResolver(database, createSteamRestrictionLookup({ read, write }));
+    const database = createRestrictionDatabase({ read, write, request: (url, options) => restrictionRequest(url, { ...options, signal: scope.signal }) });
+    const resolve = createRestrictionResolver(database, createSteamRestrictionLookup({ read, write, signal: scope.signal }));
     const style = createElement('style');
     style.textContent = `
       .sse-restriction-badge{display:inline-block!important;vertical-align:middle;margin-left:6px;padding:2px 5px;border-radius:2px;font:600 11px/1.4 Arial,sans-serif;white-space:nowrap;text-decoration:none!important;letter-spacing:normal;text-shadow:none;pointer-events:none}
@@ -3516,13 +3666,14 @@ targets = new Map([
       .sse-restriction-wishlist-title>.sse-restriction-badge{flex:0 0 auto}
     `;
     document.head.appendChild(style);
-    const selector = '#appHubAppName, .search_result_row .title, .tab_item_name, .wishlist_row .title, ' +
-      '[data-rfd-draggable-id^="WishlistItem-"] a[href*="/app/"], .gameListRow .gameListRowItemName, ' +
-      '.recommendation_link .game_name, .capsule .title, .store_capsule .title, ' +
-      '.tab_item_title, .store_main_capsule .app_name, .store_main_capsule .app_name > div, ' +
-      '.dailydeal_desc .game_name, .home_content .game_name, ' +
-      '.community_recommendation_app .app_name, .home_content.single .single_title, ' +
-      '[data-ds-appid] [class*="StoreSaleWidgetTitle"], [data-ds-appid] [class*="GameName"]';
+    scope.own(() => {
+      revision++;
+      style.remove();
+      document.querySelectorAll('.sse-restriction-badge').forEach(node => node.remove());
+      document.querySelectorAll('.sse-restriction-title-text').forEach(node => node.replaceWith(...node.childNodes));
+      document.querySelectorAll('.sse-restriction-wishlist-title').forEach(node => node.classList.remove('sse-restriction-wishlist-title'));
+    });
+    const selector = PAGE_ADAPTERS.restrictions.titles;
     let states = new WeakMap();
     let revision = 0;
     async function enhance(title) {
@@ -3549,7 +3700,7 @@ targets = new Map([
       const startedRevision = revision;
       states.set(title, state);
       const result = await resolve(appid);
-      if (!title.isConnected || revision !== startedRevision || states.get(title) !== state || restrictionAppId(title) !== appid) return;
+      if (!scope.active || !title.isConnected || revision !== startedRevision || states.get(title) !== state || restrictionAppId(title) !== appid) return;
       state.pending = false;
       if (!result || result.status === 3) state.retryAt = Date.now() + 15 * 60 * 1000;
       if (!result) return;
@@ -3563,35 +3714,25 @@ targets = new Map([
       title.appendChild(badge);
       log.debug('badge.render', '游戏受限状态已显示', { appid, ...result });
     }
-    const scan = createScheduledTask(() => {
-      const titles = document.querySelectorAll(selector);
+    const scanner = createDomScanner({ scope, selector, name: 'restrictions', attributes: ITEM_ATTRIBUTES, process: titles => {
       log.debug('scan', '扫描游戏标题', { count: titles.length });
       titles.forEach(title => { enhance(title).catch(error => log.error('badge.failed', '游戏受限标记失败', { error })); });
-    }, 250);
-    database.subscribe?.(() => {
+    } });
+    const scan = () => scanner.scan();
+    const unsubscribe = database.subscribe?.(() => {
       revision++;
       states = new WeakMap();
       scan();
     });
+    if (unsubscribe) scope.own(unsubscribe);
     // Recheck on long-lived tabs and when returning from a suspended/background tab.
     const refresh = () => {
       database.load().catch(error => log.warn('refresh.failed', '数据库刷新失败', { error }));
       scan();
     };
-    const refreshTimer = setInterval(refresh, 60 * 1000);
-    window.addEventListener('pageshow', refresh);
-    document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
-    window.addEventListener('pagehide', event => { if (!event.persisted) clearInterval(refreshTimer); });
-    new MutationObserver(mutations => {
-      if (mutations.some(mutation => {
-        const target = mutation.target.nodeType === 1 ? mutation.target : mutation.target.parentElement;
-        if (target?.closest('.sse-restriction-badge, #sapx-ui-root, #sse-family-dialog')) return false;
-        if (mutation.type !== 'childList') return true;
-        return [...mutation.addedNodes, ...mutation.removedNodes].some(node =>
-          node.nodeType !== 1 || !node.matches('.sse-restriction-badge'));
-      })) scan();
-    }).observe(document.body, { childList: true, subtree: true, characterData: true, attributes: true,
-      attributeFilter: ['href', 'data-ds-appid', 'data-app-id', 'data-rfd-draggable-id'] });
+    scope.interval(() => { if (!document.hidden) refresh(); }, 60 * 1000);
+    scope.listen(window, 'pageshow', refresh);
+    scope.listen(document, 'visibilitychange', () => { if (!document.hidden) refresh(); });
     log.info('initialize', '游戏受限状态标记已启用');
     scan();
   }
@@ -3658,15 +3799,21 @@ targets = new Map([
   }
 
   function initializeWishlistSaleCountdown() {
-    if (location.hostname !== 'store.steampowered.com' || !isWishlistPage()) return;
+    if (location.hostname !== 'store.steampowered.com' || !isWishlistPage() || !GM_getValue('sse_wishlist_sale_enabled', true)) return;
 
     const log = diagnostics.scope('wishlist-sale');
+    const scope = createFeatureScope('wishlist-sale');
     const page = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
     const rowsByApp = new Map();
     const expiryByApp = new Map();
     const queuedApps = new Set();
+    const pendingApps = new Set();
+    const retryByApp = new Map();
+    const refreshedAt = new Map();
+    const rowIds = new WeakMap();
+    const badges = new Set();
+    let cancelRetry;
     let flushTimer = null;
-    let scanTimer = null;
     const hydrationWaitStarted = Date.now();
 
     if (!document.getElementById('sse-wishlist-sale-style')) {
@@ -3674,6 +3821,7 @@ targets = new Map([
       style.id = 'sse-wishlist-sale-style';
       style.textContent = '.sse-wishlist-sale-expiration{display:block;margin:5px 0 0;color:#9acb7a;font-size:11px;line-height:1.4;white-space:normal;pointer-events:none}.sse-wishlist-sale-expiration.sse-ending-soon{color:#e6a15a}.sse-wishlist-sale-expiration.sse-sale-ended{color:#e46767}';
       document.head.appendChild(style);
+      scope.own(() => style.remove());
     }
 
     function appIdFor(row) {
@@ -3690,16 +3838,23 @@ targets = new Map([
 
     function renderExpiry(appId) {
       const endTime = expiryByApp.get(appId);
-      if (!endTime) return;
       const rows = rowsByApp.get(appId);
       if (!rows) return;
+      if (!endTime) {
+        if (expiryByApp.has(appId)) for (const row of rows) row.querySelector('.sse-wishlist-sale-expiration')?.remove();
+        return;
+      }
       for (const row of rows) {
-        if (!row.isConnected || !isDiscounted(row) || row.querySelector('.sse-wishlist-sale-expiration')) continue;
+        if (!row.isConnected || appIdFor(row) !== appId || !isDiscounted(row)) continue;
+        const existing = row.querySelector('.sse-wishlist-sale-expiration');
+        if (existing && existing.dataset.endTime === String(endTime)) continue;
+        existing?.remove();
         const price = findWishlistSalePrice(row);
         if (!price) continue;
         const badge = document.createElement('span');
         badge.className = 'sse-wishlist-sale-expiration';
         badge.dataset.endTime = String(endTime);
+        badges.add(badge);
         // Mount below the price/action flex row so Steam's layout cannot squeeze it beside the price.
         const position = findWishlistSaleBadgePosition(row, price);
         if (position.container) position.container.insertBefore(badge, position.reference || null);
@@ -3710,13 +3865,16 @@ targets = new Map([
 
     function updateCountdowns() {
       const now = Date.now();
-      document.querySelectorAll('.sse-wishlist-sale-expiration[data-end-time]').forEach(badge => {
+      if (document.hidden) return;
+      for (const badge of badges) {
+        if (!badge.isConnected) { badges.delete(badge); continue; }
         const endTime = Number(badge.dataset.endTime);
         const remaining = endTime - now;
         const endDate = new Date(endTime);
         const dateText = Number.isFinite(endTime) ? `${endDate.getFullYear()}年${endDate.getMonth() + 1}月${endDate.getDate()}日 ${endDate.getHours().toString().padStart(2, '0')}:${endDate.getMinutes().toString().padStart(2, '0')}` : '';
         if (remaining <= 0) {
-          badge.textContent = `折扣结束：${dateText} · 已结束`;
+          const text = `折扣结束：${dateText} · 已结束`;
+          if (badge.textContent !== text) badge.textContent = text;
           badge.classList.add('sse-sale-ended');
           badge.classList.remove('sse-ending-soon');
         } else {
@@ -3725,13 +3883,29 @@ targets = new Map([
           badge.classList.remove('sse-sale-ended');
         }
         badge.title = `折扣结束时间：${endDate.toLocaleString()}`;
-      });
+      }
+    }
+
+    function scheduleRetry() {
+      cancelRetry?.();
+      const times = [...retryByApp].filter(([id, state]) => rowsByApp.has(id) && !pendingApps.has(id) && Number.isFinite(state.at)).map(([, state]) => state.at);
+      if (!times.length) return;
+      cancelRetry = scope.timeout(() => {
+        cancelRetry = null;
+        for (const [id, state] of retryByApp) {
+          if (state.at <= Date.now() && rowsByApp.has(id)) queuedApps.add(id);
+        }
+        flushQueuedApps();
+        scheduleRetry();
+      }, Math.max(1, Math.min(...times) - Date.now()));
     }
 
     async function fetchExpirations(appIds) {
       const session = readStoreSession(document, page);
       for (let offset = 0; offset < appIds.length; offset += 100) {
+        if (!scope.active) return;
         const batch = appIds.slice(offset, offset + 100);
+        batch.forEach(id => pendingApps.add(id));
         try {
           const payload = {
             ids: batch.map(appid => ({ appid: Number(appid) })),
@@ -3739,40 +3913,57 @@ targets = new Map([
             data_request: { include_all_purchase_options: true }
           };
           const url = 'https://api.steampowered.com/IStoreBrowseService/GetItems/v1/?input_json=' + encodeURIComponent(JSON.stringify(payload));
-          const response = JSON.parse(await requestQueue.enqueue(() => gmGet(url)));
-          const items = response.response?.store_items || [];
+          const response = JSON.parse(await requestQueue.enqueue(() => gmGet(url, { signal: scope.signal }), { signal: scope.signal }));
+          const items = validateStoreItems(response);
+          if (!scope.active) return;
+          for (const id of batch) { expiryByApp.set(id, null); refreshedAt.set(id, Date.now()); retryByApp.delete(id); }
           for (const item of items) {
             const id = String(item.appid || item.id || '');
             if (batch.includes(id)) expiryByApp.set(id, wishlistSaleEndTimestamp(item));
           }
           log.debug('expiry.loaded', '已读取愿望单折扣结束时间', { requested: batch.length, found: items.length });
         } catch (error) {
-          log.warn('expiry.failed', '读取愿望单折扣结束时间失败', { count: batch.length, error });
+          if (!scope.active) return;
+          for (const id of batch) {
+            const failures = (retryByApp.get(id)?.failures || 0) + 1;
+            retryByApp.set(id, { failures, at: Date.now() + Math.min(900000, 30000 * 2 ** Math.min(failures - 1, 5)) });
+          }
+          log.warn('expiry.failed', '读取愿望单折扣结束时间失败，稍后重试', { count: batch.length, error });
+        } finally {
+          batch.forEach(id => pendingApps.delete(id));
         }
         for (const id of batch) {
-          if (!expiryByApp.has(id)) expiryByApp.set(id, null);
           renderExpiry(id);
         }
       }
+      scheduleRetry();
     }
 
     function flushQueuedApps() {
       flushTimer = null;
-      const appIds = [...queuedApps];
+      const appIds = [...queuedApps].filter(id => !pendingApps.has(id) && rowsByApp.has(id) &&
+        (!retryByApp.has(id) || retryByApp.get(id).at <= Date.now()));
       queuedApps.clear();
       if (!appIds.length) return;
-      fetchExpirations(appIds);
+      // Claim all batches before awaiting, so a concurrent scan cannot enqueue them twice.
+      appIds.forEach(id => { pendingApps.add(id); if (retryByApp.has(id)) retryByApp.get(id).at = Infinity; });
+      fetchExpirations(appIds).catch(error => { if (scope.active) log.error('expiry.unexpected', '折扣处理异常', { error }); });
     }
 
-    function scan() {
+    function scan(rows) {
       if (page.SSR && !page.SSR.hydrated && Date.now() - hydrationWaitStarted < 15000) {
-        if (!scanTimer) scanTimer = setTimeout(() => { scanTimer = null; scan(); }, 500);
+        scope.timeout(() => scanner.scan(), 500);
         return;
       }
-      const rows = document.querySelectorAll('.wishlist_row, .wishlistRowItem, [data-rfd-draggable-id^="WishlistItem-"], .Panel div[data-index]');
       for (const row of rows) {
         if (row.matches('div[data-index]') && row.querySelector('[data-rfd-draggable-id^="WishlistItem-"]')) continue;
         const appId = appIdFor(row);
+        const previous = rowIds.get(row);
+        if (previous && previous !== appId) {
+          rowsByApp.get(previous)?.delete(row);
+          row.querySelectorAll('.sse-wishlist-sale-expiration').forEach(node => node.remove());
+        }
+        rowIds.set(row, appId);
         if (!appId) continue;
         if (!isDiscounted(row)) {
           row.querySelectorAll('.sse-wishlist-sale-expiration').forEach(element => element.remove());
@@ -3781,28 +3972,31 @@ targets = new Map([
         if (!rowsByApp.has(appId)) rowsByApp.set(appId, new Set());
         rowsByApp.get(appId).add(row);
         if (expiryByApp.has(appId)) renderExpiry(appId);
-        else queuedApps.add(appId);
+        const expires = expiryByApp.get(appId) || 0;
+        const ttl = expires ? 300000 : 60000;
+        if ((!refreshedAt.has(appId) || Date.now() - refreshedAt.get(appId) >= ttl) && !pendingApps.has(appId)) queuedApps.add(appId);
       }
+      pruneRows();
+      if (queuedApps.size && !flushTimer) flushTimer = scope.timeout(flushQueuedApps, 180);
+    }
+    function pruneRows() {
       for (const [appId, appRows] of rowsByApp) {
-        for (const row of appRows) if (!row.isConnected) appRows.delete(row);
-        if (!appRows.size) rowsByApp.delete(appId);
+        for (const row of appRows) if (!row.isConnected || appIdFor(row) !== appId) appRows.delete(row);
+        if (!appRows.size) {
+          rowsByApp.delete(appId); expiryByApp.delete(appId); refreshedAt.delete(appId); retryByApp.delete(appId); queuedApps.delete(appId);
+        }
       }
-      if (queuedApps.size && !flushTimer) flushTimer = setTimeout(flushQueuedApps, 180);
+      for (const badge of badges) if (!badge.isConnected) badges.delete(badge);
     }
 
-    const observer = new MutationObserver(mutations => {
-      const relevant = mutations.some(mutation => {
-        if (mutation.target.nodeType === 1 && mutation.target.closest('.sse-wishlist-sale-expiration')) return false;
-        return [...mutation.addedNodes, ...mutation.removedNodes].some(node =>
-          node.nodeType !== 1 || (!node.matches('.sse-wishlist-sale-expiration') && !node.closest('.sse-wishlist-sale-expiration'))
-        );
-      });
-      if (!relevant || scanTimer) return;
-      scanTimer = setTimeout(() => { scanTimer = null; scan(); }, 300);
+    const scanner = createDomScanner({ scope, selector: PAGE_ADAPTERS.wishlist.rows, process: scan,
+      attributes: ITEM_ATTRIBUTES, name: 'wishlist-sale', removed: pruneRows, delay: 300 });
+    scope.interval(updateCountdowns, 1000);
+    scope.interval(() => { if (!document.hidden) scan([...rowsByApp.values()].flatMap(rows => [...rows])); }, 60000);
+    scope.listen(document, 'visibilitychange', () => { if (!document.hidden) { updateCountdowns(); scanner.scan(); } });
+    scope.own(() => {
+      badges.forEach(badge => badge.remove()); badges.clear(); rowsByApp.clear(); queuedApps.clear(); pendingApps.clear();
     });
-    observer.observe(document.body, { childList: true, subtree: true });
-    scan();
-    setInterval(updateCountdowns, 1000);
     log.info('initialize', '愿望单折扣结束时间和倒计时已启用');
   }
 
@@ -3815,24 +4009,49 @@ targets = new Map([
     GM_registerMenuCommand('设置', openSettingsUI);
     GM_registerMenuCommand('清除缓存', clearScriptCaches);
     boot.debug('settings', '设置菜单已注册');
-    if (location.hostname === 'store.steampowered.com' && GM_getValue('sse_extra_enabled', true)) {
-      scheduleScan();
-      startObserver();
-    } else boot.debug('regional-prices.skip', '跳过地区价格', { host: location.hostname });
-    if (/^(store\.steampowered\.com|steamcommunity\.com|checkout\.steampowered\.com)$/.test(location.hostname)) {
-      conversion.start();
-    } else boot.debug('conversion.skip', '当前站点不启用价格转换');
-    const family = initializeFamilyLibrary();
-    boot.debug('family', '家庭库初始化完成');
-    if (GM_getValue('sse_cart_enabled', true) && /^(store\.steampowered\.com|steamcommunity\.com)$/.test(location.hostname)) {
-      initializeCartTools();
-    } else boot.debug('cart.skip', '跳过购物车工具', { host: location.hostname });
-    initializeFriendTools();
-    initializeRestrictionBadges();
-    initializeWishlistSaleCountdown();
+    startFeatureRuntime();
     boot.end('功能启动已调度，异步任务由各模块记录结果');
-    return family;
   }
 
-  const familyLibrary = initialize();
+  let familyLibrary;
+  const FEATURE_DEFINITIONS = [
+    { name: 'regional-prices', key: 'sse_extra_enabled', match: () => location.hostname === 'store.steampowered.com', start: startObserver },
+    { name: 'conversion', key: 'sse_convert_enabled', match: () => /^(store\.steampowered\.com|steamcommunity\.com|checkout\.steampowered\.com)$/.test(location.hostname), start: () => conversion.start() },
+    { name: 'family', match: () => true, start: () => { familyLibrary = initializeFamilyLibrary(); } },
+    { name: 'cart', key: 'sse_cart_enabled', match: () => /^(store\.steampowered\.com|steamcommunity\.com)$/.test(location.hostname), start: initializeCartTools },
+    { name: 'friends', match: () => location.hostname === 'steamcommunity.com' && /\/friends\/?$/i.test(location.pathname), start: initializeFriendTools },
+    { name: 'restrictions', key: 'sse_restrictions_enabled', match: () => /^(store\.steampowered\.com|steamcommunity\.com)$/.test(location.hostname), start: initializeRestrictionBadges },
+    { name: 'wishlist-sale', key: 'sse_wishlist_sale_enabled', match: () => location.hostname === 'store.steampowered.com' && isWishlistPage(), start: initializeWishlistSaleCountdown }
+  ];
+  function startFeatureRuntime() {
+    const runtime = createFeatureScope('runtime');
+    let signature;
+    function reconcile() {
+      const page = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
+      const user = page.UserConfig?.steamid || page.g_steamID || page.g_AccountID || '';
+      const next = JSON.stringify([location.pathname, location.search, user,
+        ...FEATURE_DEFINITIONS.map(feature => feature.key ? GM_getValue(feature.key, true) : null),
+        GM_getValue('sse_family_enabled', true), GM_getValue('sse_family_auto', true)]);
+      if (next === signature) return;
+      signature = next;
+      for (const feature of FEATURE_DEFINITIONS) featureScopes.get(feature.name)?.dispose();
+      for (const feature of FEATURE_DEFINITIONS) {
+        if (!feature.match() || (feature.key && !GM_getValue(feature.key, true))) continue;
+        try {
+          const result = feature.start();
+          if (result?.catch) result.catch(error => diagnostics.scope('core').error('feature.failed', '功能初始化失败', { name: feature.name, error }));
+        } catch (error) { diagnostics.scope('core').error('feature.failed', '功能初始化失败', { name: feature.name, error }); }
+      }
+    }
+    runtime.interval(reconcile, 1000);
+    runtime.listen(window, 'popstate', reconcile);
+    runtime.listen(window, 'pageshow', reconcile);
+    runtime.listen(window, 'pagehide', event => {
+      if (event.persisted) return;
+      for (const [name, scope] of featureScopes) if (name !== 'runtime') scope.dispose();
+      runtime.dispose();
+    });
+    reconcile();
+  }
+  initialize();
 })();

@@ -6,7 +6,7 @@ import { loggingSource } from './helpers/logging.mjs';
 
 async function harness(extra = {}) {
   const context = vm.createContext({ GM_getValue: (_, fallback) => fallback, GM_setValue() {}, ...extra });
-  const sources = await Promise.all(['shared.js', 'network.js', 'restrictions/database.js', 'restrictions/steam.js', 'restrictions/index.js']
+  const sources = await Promise.all(['shared.js', 'runtime.js', 'pages.js', 'items.js', 'network.js', 'restrictions/database.js', 'restrictions/steam.js', 'restrictions/index.js']
     .map(path => readFile(new URL('../src/' + path, import.meta.url), 'utf8')));
   vm.runInContext(await loggingSource() + '\n' + sources.join('\n'), context);
   return context;
@@ -210,7 +210,7 @@ test('homepage title selection includes current tab rows and carousel names and 
   assert.equal(context.restrictionAppId(title), 4232910);
   assert.match(selectors, /data-ds-appid/);
   // Actual current homepage markup uses .tab_item_title, not .tab_item_name.
-  const source = await readFile(new URL('../src/restrictions/index.js', import.meta.url), 'utf8');
+  const source = await readFile(new URL('../src/pages.js', import.meta.url), 'utf8');
   assert.match(source, /\.tab_item_title/);
   assert.match(source, /\.store_main_capsule \.app_name/);
 });

@@ -4,39 +4,10 @@
     { id: 'jsdelivr-fastly', url: ref => `https://fastly.jsdelivr.net/gh/F1NN1ER/getSteamRestrictedGameLIst@${ref}/data/fulllist.json` }
   ];
 
-  function restrictionRequest(url, { probe = false, timeout = probe ? 6000 : 60000 } = {}) {
-    return new Promise((resolve, reject) => {
-      const started = Date.now();
-      let request;
-      let settled = false;
-      const finish = (error, result) => {
-        if (settled) return;
-        settled = true;
-        if (error) reject(error); else resolve(result);
-      };
-      try {
-        request = GM_xmlhttpRequest({
-          method: 'GET', url, anonymous: true, timeout,
-          ...(probe ? { headers: { Range: 'bytes=0-16383' } } : {}),
-          onprogress: event => {
-            // Stop a server ignoring Range instead of downloading the database for each probe.
-            if (probe && event.loaded >= 16384) {
-              finish(null, { ms: Date.now() - started });
-              request?.abort();
-            }
-          },
-          onload: response => {
-            if (response.status !== 200 && !(probe && response.status === 206)) {
-              finish(new Error('HTTP ' + response.status)); return;
-            }
-            finish(null, { text: response.responseText, ms: Date.now() - started });
-          },
-          onerror: () => finish(new Error('数据源请求失败')),
-          ontimeout: () => finish(new Error('数据源请求超时')),
-          onabort: () => finish(new Error('数据源请求已中止'))
-        });
-      } catch (error) { finish(error); }
-    });
+  async function restrictionRequest(url, { probe = false, timeout = probe ? 6000 : 60000, signal } = {}) {
+    const started = Date.now();
+    const response = await gmRequest(url, { anonymous: true, probe, timeout, signal });
+    return { text: response.responseText, ms: Date.now() - started };
   }
 
   function parseRestrictionDatabase(text) {

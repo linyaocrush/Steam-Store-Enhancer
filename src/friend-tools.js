@@ -4,6 +4,7 @@
       log.debug('initialize.skip', '当前页面不启用好友工具'); return;
     }
     log.info('initialize', '留言、分组与统计已启用');
+    const scope = createFeatureScope('friends');
 
     const ROOT_ID = 'sse-friend-tools';
     const style = document.createElement('style');
@@ -23,6 +24,7 @@
       #manage_friends .selected_msg{margin:0;padding:5px 8px;border-radius:3px;background:#0f141b;color:#d7e8f2}#manage_friends .selected_msg.error{color:#f29b9b}#manage_friends #selected_count{font-weight:bold;color:#67c1f5}#manage_friends .hidden{display:none!important}
     `;
     document.head.appendChild(style);
+    scope.own(() => style.remove());
 
     const root = createElement('section');
     root.id = ROOT_ID;
@@ -109,14 +111,11 @@
     else if (nativeList) nativeList.before(root);
     else { log.warn('panel.missing', '未找到好友管理面板或好友列表'); return; }
     log.debug('panel.mount', '好友工具已挂载', { nativeManagement: Boolean(managePanel) });
+    scope.own(() => root.remove());
 
     const getFriendRows = () => [...document.querySelectorAll('#search_results .selectable[data-steamid]')]
       .filter(row => /^\d{17}$/.test(row.dataset.steamid || ''));
     const page = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
-    // The original assistant opens Steam's native management mode to show card checkboxes.
-    if (managePanel && window.getComputedStyle(managePanel).display === 'none' && typeof page.ToggleManageFriends === 'function') {
-      page.ToggleManageFriends();
-    }
     const accountId = String(page.g_steamID || page.UserConfig?.steamid || 'anonymous');
     const GROUP_STORAGE_KEY = `sse_friend_groups_v1_${accountId}`;
     let groups = GM_getValue(GROUP_STORAGE_KEY, {});
@@ -185,15 +184,17 @@
     renderGroups();
     const friendList = document.querySelector('#search_results');
     if (friendList) {
-      friendList.addEventListener('change', updateSelectionCount);
+      scope.listen(friendList, 'change', updateSelectionCount);
       let refreshTimer = null;
-      new MutationObserver(() => {
+      const observer = new MutationObserver(() => {
         if (refreshTimer) return;
-        refreshTimer = setTimeout(() => {
+        refreshTimer = scope.timeout(() => {
           refreshTimer = null;
           renderFriends();
         }, 250);
-      }).observe(friendList, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'data-steamid'] });
+      });
+      observer.observe(friendList, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'data-steamid'] });
+      scope.own(() => observer.disconnect());
       log.debug('observer.ready', '好友列表动态监听已启用');
     }
     createGroup.addEventListener('click', () => {
@@ -267,6 +268,7 @@
       const results = [];
       try {
         for (let index = 0; index < friends.length; index++) {
+          if (!scope.active) break;
           const friend = friends[index];
           const steamId = friend.dataset.steamid;
           const name = friend.querySelector('.friend_block_content')?.textContent.trim().split('\n')[0] || steamId;
@@ -274,12 +276,12 @@
           try {
           task.debug('request', '开始发送留言', { index: index + 1, total: friends.length });
           const body = new URLSearchParams({ comment, count: '6', sessionid: sessionId });
-          const response = await fetch(`/comment/Profile/post/${steamId}/-1/`, {
+          const { data: result } = await fetchJson(`/comment/Profile/post/${steamId}/-1/`, {
             method: 'POST', credentials: 'same-origin',
+            signal: scope.signal,
             headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' }, body
           });
-          const result = await response.json();
-          if (!response.ok || result.success === false) throw new Error(result.error || `HTTP ${response.status}`);
+          if (result?.success !== true && result?.success !== 1) throw new Error(result?.error || 'Steam 未确认留言成功');
           results.push(`已发送 ${name}`);
           task.debug('sent', '留言发送成功', { index: index + 1, total: friends.length });
           } catch (error) {

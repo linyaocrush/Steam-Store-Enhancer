@@ -59,15 +59,21 @@
   }
 
   function initializeWishlistSaleCountdown() {
-    if (location.hostname !== 'store.steampowered.com' || !isWishlistPage()) return;
+    if (location.hostname !== 'store.steampowered.com' || !isWishlistPage() || !GM_getValue('sse_wishlist_sale_enabled', true)) return;
 
     const log = diagnostics.scope('wishlist-sale');
+    const scope = createFeatureScope('wishlist-sale');
     const page = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
     const rowsByApp = new Map();
     const expiryByApp = new Map();
     const queuedApps = new Set();
+    const pendingApps = new Set();
+    const retryByApp = new Map();
+    const refreshedAt = new Map();
+    const rowIds = new WeakMap();
+    const badges = new Set();
+    let cancelRetry;
     let flushTimer = null;
-    let scanTimer = null;
     const hydrationWaitStarted = Date.now();
 
     if (!document.getElementById('sse-wishlist-sale-style')) {
@@ -75,6 +81,7 @@
       style.id = 'sse-wishlist-sale-style';
       style.textContent = '.sse-wishlist-sale-expiration{display:block;margin:5px 0 0;color:#9acb7a;font-size:11px;line-height:1.4;white-space:normal;pointer-events:none}.sse-wishlist-sale-expiration.sse-ending-soon{color:#e6a15a}.sse-wishlist-sale-expiration.sse-sale-ended{color:#e46767}';
       document.head.appendChild(style);
+      scope.own(() => style.remove());
     }
 
     function appIdFor(row) {
@@ -91,16 +98,23 @@
 
     function renderExpiry(appId) {
       const endTime = expiryByApp.get(appId);
-      if (!endTime) return;
       const rows = rowsByApp.get(appId);
       if (!rows) return;
+      if (!endTime) {
+        if (expiryByApp.has(appId)) for (const row of rows) row.querySelector('.sse-wishlist-sale-expiration')?.remove();
+        return;
+      }
       for (const row of rows) {
-        if (!row.isConnected || !isDiscounted(row) || row.querySelector('.sse-wishlist-sale-expiration')) continue;
+        if (!row.isConnected || appIdFor(row) !== appId || !isDiscounted(row)) continue;
+        const existing = row.querySelector('.sse-wishlist-sale-expiration');
+        if (existing && existing.dataset.endTime === String(endTime)) continue;
+        existing?.remove();
         const price = findWishlistSalePrice(row);
         if (!price) continue;
         const badge = document.createElement('span');
         badge.className = 'sse-wishlist-sale-expiration';
         badge.dataset.endTime = String(endTime);
+        badges.add(badge);
         // Mount below the price/action flex row so Steam's layout cannot squeeze it beside the price.
         const position = findWishlistSaleBadgePosition(row, price);
         if (position.container) position.container.insertBefore(badge, position.reference || null);
@@ -111,13 +125,16 @@
 
     function updateCountdowns() {
       const now = Date.now();
-      document.querySelectorAll('.sse-wishlist-sale-expiration[data-end-time]').forEach(badge => {
+      if (document.hidden) return;
+      for (const badge of badges) {
+        if (!badge.isConnected) { badges.delete(badge); continue; }
         const endTime = Number(badge.dataset.endTime);
         const remaining = endTime - now;
         const endDate = new Date(endTime);
         const dateText = Number.isFinite(endTime) ? `${endDate.getFullYear()}年${endDate.getMonth() + 1}月${endDate.getDate()}日 ${endDate.getHours().toString().padStart(2, '0')}:${endDate.getMinutes().toString().padStart(2, '0')}` : '';
         if (remaining <= 0) {
-          badge.textContent = `折扣结束：${dateText} · 已结束`;
+          const text = `折扣结束：${dateText} · 已结束`;
+          if (badge.textContent !== text) badge.textContent = text;
           badge.classList.add('sse-sale-ended');
           badge.classList.remove('sse-ending-soon');
         } else {
@@ -126,13 +143,29 @@
           badge.classList.remove('sse-sale-ended');
         }
         badge.title = `折扣结束时间：${endDate.toLocaleString()}`;
-      });
+      }
+    }
+
+    function scheduleRetry() {
+      cancelRetry?.();
+      const times = [...retryByApp].filter(([id, state]) => rowsByApp.has(id) && !pendingApps.has(id) && Number.isFinite(state.at)).map(([, state]) => state.at);
+      if (!times.length) return;
+      cancelRetry = scope.timeout(() => {
+        cancelRetry = null;
+        for (const [id, state] of retryByApp) {
+          if (state.at <= Date.now() && rowsByApp.has(id)) queuedApps.add(id);
+        }
+        flushQueuedApps();
+        scheduleRetry();
+      }, Math.max(1, Math.min(...times) - Date.now()));
     }
 
     async function fetchExpirations(appIds) {
       const session = readStoreSession(document, page);
       for (let offset = 0; offset < appIds.length; offset += 100) {
+        if (!scope.active) return;
         const batch = appIds.slice(offset, offset + 100);
+        batch.forEach(id => pendingApps.add(id));
         try {
           const payload = {
             ids: batch.map(appid => ({ appid: Number(appid) })),
@@ -140,40 +173,57 @@
             data_request: { include_all_purchase_options: true }
           };
           const url = 'https://api.steampowered.com/IStoreBrowseService/GetItems/v1/?input_json=' + encodeURIComponent(JSON.stringify(payload));
-          const response = JSON.parse(await requestQueue.enqueue(() => gmGet(url)));
-          const items = response.response?.store_items || [];
+          const response = JSON.parse(await requestQueue.enqueue(() => gmGet(url, { signal: scope.signal }), { signal: scope.signal }));
+          const items = validateStoreItems(response);
+          if (!scope.active) return;
+          for (const id of batch) { expiryByApp.set(id, null); refreshedAt.set(id, Date.now()); retryByApp.delete(id); }
           for (const item of items) {
             const id = String(item.appid || item.id || '');
             if (batch.includes(id)) expiryByApp.set(id, wishlistSaleEndTimestamp(item));
           }
           log.debug('expiry.loaded', '已读取愿望单折扣结束时间', { requested: batch.length, found: items.length });
         } catch (error) {
-          log.warn('expiry.failed', '读取愿望单折扣结束时间失败', { count: batch.length, error });
+          if (!scope.active) return;
+          for (const id of batch) {
+            const failures = (retryByApp.get(id)?.failures || 0) + 1;
+            retryByApp.set(id, { failures, at: Date.now() + Math.min(900000, 30000 * 2 ** Math.min(failures - 1, 5)) });
+          }
+          log.warn('expiry.failed', '读取愿望单折扣结束时间失败，稍后重试', { count: batch.length, error });
+        } finally {
+          batch.forEach(id => pendingApps.delete(id));
         }
         for (const id of batch) {
-          if (!expiryByApp.has(id)) expiryByApp.set(id, null);
           renderExpiry(id);
         }
       }
+      scheduleRetry();
     }
 
     function flushQueuedApps() {
       flushTimer = null;
-      const appIds = [...queuedApps];
+      const appIds = [...queuedApps].filter(id => !pendingApps.has(id) && rowsByApp.has(id) &&
+        (!retryByApp.has(id) || retryByApp.get(id).at <= Date.now()));
       queuedApps.clear();
       if (!appIds.length) return;
-      fetchExpirations(appIds);
+      // Claim all batches before awaiting, so a concurrent scan cannot enqueue them twice.
+      appIds.forEach(id => { pendingApps.add(id); if (retryByApp.has(id)) retryByApp.get(id).at = Infinity; });
+      fetchExpirations(appIds).catch(error => { if (scope.active) log.error('expiry.unexpected', '折扣处理异常', { error }); });
     }
 
-    function scan() {
+    function scan(rows) {
       if (page.SSR && !page.SSR.hydrated && Date.now() - hydrationWaitStarted < 15000) {
-        if (!scanTimer) scanTimer = setTimeout(() => { scanTimer = null; scan(); }, 500);
+        scope.timeout(() => scanner.scan(), 500);
         return;
       }
-      const rows = document.querySelectorAll('.wishlist_row, .wishlistRowItem, [data-rfd-draggable-id^="WishlistItem-"], .Panel div[data-index]');
       for (const row of rows) {
         if (row.matches('div[data-index]') && row.querySelector('[data-rfd-draggable-id^="WishlistItem-"]')) continue;
         const appId = appIdFor(row);
+        const previous = rowIds.get(row);
+        if (previous && previous !== appId) {
+          rowsByApp.get(previous)?.delete(row);
+          row.querySelectorAll('.sse-wishlist-sale-expiration').forEach(node => node.remove());
+        }
+        rowIds.set(row, appId);
         if (!appId) continue;
         if (!isDiscounted(row)) {
           row.querySelectorAll('.sse-wishlist-sale-expiration').forEach(element => element.remove());
@@ -182,27 +232,30 @@
         if (!rowsByApp.has(appId)) rowsByApp.set(appId, new Set());
         rowsByApp.get(appId).add(row);
         if (expiryByApp.has(appId)) renderExpiry(appId);
-        else queuedApps.add(appId);
+        const expires = expiryByApp.get(appId) || 0;
+        const ttl = expires ? 300000 : 60000;
+        if ((!refreshedAt.has(appId) || Date.now() - refreshedAt.get(appId) >= ttl) && !pendingApps.has(appId)) queuedApps.add(appId);
       }
+      pruneRows();
+      if (queuedApps.size && !flushTimer) flushTimer = scope.timeout(flushQueuedApps, 180);
+    }
+    function pruneRows() {
       for (const [appId, appRows] of rowsByApp) {
-        for (const row of appRows) if (!row.isConnected) appRows.delete(row);
-        if (!appRows.size) rowsByApp.delete(appId);
+        for (const row of appRows) if (!row.isConnected || appIdFor(row) !== appId) appRows.delete(row);
+        if (!appRows.size) {
+          rowsByApp.delete(appId); expiryByApp.delete(appId); refreshedAt.delete(appId); retryByApp.delete(appId); queuedApps.delete(appId);
+        }
       }
-      if (queuedApps.size && !flushTimer) flushTimer = setTimeout(flushQueuedApps, 180);
+      for (const badge of badges) if (!badge.isConnected) badges.delete(badge);
     }
 
-    const observer = new MutationObserver(mutations => {
-      const relevant = mutations.some(mutation => {
-        if (mutation.target.nodeType === 1 && mutation.target.closest('.sse-wishlist-sale-expiration')) return false;
-        return [...mutation.addedNodes, ...mutation.removedNodes].some(node =>
-          node.nodeType !== 1 || (!node.matches('.sse-wishlist-sale-expiration') && !node.closest('.sse-wishlist-sale-expiration'))
-        );
-      });
-      if (!relevant || scanTimer) return;
-      scanTimer = setTimeout(() => { scanTimer = null; scan(); }, 300);
+    const scanner = createDomScanner({ scope, selector: PAGE_ADAPTERS.wishlist.rows, process: scan,
+      attributes: ITEM_ATTRIBUTES, name: 'wishlist-sale', removed: pruneRows, delay: 300 });
+    scope.interval(updateCountdowns, 1000);
+    scope.interval(() => { if (!document.hidden) scan([...rowsByApp.values()].flatMap(rows => [...rows])); }, 60000);
+    scope.listen(document, 'visibilitychange', () => { if (!document.hidden) { updateCountdowns(); scanner.scan(); } });
+    scope.own(() => {
+      badges.forEach(badge => badge.remove()); badges.clear(); rowsByApp.clear(); queuedApps.clear(); pendingApps.clear();
     });
-    observer.observe(document.body, { childList: true, subtree: true });
-    scan();
-    setInterval(updateCountdowns, 1000);
     log.info('initialize', '愿望单折扣结束时间和倒计时已启用');
   }

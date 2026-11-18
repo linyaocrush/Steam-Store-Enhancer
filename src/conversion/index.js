@@ -159,26 +159,10 @@ static readString(jsonString, cls) {
       return this.request(cls, details);
     }
     static request(cls, details) {
-      const task = diagnostics.scope('network').begin('conversion.request', { method: details.method });
-      return new Promise((resolve, reject) => {
-        const fail = error => { task.fail(error); reject(error); };
-        details.onload = (response) => {
-          if (response.status < 200 || response.status >= 300) { fail(new Error("HTTP " + response.status)); return; }
-          try {
-          if (cls.name === String.name) {
-            resolve(response.response);
-          } else {
-            const json = JSON.parse(response.response);
-            resolve(Jsons.readJson(json, cls));
-          }
-          task.end('转换模块请求完成', { status: response.status });
-          } catch (error) { fail(error); }
-        };
-        details.timeout = 20000;
-        details.ontimeout = () => fail(new Error("请求超时"));
-        details.onerror = () => fail(new Error('网络请求失败'));
-        try { _GM_xmlhttpRequest(details); }
-        catch (error) { fail(error); }
+      return gmRequest(details.url, { ...details, signal: conversionScope?.signal }).then(response => {
+        if (cls === String) return response.responseText;
+        try { return Jsons.readJson(JSON.parse(response.responseText), cls); }
+        catch (_) { throw invalidResponse('转换接口返回了无效 JSON'); }
       });
     }
   }
@@ -337,13 +321,8 @@ match(elementSnap) {
       if (/^[,.\d\s]+$/.test(content)) {
         return false;
       }
-      const parent = elementSnap.element.parentElement;
-      if (!parent) {
-        return false;
-      }
       for (const selector of this.getCssSelectors()) {
-        const element = parent.querySelector(selector);
-        if (element && element === elementSnap.element) {
+        if (elementSnap.element.matches(selector)) {
           elementSnap.selector = selector;
           return true;
         }
@@ -363,102 +342,7 @@ afterConvert(elementSnap, result) {
   });
   class ElementConverter extends AbstractConverter {
     getCssSelectors() {
-      const home = [
-".discount_prices > .discount_final_price",
-".Hxi-pnf9Xlw- span.HOrB6lehQpg-",
-".btnv6_white_transparent > span"
-      ];
-      const category = [
-".Wh0L8EnwsPV_8VAu8TOYr",
-        "._3j4dI1yA7cRfCvK8h406OB",
-"._1EKGZBnKFWOr3RqVdnLMRN",
-        "._3fFFsvII7Y2KXNLDk_krOW"
-      ];
-      const account = [
-"div.accountData.price",
-".addfunds_area_purchase_game.game_area_purchase_game > h1",
-".addfunds_area_purchase_game.game_area_purchase_game.es_custom_money > p"
-      ];
-      const wishlist = [
-"div.vTro5UlZ-gU- > div.QO6CjVPSFuI-",
-"a.En-WtuWIGUc- > span.nikULGV-7Q0-",
-"div.-OkCLv-56oQ- > div._9Rf9BwU0xAQ-",
-"div.-OkCLv-56oQ- > div.-HQzBzl6lqI-",
-"label.qhUI2RnjHYw-",
-"button.cDJOlrqyRq8-.n5jTCXrzS8A-.Focusable"
-      ];
-      const inventory = [
-"div.f6hU22EA7Z8peFWZVBJU"
-      ];
-      const cart = [
-".Panel.Focusable ._3-o3G9jt3lqcvbRXt8epsn.StoreOriginalPrice",
-".Panel.Focusable .pk-LoKoNmmPK4GBiC9DR8",
-"._2WLaY5TxjBGVyuWe_6KS3N"
-      ];
-      const cartCheckout = [
-"#checkout_review_cart_area .checkout_review_item_price > .price",
-"#review_subtotal_value.price",
-"#review_total_value.price"
-      ];
-      const market = [
-"#account_dropdown .account_name",
-"#es_summary .es_market_summary_item",
-"#marketWalletBalanceAmount",
-"span.normal_price[data-price]",
-"button.inqz7Zdx9Xg-.ob-nIzzquk8-.fkz-MePtKwI-.D8IENuW8Q7w-",
-"span.IokSIloSPlA-",
-
-"text.recharts-text.recharts-cartesian-axis-tick-value > tspan"
-      ];
-      const notify = [
-".QFW0BtI4l77AFmv1xLAkx._1B1XTNsfuwOaDPAkkr8M42 ._3hEeummFKRey8l5VXxZwxz > span"
-      ];
-      const app = [
-".game_area_purchase_game_dropdown_selection > span",
-".game_area_purchase_game_dropdown_menu_items_container_background.game_area_purchase_game_dropdown_menu_items_container  td.game_area_purchase_game_dropdown_menu_item_text"
-      ];
-      const selectors = [
-
-".discount_original_price",
-        ".discount_final_price",
-        ".col.search_price.responsive_secondrow strike",
-"#header_wallet_balance > span.tooltip",
-".esi-wishlist-stat > .num",
-".salepreviewwidgets_StoreOriginalPrice_1EKGZ",
-        ".salepreviewwidgets_StoreSalePriceBox_Wh0L8",
-".contenthubshared_OriginalPrice_3hBh3",
-        ".contenthubshared_FinalPrice_F_tGv",
-        ".salepreviewwidgets_StoreSalePriceBox_Wh0L8:not(.salepreviewwidgets_StoreSalePrepurchaseLabel_Wxeyn)",
-"tr.wallet_table_row > td.wht_total",
-        "tr.wallet_table_row > td.wht_wallet_change.wallet_column",
-        "tr.wallet_table_row > td.wht_wallet_balance.wallet_column",
-".package_totals_row > .price:not(.bundle_discount)",
-        "#package_savings_bar > .savings.bundle_savings",
-".home_page_content_title a.btn_small_tall > span"
-      ];
-      selectors.push(...home);
-      selectors.push(...category);
-      selectors.push(...account);
-      selectors.push(...wishlist);
-      selectors.push(...inventory);
-      selectors.push(...cart);
-      selectors.push(...cartCheckout);
-      selectors.push(...market);
-      selectors.push(...notify);
-      selectors.push(...app);
-      if (isCartPage()) {
-        selectors.push(
-          '.StoreOriginalPrice',
-          '.j3jr1YqpBGk- > .-nS4ZC0Bruo-',
-          '.i1XZFikuzME- .n9HLAjXXhvI-',
-          'main [class*="price" i]',
-          'main [class*="Price"]',
-          '[role="main"] [class*="price" i]',
-          '[class*="cart" i] [class*="price" i]',
-          '[data-testid*="price" i]'
-        );
-      }
-      return selectors;
+      return getConversionSelectors();
     }
     async convert(elementSnap) {
       await convertPriceTextNodes(elementSnap.element);
@@ -496,9 +380,8 @@ targets = new Map([
     }
     async convert(elementSnap) {
       const selector = elementSnap.selector;
-      this.targets.get(selector);
       const parseNodeFns = this.targets.get(selector) || [];
-      if (!parseNodeFns) {
+      if (!parseNodeFns.length) {
         return { converted: false };
       }
       const textNode = this.safeParseNode(selector, elementSnap.element, parseNodeFns);
@@ -567,20 +450,30 @@ targets = new Map([
       await Promise.all(tasks);
     }
   }
+  let conversionScope;
   async function initializeConversion() {
     if (!GM_getValue("sse_convert_enabled", true)) { log.debug('initialize.skip', '价格转换已关闭'); return; }
+    const scope = conversionScope = createFeatureScope('conversion');
+    scope.own(() => {
+      for (const [node, state] of convertedOriginals) {
+        if (node.isConnected && node.nodeValue === state.result) node.nodeValue = state.original;
+      }
+      convertedOriginals.clear();
+      document.querySelectorAll('[' + Attrs.STATUS_KEY + ']').forEach(node => node.removeAttribute(Attrs.STATUS_KEY));
+    });
     const task = log.begin('initialize', undefined, 'info');
     try {
       // SSR text must stay intact until React has adopted the server-rendered cart.
       if (isCartPage() && _unsafeWindow.SSR) {
         task.debug('hydrate.wait', '等待购物车页面接管服务端内容');
         const deadline = Date.now() + 15000;
-        while (!_unsafeWindow.SSR.hydrated && Date.now() < deadline) {
+        while (scope.active && !_unsafeWindow.SSR.hydrated && Date.now() < deadline) {
           await new Promise(resolve => setTimeout(resolve, 100));
         }
         task.debug('hydrate.ready', '结束页面就绪等待', { hydrated: Boolean(_unsafeWindow.SSR.hydrated) });
       }
       await initContext();
+      if (!scope.active) return;
       await start();
       task.end('价格转换初始化完成');
     }
@@ -601,39 +494,12 @@ targets = new Map([
   }
   async function convert() {
     const exchangerManager = ConverterManager.instance;
-    const elements = document.querySelectorAll(exchangerManager.getSelector());
-    log.debug('scan.initial', '扫描初始价格节点', { count: elements.length });
-    await exchangerManager.convert(elements);
     const selector = exchangerManager.getSelector();
-    const priceObserver = new MutationObserver(async (mutations) => {
-      const uniqueTargets = new Set();
-      mutations.forEach((mutation) => {
-        if (mutation.type === "characterData") {
-          const parentEl = mutation.target.parentElement;
-          if (parentEl && parentEl.matches(selector)) {
-            uniqueTargets.add(parentEl);
-          }
-          const closestEl = parentEl?.closest(selector);
-          if (closestEl) {
-            uniqueTargets.add(closestEl);
-          }
-        } else {
-          const target = mutation.target;
-          if (target.matches?.(selector)) uniqueTargets.add(target);
-          const priceEls = target.querySelectorAll(selector);
-          priceEls.forEach((el) => uniqueTargets.add(el));
-        }
-      });
-      if (uniqueTargets.size > 0) {
-        log.debug('scan.mutation', '处理变化的价格节点', { count: uniqueTargets.size });
-        await exchangerManager.convert(uniqueTargets);
-      }
-    });
-    priceObserver.observe(document.body, {
-      childList: true,
-      subtree: true,
-      characterData: true
-    });
+    const scope = conversionScope || (conversionScope = createFeatureScope('conversion'));
+    const scanner = createDomScanner({ scope, selector, name: 'conversion', initial: false,
+      process: nodes => exchangerManager.convert(nodes) });
+    scanner.scan();
+    await scanner.flush();
     log.debug('observer.ready', '价格变化监听已启用');
   }
   async function initContext() {
@@ -668,7 +534,9 @@ targets = new Map([
 
   const convertedNodes = new WeakMap();
   const convertingNodes = new WeakSet();
+  const convertedOriginals = new Map();
   async function convertPriceTextNodes(root) {
+    const scope = conversionScope;
     const nodes = [];
     if (root.nodeType === 3) nodes.push(root);
     else {
@@ -683,12 +551,16 @@ targets = new Map([
       convertingNodes.add(node);
       try {
         const result = await PriceProcessor.convertContent(original);
-        if (node.isConnected && node.nodeValue === original) {
+        if (scope?.active !== false && node.isConnected && node.nodeValue === original) {
           convertedNodes.set(node, result);
-          if (result !== original) node.nodeValue = result;
+          if (result !== original) {
+            convertedOriginals.set(node, { original, result });
+            node.nodeValue = result;
+          }
         }
       } finally { convertingNodes.delete(node); }
     }));
+    for (const node of convertedOriginals.keys()) if (!node.isConnected) convertedOriginals.delete(node);
   }
   return {
     get setting() { return SettingManager.instance.setting; },

@@ -13,7 +13,7 @@
     return 0;
   }
 
-  function createSteamRestrictionLookup({ read, write, request = url => gmGet(url), parse = (html, id) =>
+  function createSteamRestrictionLookup({ read, write, signal, request = url => gmGet(url, { signal }), parse = (html, id) =>
     parseSteamRestriction(new DOMParser().parseFromString(html, 'text/html'), id), now = () => Date.now(),
     wait = ms => new Promise(resolve => setTimeout(resolve, ms)) }) {
     const log = diagnostics.scope('restrictions.steam');
@@ -50,11 +50,13 @@
       const attempt = attempted.get(appid);
       if (attempt && now() < attempt.retryAt) return null;
       const run = async () => {
+        if (signal?.aborted) return null;
         try { cache = { ...cache, ...read(key) }; } catch (_) {}
         if ([0, 1, 2].includes(cache[appid]?.status)) return cache[appid].status;
         if (now() < (readControl().cooldownUntil || 0)) return null;
         const delay = Math.max(0, (control.nextAt || 0) - now());
         if (delay) await wait(delay);
+        if (signal?.aborted) return null;
         if (now() < (readControl().cooldownUntil || 0)) return null;
         saveControl({ ...control, nextAt: now() + 4000 });
         const task = log.begin('lookup', { appid });
@@ -75,6 +77,7 @@
           task.end('Steam 状态读取完成', { appid, status });
           return status;
         } catch (error) {
+          if (signal?.aborted) { task.cancel('页面已离开'); return null; }
           task.fail(error);
           failed([403, 429].includes(error?.status) || /HTTP (403|429)\b/.test(error?.message || ''));
           attempted.set(appid, { retryAt: now() + 15 * 60 * 1000 });
@@ -83,7 +86,7 @@
       };
       // Coordinate same-origin tabs where Web Locks are available.
       const promise = queue.enqueue(() => typeof navigator !== 'undefined' && navigator.locks?.request
-        ? navigator.locks.request('sse-steam-restriction-lookup', run) : run())
+        ? navigator.locks.request('sse-steam-restriction-lookup', { ...(signal ? { signal } : {}) }, run) : run(), { signal })
         .finally(() => pending.delete(appid));
       pending.set(appid, promise);
       return promise;
