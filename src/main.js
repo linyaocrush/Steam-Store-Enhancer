@@ -20,6 +20,7 @@
     } else boot.debug('cart.skip', '跳过购物车工具', { host: location.hostname });
     initializeFriendTools();
     initializeRestrictionBadges();
+    initializeWishlistSaleCountdown();
     boot.end('功能启动已调度，异步任务由各模块记录结果');
     return family;
   }

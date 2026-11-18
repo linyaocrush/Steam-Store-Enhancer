@@ -24,6 +24,7 @@ export const sources = [
   'restrictions/database.js',
   'restrictions/steam.js',
   'restrictions/index.js',
+  'wishlist-sale.js',
   'main.js'
 ];
 
