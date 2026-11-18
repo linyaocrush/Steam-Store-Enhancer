@@ -4,6 +4,7 @@
     addStyle();
     boot.debug('styles', '基础样式已加载');
     GM_registerMenuCommand('设置', openSettingsUI);
+    GM_registerMenuCommand('清除缓存', clearScriptCaches);
     boot.debug('settings', '设置菜单已注册');
     if (location.hostname === 'store.steampowered.com' && GM_getValue('sse_extra_enabled', true)) {
       scheduleScan();
@@ -18,6 +19,7 @@
       initializeCartTools();
     } else boot.debug('cart.skip', '跳过购物车工具', { host: location.hostname });
     initializeFriendTools();
+    initializeRestrictionBadges();
     boot.end('功能启动已调度，异步任务由各模块记录结果');
     return family;
   }

@@ -10,6 +10,7 @@ export const sources = [
   'logging/index.js',
   'shared.js',
   'network.js',
+  'cache.js',
   'styles.js',
   'settings.js',
   'regional-prices.js',
@@ -20,6 +21,9 @@ export const sources = [
   'family-library.js',
   'cart-tools.js',
   'friend-tools.js',
+  'restrictions/database.js',
+  'restrictions/steam.js',
+  'restrictions/index.js',
   'main.js'
 ];
 

@@ -20,6 +20,7 @@
       '<div class="sapx-field"><label class="sapx-check"><input class="sapx-checkbox" id="sse-convert-enabled" type="checkbox" />启用价格转换</label></div>' +
       '<div class="sapx-field"><label class="sapx-check"><input class="sapx-checkbox" id="sse-cart-enabled" type="checkbox" />启用快速加购与购物车管理</label></div>' +
       '<div class="sapx-field"><label class="sapx-check"><input class="sapx-checkbox" id="sse-family-enabled" type="checkbox" />启用家庭库游戏标记</label></div>' +
+      '<div class="sapx-field"><label class="sapx-check"><input class="sapx-checkbox" id="sse-restrictions-enabled" type="checkbox" />显示游戏受限状态</label></div>' +
       '<div class="sapx-field"><label class="sapx-check"><input class="sapx-checkbox" id="sse-family-auto" type="checkbox" />每隔 24 小时自动扫描家庭库</label></div>' +
       '<div class="sapx-field"><button class="sapx-btn sapx-btn-ghost" type="button" id="sse-family-open">管理家庭库：扫描、贡献统计与最近购入</button></div>' +
       '<div class="sapx-field"><label class="sapx-label" for="sse-convert-region">价格转换目标地区</label><select class="sapx-select" id="sse-convert-region"></select></div>' +
@@ -89,6 +90,7 @@
     field('convert-enabled').checked = GM_getValue('sse_convert_enabled', true);
     field('cart-enabled').checked = GM_getValue('sse_cart_enabled', true);
     field('family-enabled').checked = GM_getValue('sse_family_enabled', true);
+    field('restrictions-enabled').checked = GM_getValue('sse_restrictions_enabled', true);
     field('family-auto').checked = GM_getValue('sse_family_auto', true);
     field('cart-language').value = GM_getValue('sse_cart_language', 'ZH');
     field('cart-country').checked = GM_getValue('sse_cart_country', false);
@@ -135,6 +137,7 @@
         GM_setValue('sse_convert_enabled', field('convert-enabled').checked);
         GM_setValue('sse_cart_enabled', field('cart-enabled').checked);
         GM_setValue('sse_family_enabled', field('family-enabled').checked);
+        GM_setValue('sse_restrictions_enabled', field('restrictions-enabled').checked);
         GM_setValue('sse_family_auto', field('family-auto').checked);
         GM_setValue('sse_cart_language', field('cart-language').value);
         GM_setValue('sse_cart_country', field('cart-country').checked);

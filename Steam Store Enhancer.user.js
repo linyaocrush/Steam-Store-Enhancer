@@ -5,7 +5,7 @@
 // @homepageURL  https://github.com/linyaocrush/Steam-Store-Enhancer
 // @downloadURL  https://raw.githubusercontent.com/linyaocrush/Steam-Store-Enhancer/main/Steam%20Store%20Enhancer.user.js
 // @updateURL    https://raw.githubusercontent.com/linyaocrush/Steam-Store-Enhancer/main/Steam%20Store%20Enhancer.user.js
-// @version      1.3.1
+// @version      1.4.0
 // @description  Steam 额外地区价格、汇率转换、快速加购、购物车批量管理与家庭库游戏标记。
 // @author       linyaocrush, marioplus, Chr_, Cliencer Goge, Miku39
 // @license      AGPL-3.0
@@ -27,6 +27,10 @@
 // @connect      store.steampowered.com
 // @connect      api.steampowered.com
 // @connect      api.augmentedsteam.com
+// @connect      raw.githubusercontent.com
+// @connect      api.github.com
+// @connect      cdn.jsdelivr.net
+// @connect      fastly.jsdelivr.net
 // ==/UserScript==
 
 (function () {
@@ -312,7 +316,7 @@
             if ((response.status >= 200 && response.status < 300) || (response.status === 0 && response.responseText)) {
               task.end('请求完成', { status: response.status });
               resolve(response.responseText);
-            } else fail(new Error('HTTP ' + response.status));
+            } else fail(Object.assign(new Error('HTTP ' + response.status), { status: response.status }));
           },
           onerror: () => fail(new Error('网络请求失败')),
           ontimeout: () => fail(new Error('Timeout'))
@@ -339,6 +343,23 @@
     }
   }
   const requestQueue = new RequestQueue(4);
+
+  // ---- cache.js ----
+  const SCRIPT_CACHE_KEYS = Object.freeze([
+    'sse_restrictions_database_v1', 'sse_restrictions_steam_v1',
+    'sse_restrictions_steam_requests_v1', 'sse_family_cache_v1', 'Storage:RateCache'
+  ]);
+
+  function clearScriptCaches() {
+    try {
+      SCRIPT_CACHE_KEYS.forEach(key => GM_deleteValue(key));
+      diagnostics.scope('cache').info('clear', '脚本缓存已清除，刷新页面以释放内存缓存');
+      location.reload();
+    } catch (error) {
+      diagnostics.scope('cache').error('clear.failed', '清除脚本缓存失败', { error });
+      window.alert('清除缓存失败，请查看脚本日志。');
+    }
+  }
 
   // ---- styles.js ----
   function addStyle() {
@@ -419,6 +440,7 @@
       '<div class="sapx-field"><label class="sapx-check"><input class="sapx-checkbox" id="sse-convert-enabled" type="checkbox" />启用价格转换</label></div>' +
       '<div class="sapx-field"><label class="sapx-check"><input class="sapx-checkbox" id="sse-cart-enabled" type="checkbox" />启用快速加购与购物车管理</label></div>' +
       '<div class="sapx-field"><label class="sapx-check"><input class="sapx-checkbox" id="sse-family-enabled" type="checkbox" />启用家庭库游戏标记</label></div>' +
+      '<div class="sapx-field"><label class="sapx-check"><input class="sapx-checkbox" id="sse-restrictions-enabled" type="checkbox" />显示游戏受限状态</label></div>' +
       '<div class="sapx-field"><label class="sapx-check"><input class="sapx-checkbox" id="sse-family-auto" type="checkbox" />每隔 24 小时自动扫描家庭库</label></div>' +
       '<div class="sapx-field"><button class="sapx-btn sapx-btn-ghost" type="button" id="sse-family-open">管理家庭库：扫描、贡献统计与最近购入</button></div>' +
       '<div class="sapx-field"><label class="sapx-label" for="sse-convert-region">价格转换目标地区</label><select class="sapx-select" id="sse-convert-region"></select></div>' +
@@ -488,6 +510,7 @@
     field('convert-enabled').checked = GM_getValue('sse_convert_enabled', true);
     field('cart-enabled').checked = GM_getValue('sse_cart_enabled', true);
     field('family-enabled').checked = GM_getValue('sse_family_enabled', true);
+    field('restrictions-enabled').checked = GM_getValue('sse_restrictions_enabled', true);
     field('family-auto').checked = GM_getValue('sse_family_auto', true);
     field('cart-language').value = GM_getValue('sse_cart_language', 'ZH');
     field('cart-country').checked = GM_getValue('sse_cart_country', false);
@@ -534,6 +557,7 @@
         GM_setValue('sse_convert_enabled', field('convert-enabled').checked);
         GM_setValue('sse_cart_enabled', field('cart-enabled').checked);
         GM_setValue('sse_family_enabled', field('family-enabled').checked);
+        GM_setValue('sse_restrictions_enabled', field('restrictions-enabled').checked);
         GM_setValue('sse_family_auto', field('family-auto').checked);
         GM_setValue('sse_cart_language', field('cart-language').value);
         GM_setValue('sse_cart_country', field('cart-country').checked);
@@ -3138,6 +3162,412 @@ targets = new Map([
     });
   }
 
+  // ---- restrictions/database.js ----
+  const RESTRICTION_SOURCES = [
+    { id: 'github', url: ref => `https://raw.githubusercontent.com/F1NN1ER/getSteamRestrictedGameLIst/${ref}/data/fulllist.json` },
+    { id: 'jsdelivr', url: ref => `https://cdn.jsdelivr.net/gh/F1NN1ER/getSteamRestrictedGameLIst@${ref}/data/fulllist.json` },
+    { id: 'jsdelivr-fastly', url: ref => `https://fastly.jsdelivr.net/gh/F1NN1ER/getSteamRestrictedGameLIst@${ref}/data/fulllist.json` }
+  ];
+
+  function restrictionRequest(url, { probe = false, timeout = probe ? 6000 : 60000 } = {}) {
+    return new Promise((resolve, reject) => {
+      const started = Date.now();
+      let request;
+      let settled = false;
+      const finish = (error, result) => {
+        if (settled) return;
+        settled = true;
+        if (error) reject(error); else resolve(result);
+      };
+      try {
+        request = GM_xmlhttpRequest({
+          method: 'GET', url, anonymous: true, timeout,
+          ...(probe ? { headers: { Range: 'bytes=0-16383' } } : {}),
+          onprogress: event => {
+            // Stop a server ignoring Range instead of downloading the database for each probe.
+            if (probe && event.loaded >= 16384) {
+              finish(null, { ms: Date.now() - started });
+              request?.abort();
+            }
+          },
+          onload: response => {
+            if (response.status !== 200 && !(probe && response.status === 206)) {
+              finish(new Error('HTTP ' + response.status)); return;
+            }
+            finish(null, { text: response.responseText, ms: Date.now() - started });
+          },
+          onerror: () => finish(new Error('数据源请求失败')),
+          ontimeout: () => finish(new Error('数据源请求超时')),
+          onabort: () => finish(new Error('数据源请求已中止'))
+        });
+      } catch (error) { finish(error); }
+    });
+  }
+
+  function parseRestrictionDatabase(text) {
+    const rows = JSON.parse(text);
+    if (!Array.isArray(rows) || !rows.length) throw new Error('受限数据库为空或格式错误');
+    const result = new Map();
+    for (const row of rows) {
+      if (!Number.isSafeInteger(row?.appid) || row.appid <= 0 ||
+          !Number.isInteger(row.status) || row.status < 0 || row.status > 3 || result.has(row.appid)) {
+        throw new Error('受限数据库存在无效记录');
+      }
+      result.set(row.appid, row.status);
+    }
+    return result;
+  }
+
+  function createRestrictionDatabase({ read, write, request = restrictionRequest, now = () => Date.now(), sources = RESTRICTION_SOURCES }) {
+    const log = diagnostics.scope('restrictions.database');
+    const key = 'sse_restrictions_database_v1';
+    const ttl = 24 * 60 * 60 * 1000;
+    let pending;
+    let memory;
+    let hydrated = false;
+    let updated = 0;
+    let retryAt = 0;
+    const listeners = new Set();
+
+    async function load() {
+      if (!hydrated) {
+        hydrated = true;
+        let cached;
+        try {
+          cached = read(key);
+          if (cached?.version === 1 && Array.isArray(cached.rows)) {
+            memory = parseRestrictionDatabase(JSON.stringify(cached.rows.map(([appid, status]) => ({ appid, status }))));
+            updated = Number.isFinite(cached.updated) && cached.updated <= now() ? cached.updated : 0;
+          }
+        } catch (error) { log.warn('cache.invalid', '受限数据库缓存不可用', { error }); memory = undefined; }
+      }
+      if (memory && now() - updated < ttl) return memory;
+      if (now() < retryAt) return memory;
+      if (!pending) pending = refresh().finally(() => { pending = null; });
+      // Keep titles usable while an expired database is refreshed in the background.
+      return memory || pending;
+    }
+
+    async function refresh() {
+        // Pin mirrors to the latest commit so CDN branch-cache latency cannot select older data.
+        let ref = 'main';
+        try {
+          const response = await request('https://api.github.com/repos/F1NN1ER/getSteamRestrictedGameLIst/commits?path=data/fulllist.json&per_page=1', { timeout: 8000 });
+          const commits = JSON.parse(response.text);
+          if (/^[a-f0-9]{40}$/.test(commits?.[0]?.sha || '')) ref = commits[0].sha;
+        } catch (error) { log.debug('revision.fallback', '无法确认最新提交，使用主分支', { error }); }
+        const task = log.begin('refresh', { revision: ref }, 'info');
+        const measured = await Promise.all(sources.map(async source => {
+          const url = source.url(ref);
+          try {
+            const probe = await request(url, { probe: true });
+            log.debug('source.probe', '数据源测速完成', { source: source.id, ms: probe.ms });
+            return { source, url, ms: probe.ms };
+          } catch (error) {
+            log.debug('source.unavailable', '数据源测速失败', { source: source.id, error });
+            return { source, url, ms: Infinity };
+          }
+        }));
+        measured.sort((a, b) => a.ms - b.ms);
+        for (const candidate of measured) {
+          try {
+            task.debug('download', '下载受限数据库', { source: candidate.source.id, probeMs: candidate.ms });
+            const response = await request(candidate.url, {});
+            const data = parseRestrictionDatabase(response.text);
+            memory = data;
+            updated = now();
+            retryAt = 0;
+            // One fixed storage key replaces the whole snapshot, including removed AppIDs.
+            try { write(key, { version: 1, updated, source: candidate.source.id, revision: ref, rows: [...data] }); }
+            catch (error) { task.warn('cache.write', '数据库已加载，但无法保存本地缓存', { error }); }
+            task.end('受限数据库已更新', { source: candidate.source.id, count: data.size, downloadMs: response.ms });
+            for (const listener of listeners) {
+              try { listener(); } catch (error) { log.warn('refresh.notify', '数据库更新通知失败', { error }); }
+            }
+            return data;
+          } catch (error) { task.warn('download.failed', '数据源失败，尝试下一个来源', { source: candidate.source.id, error }); }
+        }
+        task.fail(new Error('所有受限数据库来源均不可用'));
+        if (memory) log.warn('cache.stale', '暂用上次成功下载的数据库');
+        retryAt = now() + 15 * 60 * 1000;
+        return memory;
+    }
+    return { load, subscribe: listener => { listeners.add(listener); return () => listeners.delete(listener); } };
+  }
+
+  // ---- restrictions/steam.js ----
+  function parseSteamRestriction(doc, appid) {
+    // Age checks, redirects, regional error pages and partial responses are not proof of normality.
+    const canonical = doc.querySelector('link[rel="canonical"]')?.getAttribute('href') ||
+      doc.querySelector('meta[property="og:url"]')?.getAttribute('content');
+    if (canonical && !new RegExp(`/app/${appid}(?:/|$|\\?)`).test(canonical)) return null;
+    if (!doc.querySelector('#appHubAppName') || !doc.querySelector('#game_area_features, .game_area_details_specs')) return null;
+    const limited = doc.querySelectorAll('.game_area_details_specs_ctn.learning_about');
+    for (const element of limited) {
+      const label = element.querySelector('.label')?.textContent || element.textContent;
+      if (/Profile Features Limited|个人资料功能受限|個人檔案功能受限|个人资料受限/i.test(label)) return 2;
+    }
+    if (limited.length) return 1;
+    return 0;
+  }
+
+  function createSteamRestrictionLookup({ read, write, request = url => gmGet(url), parse = (html, id) =>
+    parseSteamRestriction(new DOMParser().parseFromString(html, 'text/html'), id), now = () => Date.now(),
+    wait = ms => new Promise(resolve => setTimeout(resolve, ms)) }) {
+    const log = diagnostics.scope('restrictions.steam');
+    const key = 'sse_restrictions_steam_v1';
+    const controlKey = 'sse_restrictions_steam_requests_v1';
+    const queue = new RequestQueue(1);
+    const pending = new Map();
+    const attempted = new Map();
+    let cache;
+    try { cache = read(key); } catch (_) {}
+    if (!cache || typeof cache !== 'object' || Array.isArray(cache)) cache = {};
+    let control = {};
+    function readControl() {
+      try { control = { ...control, ...read(controlKey) }; } catch (_) {}
+      return control;
+    }
+    function saveControl(value) {
+      control = value;
+      try { write(controlKey, control); } catch (error) { log.warn('throttle.save', '请求限速状态保存失败', { error }); }
+    }
+    function failed(blocked = false) {
+      const failures = (Number(readControl().failures) || 0) + 1;
+      const delay = blocked || failures >= 3 ? Math.min(60, 15 * Math.pow(2, Math.min(failures - 1, 2))) * 60 * 1000 : 0;
+      saveControl({ ...control, failures, cooldownUntil: now() + delay });
+      if (delay) log.warn('throttle.cooldown', 'Steam 补查暂停，等待冷却', { failures, retryAt: control.cooldownUntil });
+    }
+    async function lookup(appid) {
+      if (!Number.isSafeInteger(appid) || appid <= 0) return null;
+      // Merge other tabs' successful lookups; confirmed results have no expiry or size cap.
+      try { cache = { ...cache, ...read(key) }; } catch (_) {}
+      const saved = cache[appid];
+      if ([0, 1, 2].includes(saved?.status)) return saved.status;
+      if (pending.has(appid)) return pending.get(appid);
+      const attempt = attempted.get(appid);
+      if (attempt && now() < attempt.retryAt) return null;
+      const run = async () => {
+        try { cache = { ...cache, ...read(key) }; } catch (_) {}
+        if ([0, 1, 2].includes(cache[appid]?.status)) return cache[appid].status;
+        if (now() < (readControl().cooldownUntil || 0)) return null;
+        const delay = Math.max(0, (control.nextAt || 0) - now());
+        if (delay) await wait(delay);
+        if (now() < (readControl().cooldownUntil || 0)) return null;
+        saveControl({ ...control, nextAt: now() + 4000 });
+        const task = log.begin('lookup', { appid });
+        try {
+          const html = await request(`https://store.steampowered.com/app/${appid}/?l=english`);
+          const status = parse(html, appid);
+          if (![0, 1, 2].includes(status)) {
+            task.cancel('Steam 页面无法确认状态', { appid });
+            attempted.set(appid, { retryAt: now() + 15 * 60 * 1000 });
+            failed();
+            return null;
+          }
+          try { cache = { ...cache, ...read(key) }; } catch (_) {}
+          cache[appid] = { status, updated: now() };
+          try { write(key, cache); } catch (error) { task.warn('cache.write', 'Steam 状态缓存保存失败', { error }); }
+          saveControl({ ...control, failures: 0, cooldownUntil: 0 });
+          attempted.delete(appid);
+          task.end('Steam 状态读取完成', { appid, status });
+          return status;
+        } catch (error) {
+          task.fail(error);
+          failed([403, 429].includes(error?.status) || /HTTP (403|429)\b/.test(error?.message || ''));
+          attempted.set(appid, { retryAt: now() + 15 * 60 * 1000 });
+          return null;
+        }
+      };
+      // Coordinate same-origin tabs where Web Locks are available.
+      const promise = queue.enqueue(() => typeof navigator !== 'undefined' && navigator.locks?.request
+        ? navigator.locks.request('sse-steam-restriction-lookup', run) : run())
+        .finally(() => pending.delete(appid));
+      pending.set(appid, promise);
+      return promise;
+    }
+    return { lookup };
+  }
+
+  // ---- restrictions/index.js ----
+  const RESTRICTION_LABELS = Object.freeze({
+    0: { text: '非受限', className: 'normal' },
+    1: { text: 'Steam 正在了解', className: 'learning' },
+    2: { text: '受限', className: 'restricted' },
+    3: { text: '无效', className: 'invalid' }
+  });
+
+  function createRestrictionResolver(database, steam, now = () => Date.now()) {
+    const pending = new Map();
+    const retryAt = new Map();
+    database.subscribe?.(() => { pending.clear(); retryAt.clear(); });
+    return appid => {
+      if (!Number.isSafeInteger(appid) || appid <= 0) return Promise.resolve(null);
+      if (retryAt.has(appid) && now() >= retryAt.get(appid)) { pending.delete(appid); retryAt.delete(appid); }
+      if (!pending.has(appid)) pending.set(appid, (async () => {
+        const data = await database.load();
+        const status = data?.get(appid);
+        if ([0, 1, 2].includes(status)) return { status, source: 'database' };
+        const live = await steam.lookup(appid);
+        if ([0, 1, 2].includes(live)) return { status: live, source: 'steam' };
+        retryAt.set(appid, now() + 15 * 60 * 1000);
+        diagnostics.scope('restrictions').debug('resolve.unconfirmed', 'Steam 未能确认游戏状态，稍后重试', { appid, databaseStatus: status });
+        return status === 3 ? { status: 3, source: 'database' } : null;
+      })().catch(error => {
+        retryAt.set(appid, now() + 15 * 60 * 1000);
+        diagnostics.scope('restrictions').error('resolve.failed', '游戏受限状态查询失败', { appid, error });
+        return null;
+      }));
+      return pending.get(appid);
+    };
+  }
+
+  function restrictionAppId(title, path = location.pathname) {
+    if (title.matches('#appHubAppName')) return Number(path.match(/^\/app\/(\d+)/)?.[1]) || null;
+    const row = title.closest('[data-rfd-draggable-id^="WishlistItem-"], [data-ds-appid], [data-app-id], .search_result_row, .tab_item, .wishlist_row, .gameListRow, .recommendation_link');
+    if (row) {
+      const id = row.getAttribute('data-rfd-draggable-id')?.match(/^WishlistItem-(\d+)-/)?.[1] ||
+        row.getAttribute('data-ds-appid') || row.getAttribute('data-app-id');
+      if (/^\d+$/.test(id || '')) return Number(id);
+      // A multi-app capsule or package must not inherit the current detail page's AppID.
+      if (id) return null;
+      const href = row.getAttribute('href') || row.querySelector('a[href*="/app/"]')?.getAttribute('href');
+      const found = href?.match(/\/app\/(\d+)(?:\/|$|\?)/);
+      if (found) return Number(found[1]);
+    }
+    const link = title.closest('a[href*="/app/"]');
+    if (link) return Number(link.getAttribute('href')?.match(/\/app\/(\d+)(?:\/|$|\?)/)?.[1]) || null;
+    // These homepage titles sit beside, rather than inside, their app link.
+    const card = title.closest('.community_recommendation_app, .home_content.single');
+    const appLink = card?.querySelector('a[href*="/app/"]');
+    const id = appLink?.getAttribute('data-ds-appid');
+    if (id) return /^\d+$/.test(id) ? Number(id) : null;
+    return Number(appLink?.getAttribute('href')?.match(/\/app\/(\d+)(?:\/|$|\?)/)?.[1]) || null;
+  }
+
+  function isRestrictionWishlistTitle(link) {
+    if (link.querySelector('img, [class*="price" i], [class*="discount" i], .sse-extra-price, .sse-cart-button')) return false;
+    if (link.closest('[class*="price" i], [class*="discount" i], .game_purchase_action')) return false;
+    // New wishlist purchase links also point to /app/, but contain prices rather than a title.
+    const text = link.textContent.trim();
+    return Boolean(text) && !/(?:[$€£¥₹₽₩₺₴₫฿]|\b(?:USD|EUR|CNY|RMB|HKD|TWD|JPY|KRW)\b|[-−]\s*\d+\s*%)/i.test(text);
+  }
+
+  function prepareRestrictionWishlistTitle(title) {
+    if (!title.closest('.wishlist_row, [data-rfd-draggable-id^="WishlistItem-"]')) return;
+    let text = title.querySelector('.sse-restriction-title-text');
+    if (!text) {
+      text = createElement('span', '', 'sse-restriction-title-text');
+      // Keep the original nodes and link handlers while giving only the name an ellipsis.
+      for (const child of [...title.childNodes]) {
+        if (child.nodeType === 1 && child.matches('.sse-restriction-badge')) continue;
+        text.appendChild(child);
+      }
+      title.prepend(text);
+    }
+    title.classList.add('sse-restriction-wishlist-title');
+  }
+
+  function initializeRestrictionBadges() {
+    const log = diagnostics.scope('restrictions');
+    if (!/^(store\.steampowered\.com|steamcommunity\.com)$/.test(location.hostname) ||
+        !GM_getValue('sse_restrictions_enabled', true)) return;
+    const read = key => GM_getValue(key, null);
+    const write = (key, value) => GM_setValue(key, value);
+    const database = createRestrictionDatabase({ read, write });
+    const resolve = createRestrictionResolver(database, createSteamRestrictionLookup({ read, write }));
+    const style = createElement('style');
+    style.textContent = `
+      .sse-restriction-badge{display:inline-block!important;vertical-align:middle;margin-left:6px;padding:2px 5px;border-radius:2px;font:600 11px/1.4 Arial,sans-serif;white-space:nowrap;text-decoration:none!important;letter-spacing:normal;text-shadow:none;pointer-events:none}
+      .sse-restriction-normal{background:#237447;color:#e4ffed!important}
+      .sse-restriction-learning{background:#e6b642;color:#302407!important}
+      .sse-restriction-restricted{background:#ac3038;color:#fff0f1!important}
+      .sse-restriction-invalid{background:#505965;color:#f0f2f5!important}
+      .sse-restriction-wishlist-title{display:flex!important;align-items:center;min-width:0;max-width:100%;overflow:hidden;text-overflow:clip!important}
+      .sse-restriction-wishlist-title>.sse-restriction-title-text{flex:0 1 auto;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+      .sse-restriction-wishlist-title>.sse-restriction-badge{flex:0 0 auto}
+    `;
+    document.head.appendChild(style);
+    const selector = '#appHubAppName, .search_result_row .title, .tab_item_name, .wishlist_row .title, ' +
+      '[data-rfd-draggable-id^="WishlistItem-"] a[href*="/app/"], .gameListRow .gameListRowItemName, ' +
+      '.recommendation_link .game_name, .capsule .title, .store_capsule .title, ' +
+      '.tab_item_title, .store_main_capsule .app_name, .store_main_capsule .app_name > div, ' +
+      '.dailydeal_desc .game_name, .home_content .game_name, ' +
+      '.community_recommendation_app .app_name, .home_content.single .single_title, ' +
+      '[data-ds-appid] [class*="StoreSaleWidgetTitle"], [data-ds-appid] [class*="GameName"]';
+    let states = new WeakMap();
+    let revision = 0;
+    async function enhance(title) {
+      if (title.closest('#sapx-ui-root, #sse-family-dialog, #sse-cart-tools') || !title.textContent.trim()) return;
+      // Wishlist app links include artwork and purchase links as well as the game name.
+      if (title.matches('[data-rfd-draggable-id^="WishlistItem-"] a') && !isRestrictionWishlistTitle(title)) {
+        title.querySelectorAll('.sse-restriction-badge').forEach(badge => badge.remove());
+        states.delete(title);
+        return;
+      }
+      // Select the innermost title when the carousel wraps its name in another div.
+      if (title.matches('.store_main_capsule .app_name') && title.querySelector('div')) return;
+      const appid = restrictionAppId(title);
+      const previous = states.get(title);
+      if (!appid) {
+        title.querySelectorAll('.sse-restriction-badge').forEach(badge => badge.remove());
+        states.delete(title);
+        return;
+      }
+      if (previous?.appid === appid && (previous.pending ||
+          (previous.retryAt ? Date.now() < previous.retryAt : title.querySelector('.sse-restriction-badge')))) return;
+      title.querySelectorAll('.sse-restriction-badge').forEach(badge => badge.remove());
+      const state = { appid, pending: true };
+      const startedRevision = revision;
+      states.set(title, state);
+      const result = await resolve(appid);
+      if (!title.isConnected || revision !== startedRevision || states.get(title) !== state || restrictionAppId(title) !== appid) return;
+      state.pending = false;
+      if (!result || result.status === 3) state.retryAt = Date.now() + 15 * 60 * 1000;
+      if (!result) return;
+      const label = RESTRICTION_LABELS[result.status];
+      const badge = createElement('span', label.text, `sse-restriction-badge sse-restriction-${label.className}`);
+      badge.setAttribute('data-sse-restriction-appid', String(appid));
+      badge.title = `${label.text} · ${result.source === 'steam' ? 'Steam 商店实时查询' : '受限游戏数据库'} · AppID ${appid}`;
+      const existing = title.querySelector('.sse-restriction-badge');
+      if (existing) existing.remove();
+      prepareRestrictionWishlistTitle(title);
+      title.appendChild(badge);
+      log.debug('badge.render', '游戏受限状态已显示', { appid, ...result });
+    }
+    const scan = createScheduledTask(() => {
+      const titles = document.querySelectorAll(selector);
+      log.debug('scan', '扫描游戏标题', { count: titles.length });
+      titles.forEach(title => { enhance(title).catch(error => log.error('badge.failed', '游戏受限标记失败', { error })); });
+    }, 250);
+    database.subscribe?.(() => {
+      revision++;
+      states = new WeakMap();
+      scan();
+    });
+    // Recheck on long-lived tabs and when returning from a suspended/background tab.
+    const refresh = () => {
+      database.load().catch(error => log.warn('refresh.failed', '数据库刷新失败', { error }));
+      scan();
+    };
+    const refreshTimer = setInterval(refresh, 60 * 1000);
+    window.addEventListener('pageshow', refresh);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
+    window.addEventListener('pagehide', event => { if (!event.persisted) clearInterval(refreshTimer); });
+    new MutationObserver(mutations => {
+      if (mutations.some(mutation => {
+        const target = mutation.target.nodeType === 1 ? mutation.target : mutation.target.parentElement;
+        if (target?.closest('.sse-restriction-badge, #sapx-ui-root, #sse-family-dialog')) return false;
+        if (mutation.type !== 'childList') return true;
+        return [...mutation.addedNodes, ...mutation.removedNodes].some(node =>
+          node.nodeType !== 1 || !node.matches('.sse-restriction-badge'));
+      })) scan();
+    }).observe(document.body, { childList: true, subtree: true, characterData: true, attributes: true,
+      attributeFilter: ['href', 'data-ds-appid', 'data-app-id', 'data-rfd-draggable-id'] });
+    log.info('initialize', '游戏受限状态标记已启用');
+    scan();
+  }
+
   // ---- main.js ----
   function initialize() {
     const log = diagnostics.scope('core');
@@ -3145,6 +3575,7 @@ targets = new Map([
     addStyle();
     boot.debug('styles', '基础样式已加载');
     GM_registerMenuCommand('设置', openSettingsUI);
+    GM_registerMenuCommand('清除缓存', clearScriptCaches);
     boot.debug('settings', '设置菜单已注册');
     if (location.hostname === 'store.steampowered.com' && GM_getValue('sse_extra_enabled', true)) {
       scheduleScan();
@@ -3159,6 +3590,7 @@ targets = new Map([
       initializeCartTools();
     } else boot.debug('cart.skip', '跳过购物车工具', { host: location.hostname });
     initializeFriendTools();
+    initializeRestrictionBadges();
     boot.end('功能启动已调度，异步任务由各模块记录结果');
     return family;
   }

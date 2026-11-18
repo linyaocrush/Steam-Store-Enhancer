@@ -11,7 +11,7 @@
             if ((response.status >= 200 && response.status < 300) || (response.status === 0 && response.responseText)) {
               task.end('请求完成', { status: response.status });
               resolve(response.responseText);
-            } else fail(new Error('HTTP ' + response.status));
+            } else fail(Object.assign(new Error('HTTP ' + response.status), { status: response.status }));
           },
           onerror: () => fail(new Error('网络请求失败')),
           ontimeout: () => fail(new Error('Timeout'))
