@@ -64,6 +64,7 @@
     const log = diagnostics.scope('wishlist-sale');
     const scope = createFeatureScope('wishlist-sale');
     const page = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
+    const initialPath = location.pathname;
     const rowsByApp = new Map();
     const expiryByApp = new Map();
     const queuedApps = new Set();
@@ -73,6 +74,7 @@
     const rowIds = new WeakMap();
     const badges = new Set();
     let cancelRetry;
+    let cancelHydration;
     let flushTimer = null;
     const hydrationWaitStarted = Date.now();
 
@@ -97,6 +99,7 @@
     }
 
     function renderExpiry(appId) {
+      if (!scope.active) return;
       const endTime = expiryByApp.get(appId);
       const rows = rowsByApp.get(appId);
       if (!rows) return;
@@ -120,7 +123,6 @@
         if (position.container) position.container.insertBefore(badge, position.reference || null);
         else price.after(badge);
       }
-      updateCountdowns();
     }
 
     function updateCountdowns() {
@@ -138,7 +140,8 @@
           badge.classList.add('sse-sale-ended');
           badge.classList.remove('sse-ending-soon');
         } else {
-          badge.textContent = `折扣结束：${dateText} · 剩余 ${formatWishlistSaleCountdown(remaining)}`;
+          const text = `折扣结束：${dateText} · 剩余 ${formatWishlistSaleCountdown(remaining)}`;
+          if (badge.textContent !== text) badge.textContent = text;
           badge.classList.toggle('sse-ending-soon', remaining <= 3600000);
           badge.classList.remove('sse-sale-ended');
         }
@@ -161,12 +164,13 @@
     }
 
     async function fetchExpirations(appIds) {
-      const session = readStoreSession(document, page);
+      if (!scope.active || location.hostname !== 'store.steampowered.com' || location.pathname !== initialPath) return;
       for (let offset = 0; offset < appIds.length; offset += 100) {
         if (!scope.active) return;
         const batch = appIds.slice(offset, offset + 100);
         batch.forEach(id => pendingApps.add(id));
         try {
+          const session = readStoreSession(document, page);
           const payload = {
             ids: batch.map(appid => ({ appid: Number(appid) })),
             context: { language: session.language || 'schinese', country_code: session.country || 'US', steam_realm: 1 },
@@ -196,6 +200,8 @@
           renderExpiry(id);
         }
       }
+      pruneRows();
+      updateCountdowns();
       scheduleRetry();
     }
 
@@ -212,7 +218,7 @@
 
     function scan(rows) {
       if (page.SSR && !page.SSR.hydrated && Date.now() - hydrationWaitStarted < 15000) {
-        scope.timeout(() => scanner.scan(), 500);
+        if (!cancelHydration) cancelHydration = scope.timeout(() => { cancelHydration = null; scanner.scan(); }, 500);
         return;
       }
       for (const row of rows) {
@@ -237,11 +243,25 @@
         if ((!refreshedAt.has(appId) || Date.now() - refreshedAt.get(appId) >= ttl) && !pendingApps.has(appId)) queuedApps.add(appId);
       }
       pruneRows();
+      updateCountdowns();
       if (queuedApps.size && !flushTimer) flushTimer = scope.timeout(flushQueuedApps, 180);
     }
-    function pruneRows() {
+    function pruneRows(removed = []) {
+      for (const node of removed) {
+        const rows = [node, ...(node.querySelectorAll?.(PAGE_ADAPTERS.wishlist.rows) || [])];
+        for (const row of rows) {
+          const id = rowIds.get(row);
+          if (!id || row.isConnected) continue;
+          rowsByApp.get(id)?.delete(row);
+          row.querySelectorAll?.('.sse-wishlist-sale-expiration').forEach(badge => { badges.delete(badge); badge.remove(); });
+          rowIds.delete(row);
+        }
+      }
       for (const [appId, appRows] of rowsByApp) {
-        for (const row of appRows) if (!row.isConnected || appIdFor(row) !== appId) appRows.delete(row);
+        for (const row of appRows) if (appIdFor(row) !== appId || !isDiscounted(row)) {
+          appRows.delete(row);
+          row.querySelectorAll('.sse-wishlist-sale-expiration').forEach(badge => badges.delete(badge));
+        }
         if (!appRows.size) {
           rowsByApp.delete(appId); expiryByApp.delete(appId); refreshedAt.delete(appId); retryByApp.delete(appId); queuedApps.delete(appId);
         }

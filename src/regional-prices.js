@@ -173,7 +173,7 @@
   function getPriceForItem(item, region) {
     const key = item.type + ':' + item.id + ':' + region.id;
     if (pendingPrices.has(key)) { regionalLog.debug('price.join', '复用进行中的价格查询', { item: key }); return pendingPrices.get(key); }
-    const pending = fetchPriceForItem(item, region).finally(() => pendingPrices.delete(key));
+    const pending = fetchPriceForItem(item, region).finally(() => { if (pendingPrices.get(key) === pending) pendingPrices.delete(key); });
     pendingPrices.set(key, pending);
     return pending;
   }
@@ -183,14 +183,17 @@
     const cached = cacheGet(key);
     if (cached !== undefined) { regionalLog.debug('cache.hit', '命中价格缓存', { item: key }); return cached; }
     const task = regionalLog.begin('price.fetch', { item: key });
+    const scope = regionalScope;
     let failure;
     for (const cc of region.ccCandidates) {
       task.debug('candidate', '读取候选地区', { cc });
       try {
+        if (scope?.active === false) throw requestError('aborted', '价格查询已取消');
         let res = null;
         if (item.type === 'app') res = await getAppPrice(item.id, cc, region.currency);
         else if (item.type === 'package') res = await getPackagePrice(item.id, cc, region.currency);
         else if (item.type === 'bundle') res = await getBundlePrice(item.id, cc, region.currency);
+        if (scope?.active === false) throw requestError('aborted', '价格查询已取消');
         if (res && res.ok) {
           if (item.type === 'bundle' || !res.currency || res.currency === region.currency) {
             cacheSet(key, res);
@@ -433,6 +436,7 @@
     const scope = regionalScope = createFeatureScope('regional-prices');
     scope.own(() => {
       summaryRevision++;
+      pendingPrices.clear();
       regionalScanner = null;
       cartSummaryRetry = null;
       document.querySelectorAll('.' + EXTRA_CLASS + ', .sapx-region-locked, #' + CART_SUMMARY_ID).forEach(node => node.remove());

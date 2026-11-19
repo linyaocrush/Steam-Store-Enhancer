@@ -2,6 +2,7 @@
     const nativeButton = row.querySelector('.E4PXslhR-fI- > button:not(.sse-quick-add), button.LrqeL6o22aQ-:not(.sse-quick-add), .purchase_area .btnv6_green_white_innerfade:not(.sse-quick-add), .purchase_area .btn_addtocart:not(.sse-quick-add)');
     if (nativeButton) return nativeButton;
     return Array.from(row.querySelectorAll('a, button')).find(element => {
+      if (element.classList?.contains?.('sse-quick-add')) return false;
       const label = [element.getAttribute('aria-label'), element.getAttribute('title'), element.getAttribute('data-tooltip-text'), element.textContent]
         .filter(Boolean).join(' ');
       return /加入购物车|在购物车中|已在购物车|已加入购物车|购物车中|add(?:ed)?\s+to\s+cart|in\s+cart|view\s+cart/i.test(label);
@@ -27,6 +28,7 @@
 
   function initializeCartTools() {
     const scope = createFeatureScope('cart');
+    const initialHost = location.hostname;
     const log = diagnostics.scope('cart');
     log.info('initialize', '快速加购与购物车管理已启用');
     const page = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
@@ -51,6 +53,7 @@
       .sse-cart-dialog h3{color:#e5e5e5;margin-top:0}.sse-cart-dialog .sse-cart-button{display:block;width:100%;margin-top:8px;text-align:left}
     `;
     document.head.appendChild(style);
+    const inCartPage = () => initialHost === location.hostname && /^\/cart(?:\/|$)/i.test(location.pathname);
     const nativeReplacements = new Map();
     scope.own(() => {
       for (const [control, native] of nativeReplacements) if (control.isConnected) control.replaceWith(native);
@@ -98,6 +101,7 @@
       if ((resultCode && resultCode !== '1') || (data.response?.result != null && data.response.result !== 1)) {
         throw new Error(text('Steam 拒绝了购物车操作。', 'Steam rejected the cart operation.'));
       }
+      if (payload !== undefined && resultCode !== '1' && data.response?.result !== 1) throw invalidResponse('Steam 未确认购物车操作成功');
       const response = validateCartResponse(data, method);
       task.end('购物车接口操作完成');
       return response;
@@ -225,7 +229,7 @@
     }
 
     function mountPanel() {
-      if (!isCartPage()) return;
+      if (!inCartPage()) return;
       const anchor = findCartPanelAnchor();
       if (!anchor) return;
       if (cartPanel) {
@@ -298,7 +302,7 @@
       toolbar.append(button(text('导出', 'Export'), run(async () => {
         log.info('export.start', '开始导出购物车');
         const { cart } = await account('GetCart');
-        if (!Array.isArray(cart?.line_items)) throw invalidResponse('购物车列表无效，未执行修改。');
+        if (!Array.isArray(cart?.line_items)) throw invalidResponse('购物车列表无效，无法导出。');
         const lines = [];
         for (const item of cart?.line_items || []) {
           const target = { type: item.packageid ? 'sub' : 'bundle', id: Number(item.packageid || item.bundleid) };
@@ -340,7 +344,7 @@
           }
         }
         const { cart } = await account('GetCart');
-        if (!Array.isArray(cart?.line_items)) throw invalidResponse('购物车列表无效，无法导出。');
+        if (!Array.isArray(cart?.line_items)) throw invalidResponse('购物车列表无效，未执行修改。');
         const items = cart?.line_items || [];
         for (const [index, item] of items.entries()) {
           await account('ModifyLineItem', { line_item_id: item.line_item_id, gift_info: giftInfo, flags: { is_gift: gift, is_private: false } });
@@ -374,8 +378,7 @@
 
     const quickSelector = PAGE_ADAPTERS.quick.rows;
     function scanQuickButtons(rows = document.querySelectorAll(quickSelector)) {
-      mountPanel();
-      if (!isCartPage() && document.querySelector(quickSelector) && !document.getElementById('sse-cart-extract')) {
+      if (initialHost === location.hostname && !inCartPage() && document.querySelector(quickSelector) && !document.getElementById('sse-cart-extract')) {
         const host = document.querySelector('.wishlist_header, #search_results, .home_tabs_content, .page_content, main');
         if (host) {
           const extract = button(text('提取当前已加载商品', 'Extract loaded items'), () => {
@@ -451,9 +454,22 @@
       });
       if (mounted) log.debug('quick-add.mount', '已挂载快速加购按钮', { count: mounted });
     }
-    createDomScanner({ scope, selector: quickSelector, process: scanQuickButtons, name: 'cart',
-      attributes: ITEM_ATTRIBUTES, changed: mountPanel,
-      removed: () => { for (const [control] of nativeReplacements) if (!control.isConnected) nativeReplacements.delete(control); } });
+    createDomScanner({ scope, selector: quickSelector + ',' + PAGE_ADAPTERS.cart.anchors, process: nodes => {
+      if (nodes.some(node => node.matches(PAGE_ADAPTERS.cart.anchors))) mountPanel();
+      scanQuickButtons(nodes.filter(node => node.matches(quickSelector)));
+    }, name: 'cart', attributes: ITEM_ATTRIBUTES,
+      removed: nodes => {
+        for (const node of nodes) {
+          const candidates = [node, ...(node.querySelectorAll?.('.sse-native-cart') || [])];
+          for (const control of candidates) {
+            const native = nativeReplacements.get(control);
+            if (native && !control.isConnected && control.parentNode) {
+              control.replaceWith(native);
+              nativeReplacements.delete(control);
+            } else if (native && !control.isConnected) nativeReplacements.delete(control);
+          }
+        }
+      } });
     log.debug('observer.ready', '购物车动态节点监听已启用');
     let resizePending = false;
     scope.listen(window, 'resize', () => {
@@ -461,7 +477,7 @@
       resizePending = true;
       scope.timeout(() => { resizePending = false; mountPanel(); }, 150);
     }, { passive: true });
-    scanQuickButtons();
+    mountPanel();
     if (GM_getValue('sse_cart_country', false)) context().then(current => {
       const host = document.querySelector('#header_wallet_ctn');
       if (host && !host.querySelector('.sse-account-country')) {

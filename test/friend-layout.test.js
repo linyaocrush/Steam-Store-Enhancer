@@ -18,15 +18,16 @@ test('friend tools mount after native management and use native card selection',
        remove() { this.removed = true; }
     };
   }
-  const checkbox = element('input');
-  checkbox.checked = false;
+  const checkboxes = [];
   const friend = {
-    dataset: { steamid: '76561198000000001' }, className: 'online',
+    dataset: { steamid: '76561198000000001' }, className: 'friend_block_v2 online', style: { position: 'static' }, children: [],
     querySelector(selector) {
-      if (selector.includes('select_friend_checkbox')) return checkbox;
+      if (selector.includes('.select_friend_checkbox')) return null;
+      if (selector === '.sse-friend-select') return checkboxes.find(item => !item.removed) || null;
       if (selector === '.friend_block_content') return { textContent: 'Friend' };
       return null;
-    }
+    },
+    appendChild(item) { checkboxes.push(item); item.parentNode = this; return item; }
   };
   const manage = element('div');
   const nativeList = element('div');
@@ -39,7 +40,7 @@ test('friend tools mount after native management and use native card selection',
   let opened = false;
   const context = vm.createContext({
     document: doc, location: { hostname: 'steamcommunity.com', pathname: '/id/test/friends' },
-    window: { getComputedStyle: () => ({ display: 'none' }) },
+     window: { getComputedStyle: () => ({ display: 'block', position: 'static' }) },
     unsafeWindow: { g_steamID: '76561198000000002', ToggleManageFriends() { opened = true; } },
     GM_getValue: (_, fallback) => fallback, GM_setValue() {},
     MutationObserver: class { observe() {} }
@@ -48,13 +49,17 @@ test('friend tools mount after native management and use native card selection',
   const source = await readFile(new URL('../src/friend-tools.js', import.meta.url), 'utf8');
   vm.runInContext(await loggingSource() + '\n' + support.join('\n') + '\n' + source + '\ninitializeFriendTools();', context);
   assert.equal(opened, false);
+  assert.equal(friend.className.includes('selectable'), false, 'normal-mode friend cards must be discovered without Steam management mode');
   const root = manage.next;
   assert.equal(root.id, 'sse-friend-tools');
   const tabs = root.children.find(item => item.attributes.role === 'tablist');
   assert.deepEqual(tabs.children.map(item => item.textContent), ['留言', '留言设置', '数据分析']);
   tabs.children[2].events.click();
   assert.equal(root.children.at(-1).hidden, false);
-  checkbox.checked = true;
+  const fallbackCheckbox = checkboxes[0];
+  assert.ok(fallbackCheckbox, 'a visible fallback checkbox should replace Steam\'s hidden native checkbox');
+  assert.equal(friend.style.position, 'relative');
+  fallbackCheckbox.checked = true;
   nativeList.events.change();
   assert.equal(root.children[2].textContent, '已选 1 位');
 });

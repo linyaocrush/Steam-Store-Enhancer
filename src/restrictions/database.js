@@ -24,7 +24,7 @@
     return result;
   }
 
-  function createRestrictionDatabase({ read, write, request = restrictionRequest, now = () => Date.now(), sources = RESTRICTION_SOURCES }) {
+  function createRestrictionDatabase({ read, write, request = restrictionRequest, now = () => Date.now(), sources = RESTRICTION_SOURCES, signal }) {
     const log = diagnostics.scope('restrictions.database');
     const key = 'sse_restrictions_database_v1';
     const ttl = 24 * 60 * 60 * 1000;
@@ -36,6 +36,7 @@
     const listeners = new Set();
 
     async function load() {
+      if (signal?.aborted) return memory;
       if (!hydrated) {
         hydrated = true;
         let cached;
@@ -58,15 +59,16 @@
         // Pin mirrors to the latest commit so CDN branch-cache latency cannot select older data.
         let ref = 'main';
         try {
-          const response = await request('https://api.github.com/repos/F1NN1ER/getSteamRestrictedGameLIst/commits?path=data/fulllist.json&per_page=1', { timeout: 8000 });
+          const response = await request('https://api.github.com/repos/F1NN1ER/getSteamRestrictedGameLIst/commits?path=data/fulllist.json&per_page=1', { timeout: 8000, signal });
           const commits = JSON.parse(response.text);
           if (/^[a-f0-9]{40}$/.test(commits?.[0]?.sha || '')) ref = commits[0].sha;
         } catch (error) { log.debug('revision.fallback', '无法确认最新提交，使用主分支', { error }); }
+        if (signal?.aborted) return memory;
         const task = log.begin('refresh', { revision: ref }, 'info');
         const measured = await Promise.all(sources.map(async source => {
           const url = source.url(ref);
           try {
-            const probe = await request(url, { probe: true });
+            const probe = await request(url, { probe: true, signal });
             log.debug('source.probe', '数据源测速完成', { source: source.id, ms: probe.ms });
             return { source, url, ms: probe.ms };
           } catch (error) {
@@ -77,8 +79,10 @@
         measured.sort((a, b) => a.ms - b.ms);
         for (const candidate of measured) {
           try {
+            if (signal?.aborted) { task.end('数据库刷新已取消'); return memory; }
             task.debug('download', '下载受限数据库', { source: candidate.source.id, probeMs: candidate.ms });
-            const response = await request(candidate.url, {});
+            const response = await request(candidate.url, { signal });
+            if (signal?.aborted) { task.end('数据库刷新已取消'); return memory; }
             const data = parseRestrictionDatabase(response.text);
             memory = data;
             updated = now();

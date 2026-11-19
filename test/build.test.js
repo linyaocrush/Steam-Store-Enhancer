@@ -46,7 +46,7 @@ test('friend comment tool is included and requires explicit confirmation', async
   const source = await readFile(new URL('../src/friend-tools.js', import.meta.url), 'utf8');
   const main = await readFile(new URL('../src/main.js', import.meta.url), 'utf8');
   assert.match(source, /window\.confirm\(/);
-  assert.match(source, /setTimeout\(resolve, 4000\)/);
+  assert.match(source, /scope\.wait\(4000\)/);
   assert.match(source, /for \(let index = 0; index < friends\.length; index\+\+\)/);
   assert.match(source, /status\.setAttribute\('aria-live', 'polite'\)/);
   assert.match(source, /finally \{\s*send\.disabled = false;/);

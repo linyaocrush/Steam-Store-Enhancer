@@ -83,7 +83,7 @@
     const scope = createFeatureScope('restrictions');
     const read = key => GM_getValue(key, null);
     const write = (key, value) => GM_setValue(key, value);
-    const database = createRestrictionDatabase({ read, write, request: (url, options) => restrictionRequest(url, { ...options, signal: scope.signal }) });
+    const database = createRestrictionDatabase({ read, write, signal: scope.signal });
     const resolve = createRestrictionResolver(database, createSteamRestrictionLookup({ read, write, signal: scope.signal }));
     const style = createElement('style');
     style.textContent = `
@@ -107,6 +107,7 @@
     const selector = PAGE_ADAPTERS.restrictions.titles;
     let states = new WeakMap();
     let revision = 0;
+    const trackedTitles = new Set();
     async function enhance(title) {
       if (title.closest('#sapx-ui-root, #sse-family-dialog, #sse-cart-tools') || !title.textContent.trim()) return;
       // Wishlist app links include artwork and purchase links as well as the game name.
@@ -118,6 +119,7 @@
       // Select the innermost title when the carousel wraps its name in another div.
       if (title.matches('.store_main_capsule .app_name') && title.querySelector('div')) return;
       const appid = restrictionAppId(title);
+      trackedTitles.add(title);
       const previous = states.get(title);
       if (!appid) {
         title.querySelectorAll('.sse-restriction-badge').forEach(badge => badge.remove());
@@ -145,9 +147,16 @@
       title.appendChild(badge);
       log.debug('badge.render', '游戏受限状态已显示', { appid, ...result });
     }
-    const scanner = createDomScanner({ scope, selector, name: 'restrictions', attributes: ITEM_ATTRIBUTES, process: titles => {
+    const scanner = createDomScanner({ scope, selector, name: 'restrictions', attributes: ITEM_ATTRIBUTES, initial: false, process: titles => {
       log.debug('scan', '扫描游戏标题', { count: titles.length });
       titles.forEach(title => { enhance(title).catch(error => log.error('badge.failed', '游戏受限标记失败', { error })); });
+    }, removed: nodes => {
+      for (const node of nodes) {
+        if (!node.isConnected && node.matches?.(selector)) { trackedTitles.delete(node); states.delete(node); }
+        node.querySelectorAll?.(selector).forEach(title => {
+          if (!title.isConnected) { trackedTitles.delete(title); states.delete(title); }
+        });
+      }
     } });
     const scan = () => scanner.scan();
     const unsubscribe = database.subscribe?.(() => {
@@ -159,11 +168,16 @@
     // Recheck on long-lived tabs and when returning from a suspended/background tab.
     const refresh = () => {
       database.load().catch(error => log.warn('refresh.failed', '数据库刷新失败', { error }));
-      scan();
+      for (const title of trackedTitles) {
+        if (!title.isConnected) { trackedTitles.delete(title); continue; }
+        const state = states.get(title);
+        if (state?.retryAt && Date.now() >= state.retryAt) enhance(title).catch(error => log.debug('retry.failed', '标签重试失败', { error }));
+      }
     };
+    scope.own(() => trackedTitles.clear());
     scope.interval(() => { if (!document.hidden) refresh(); }, 60 * 1000);
-    scope.listen(window, 'pageshow', refresh);
-    scope.listen(document, 'visibilitychange', () => { if (!document.hidden) refresh(); });
+    scope.listen(window, 'pageshow', () => { refresh(); scan(); });
+    scope.listen(document, 'visibilitychange', () => { if (!document.hidden) { refresh(); scan(); } });
     log.info('initialize', '游戏受限状态标记已启用');
     scan();
   }

@@ -5,7 +5,7 @@
 // @homepageURL  https://github.com/linyaocrush/Steam-Store-Enhancer
 // @downloadURL  https://raw.githubusercontent.com/linyaocrush/Steam-Store-Enhancer/main/Steam%20Store%20Enhancer.user.js
 // @updateURL    https://raw.githubusercontent.com/linyaocrush/Steam-Store-Enhancer/main/Steam%20Store%20Enhancer.user.js
-// @version      1.5.1
+// @version      1.6.0
 // @description  Steam 额外地区价格、汇率转换、快速加购、愿望单折扣倒计时、购物车批量管理与家庭库游戏标记。
 // @author       linyaocrush, marioplus, Chr_, Cliencer Goge, Miku39
 // @license      AGPL-3.0
@@ -16,6 +16,8 @@
 // @match        https://steamdb.keylol.com/tooltip*
 // @run-at       document-idle
 // @grant        GM_getValue
+// @grant        GM_addValueChangeListener
+// @grant        GM_removeValueChangeListener
 // @grant        GM_setValue
 // @grant        GM_setClipboard
 // @grant        GM_deleteValue
@@ -331,14 +333,24 @@
         scope.own(() => target.removeEventListener(event, callback, options));
       },
       timeout(callback, delay) {
-        const cancel = () => clearTimeout(id);
-        const id = setTimeout(() => { disposers.delete(cancel); if (scope.active) callback(); }, delay);
+        let id;
+        const cancel = () => { clearTimeout(id); disposers.delete(cancel); };
+        id = setTimeout(() => { disposers.delete(cancel); if (scope.active) callback(); }, delay);
         scope.own(cancel);
         return cancel;
       },
       interval(callback, delay) {
         const id = setInterval(() => { if (scope.active) callback(); }, delay);
         return scope.own(() => clearInterval(id));
+      },
+      wait(delay) {
+        return new Promise(resolve => {
+          const finish = value => { controller.signal.removeEventListener('abort', abort); resolve(value); };
+          const abort = () => { cancel(); finish(false); };
+          const cancel = scope.timeout(() => finish(true), delay);
+          if (!scope.active) abort();
+          else controller.signal.addEventListener('abort', abort, { once: true });
+        });
       },
       dispose() {
         if (!scope.active) return;
@@ -369,7 +381,8 @@
     let cancelTimer;
     let dirty = false;
     let lost = false;
-    const owned = node => Boolean(node?.closest?.(SCRIPT_OWNED_SELECTOR));
+    const removedNodes = new Set();
+    const owned = node => Boolean(node?.matches?.(SCRIPT_OWNED_SELECTOR) || node?.closest?.(SCRIPT_OWNED_SELECTOR));
     function collect(node, descendants = true) {
       if (!node || owned(node)) return;
       if (node.nodeType === 3) node = node.parentElement;
@@ -389,10 +402,12 @@
       const targets = [...pending].filter(node => node.isConnected !== false);
       pending.clear();
       const hadChanges = dirty, hadRemovals = lost;
+      const detachedNodes = [...removedNodes];
+      removedNodes.clear();
       dirty = lost = false;
       const start = Date.now();
       try {
-        if (hadRemovals) removed?.();
+        if (hadRemovals) removed?.(detachedNodes);
         if (hadChanges) changed?.();
         if (targets.length) await process(targets);
       } catch (error) { if (scope.active) log.error('scan.failed', '动态节点处理失败', { error }); }
@@ -403,6 +418,14 @@
     }
     function schedule() { if (!cancelTimer) cancelTimer = scope.timeout(flush, delay); }
     function notify(mutations) {
+      const visited = new Set();
+      const collectOnce = (node, descendants) => {
+        if (!node) return;
+        const key = descendants ? node : null;
+        if (key && visited.has(key)) return;
+        if (key) visited.add(key);
+        collect(node, descendants);
+      };
       for (const mutation of mutations) {
         if (owned(mutation.target.nodeType === 3 ? mutation.target.parentElement : mutation.target)) continue;
         metrics.mutations++;
@@ -410,11 +433,15 @@
           const additions = Array.from(mutation.addedNodes || []);
           const removals = Array.from(mutation.removedNodes || []);
           const external = node => node.nodeType === 3 || (node.nodeType === 1 && !owned(node));
-          if (![...additions, ...removals].some(external)) continue;
+          const externalChange = [...additions, ...removals].some(external);
+          if (!externalChange && (additions.length || removals.length)) continue;
           collect(mutation.target, false);
-          additions.filter(external).forEach(node => collect(node));
-          if (removals.some(external)) lost = true;
-        } else collect(mutation.target, mutation.type === 'attributes');
+          additions.filter(external).forEach(node => collectOnce(node, true));
+          if (removals.some(external)) {
+            lost = true;
+            removals.filter(external).forEach(node => removedNodes.add(node));
+          }
+        } else collectOnce(mutation.target, mutation.type === 'attributes');
         dirty = true;
       }
       if (dirty) schedule();
@@ -422,8 +449,15 @@
     const observer = new MutationObserver(notify);
     observer.observe(root, { childList: true, subtree: true, characterData: true,
       ...(attributes.length ? { attributes: true, attributeFilter: attributes } : {}) });
-    scope.own(() => { observer.disconnect(); cancelTimer?.(); pending.clear(); });
-    const scan = () => { metrics.fullScans++; collect(root); dirty = true; schedule(); };
+    scope.own(() => { observer.disconnect(); cancelTimer?.(); pending.clear(); removedNodes.clear(); });
+    const scan = () => {
+      metrics.fullScans++;
+      if (root === document.body && document.querySelectorAll) {
+        for (const match of document.querySelectorAll(selector)) if (!owned(match)) pending.add(match);
+      } else collect(root);
+      dirty = true;
+      schedule();
+    };
     if (initial) scan();
     return { scan, notify, flush, metrics };
   }
@@ -431,9 +465,10 @@
   // ---- pages.js ----
   const PAGE_ADAPTERS = Object.freeze({
     wishlist: { rows: '.wishlist_row, .wishlistRowItem, [data-rfd-draggable-id^="WishlistItem-"], .Panel div[data-index]' },
-    cart: { rows: '.i-xXuvHLioU-[role="button"], .bKkQiLkI-vk-', total: '.i1XZFikuzME- .n9HLAjXXhvI-' },
+    cart: { rows: '.i-xXuvHLioU-[role="button"], .bKkQiLkI-vk-', total: '.i1XZFikuzME- .n9HLAjXXhvI-', anchors: '.i1XZFikuzME-, a[href*="checkout.steampowered.com/checkout"]' },
     quick: { rows: 'a.search_result_row, a.tab_item, a.recommendation_link, .wishlist_row, [data-rfd-draggable-id^="WishlistItem-"], .game_purchase_action' },
-    family: { rows: 'a[href*="/app/"], [data-ds-appid], [data-app-id], [data-rfd-draggable-id^="WishlistItem-"]' },
+    family: { rows: 'a[href*="/app/"], [data-ds-appid], [data-app-id], [data-rfd-draggable-id^="WishlistItem-"]',
+      anchors: '#wishlist_link, #store_nav_wishlist_link, a[href*="/wishlist"], .queue_and_playtime, #game_area_purchase, .game_area_purchase, #game_score' },
     restrictions: { titles: '#appHubAppName, .search_result_row .title, .tab_item_name, .wishlist_row .title, ' +
       '[data-rfd-draggable-id^="WishlistItem-"] a[href*="/app/"], .gameListRow .gameListRowItemName, ' +
       '.recommendation_link .game_name, .capsule .title, .store_capsule .title, .tab_item_title, ' +
@@ -452,7 +487,7 @@
     '.StoreOriginalPrice', '.j3jr1YqpBGk- > .-nS4ZC0Bruo-'
   ].join(',');
   const CONVERSION_SELECTORS = [
-    '.discount_prices > .discount_final_price', '.Hxi-pnf9XlwQ- span.HOrB6lehQpg-',
+    '.discount_prices > .discount_final_price',
     '.Hxi-pnf9Xlw- span.HOrB6lehQpg-', '.btnv6_white_transparent > span',
     '.Wh0L8EnwsPV_8VAu8TOYr', '._3j4dI1yA7cRfCvK8h406OB', '._1EKGZBnKFWOr3RqVdnLMRN', '._3fFFsvII7Y2KXNLDk_krOW',
     'div.accountData.price', '.addfunds_area_purchase_game.game_area_purchase_game > h1',
@@ -512,6 +547,9 @@
         const ref = itemRef('bundle', id);
         if (ref) return ref;
       }
+      const bundleHolder = scopeEl.closest('[data-ds-bundleid]');
+      const bundleId = bundleHolder?.getAttribute('data-ds-bundleid')?.split(',')[0];
+      if (itemRef('bundle', bundleId)) return itemRef('bundle', bundleId);
       const sub = purchase.querySelector('input[name="subid"]');
       const ref = itemRef('package', sub?.value);
       if (ref) return ref;
@@ -545,6 +583,8 @@
     }
     if (refs.size === 1) return refs.values().next().value;
     if (!refs.size && purchase) return itemFromLink(location.pathname);
+    const current = itemFromLink(location.pathname);
+    if (current && (purchase || (current.type === 'app' && scopeEl.closest('#game_area_purchase')))) return current;
     return null;
   }
 
@@ -866,7 +906,12 @@
     const adv = root.querySelector('#sapx-adv');
     adv.removeAttribute('open');
     const cur = getTargetRegion();
-    select.innerHTML = REGIONS.map(r => '<option value="' + r.id + '">' + r.label + '</option>').join('');
+    select.replaceChildren(...REGIONS.map(region => {
+      const option = document.createElement('option');
+      option.value = region.id;
+      option.textContent = region.label;
+      return option;
+    }));
     select.value = cur.id;
     showCode.checked = getShowRegionCode();
     const field = id => root.querySelector('#sse-' + id);
@@ -1119,7 +1164,7 @@
   function getPriceForItem(item, region) {
     const key = item.type + ':' + item.id + ':' + region.id;
     if (pendingPrices.has(key)) { regionalLog.debug('price.join', '复用进行中的价格查询', { item: key }); return pendingPrices.get(key); }
-    const pending = fetchPriceForItem(item, region).finally(() => pendingPrices.delete(key));
+    const pending = fetchPriceForItem(item, region).finally(() => { if (pendingPrices.get(key) === pending) pendingPrices.delete(key); });
     pendingPrices.set(key, pending);
     return pending;
   }
@@ -1129,14 +1174,17 @@
     const cached = cacheGet(key);
     if (cached !== undefined) { regionalLog.debug('cache.hit', '命中价格缓存', { item: key }); return cached; }
     const task = regionalLog.begin('price.fetch', { item: key });
+    const scope = regionalScope;
     let failure;
     for (const cc of region.ccCandidates) {
       task.debug('candidate', '读取候选地区', { cc });
       try {
+        if (scope?.active === false) throw requestError('aborted', '价格查询已取消');
         let res = null;
         if (item.type === 'app') res = await getAppPrice(item.id, cc, region.currency);
         else if (item.type === 'package') res = await getPackagePrice(item.id, cc, region.currency);
         else if (item.type === 'bundle') res = await getBundlePrice(item.id, cc, region.currency);
+        if (scope?.active === false) throw requestError('aborted', '价格查询已取消');
         if (res && res.ok) {
           if (item.type === 'bundle' || !res.currency || res.currency === region.currency) {
             cacheSet(key, res);
@@ -1379,6 +1427,7 @@
     const scope = regionalScope = createFeatureScope('regional-prices');
     scope.own(() => {
       summaryRevision++;
+      pendingPrices.clear();
       regionalScanner = null;
       cartSummaryRetry = null;
       document.querySelectorAll('.' + EXTRA_CLASS + ', .sapx-region-locked, #' + CART_SUMMARY_ID).forEach(node => node.remove());
@@ -1480,7 +1529,7 @@
         try {
           const response = await fetchRates(from);
           const rate = response.get(to)?.[from];
-          if (!rate) throw new Error(`汇率接口没有返回有效币种对：${from} -> ${to}`);
+          if (!Number.isFinite(Number(rate)) || Number(rate) <= 0) throw new Error(`汇率接口没有返回有效币种对：${from} -> ${to}`);
           task.end('汇率读取成功', { rate });
           return rate;
         } catch (error) { task.fail(error); throw error; }
@@ -1510,6 +1559,7 @@
               this.memoryCache.setCache(cache);
               this.saveRateCache();
             } catch (error) {
+              if (error.kind === 'aborted') throw error;
               if (cache?.rate) {
                 log.warn('cache.stale', '远程刷新失败，使用旧汇率缓存', { from, to, error });
                 return cache.rate;
@@ -1523,7 +1573,7 @@
         })();
         this.pendingRequests.set(key, request);
         try { return await request; }
-        finally { this.pendingRequests.delete(key); }
+        finally { if (this.pendingRequests.get(key) === request) this.pendingRequests.delete(key); }
       }
       loadRateCache() {
         const setting = getContext().setting;
@@ -1544,6 +1594,7 @@
         storage.deleteValue(cacheKey);
         log.info('cache.clear', '汇率缓存已清除');
       }
+      resetPending() { this.pendingRequests.clear(); this.isBroken = false; }
     }
     return new RateManager();
   }
@@ -2114,11 +2165,14 @@ targets = new Map([
   async function initializeConversion() {
     if (!GM_getValue("sse_convert_enabled", true)) { log.debug('initialize.skip', '价格转换已关闭'); return; }
     const scope = conversionScope = createFeatureScope('conversion');
+    RateManager.instance.resetPending();
     scope.own(() => {
-      for (const [node, state] of convertedOriginals) {
-        if (node.isConnected && node.nodeValue === state.result) node.nodeValue = state.original;
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+      while (walker.nextNode()) {
+        const node = walker.currentNode;
+        const state = convertedOriginals.get(node);
+        if (state && node.nodeValue === state.result) node.nodeValue = state.original;
       }
-      convertedOriginals.clear();
       document.querySelectorAll('[' + Attrs.STATUS_KEY + ']').forEach(node => node.removeAttribute(Attrs.STATUS_KEY));
     });
     const task = log.begin('initialize', undefined, 'info');
@@ -2128,7 +2182,7 @@ targets = new Map([
         task.debug('hydrate.wait', '等待购物车页面接管服务端内容');
         const deadline = Date.now() + 15000;
         while (scope.active && !_unsafeWindow.SSR.hydrated && Date.now() < deadline) {
-          await new Promise(resolve => setTimeout(resolve, 100));
+          if (!await scope.wait(100)) return;
         }
         task.debug('hydrate.ready', '结束页面就绪等待', { hydrated: Boolean(_unsafeWindow.SSR.hydrated) });
       }
@@ -2156,11 +2210,10 @@ targets = new Map([
     const exchangerManager = ConverterManager.instance;
     const selector = exchangerManager.getSelector();
     const scope = conversionScope || (conversionScope = createFeatureScope('conversion'));
-    const initial = document.querySelectorAll(selector);
-    await exchangerManager.convert(initial);
-    if (!scope.active) return;
     const scanner = createDomScanner({ scope, selector, name: 'conversion', initial: false,
       process: nodes => exchangerManager.convert(nodes) });
+    scanner.scan();
+    await scanner.flush();
     return scanner;
     log.debug('observer.ready', '价格变化监听已启用');
   }
@@ -2196,7 +2249,7 @@ targets = new Map([
 
   const convertedNodes = new WeakMap();
   const convertingNodes = new WeakSet();
-  const convertedOriginals = new Map();
+  const convertedOriginals = new WeakMap();
   async function convertPriceTextNodes(root) {
     const scope = conversionScope;
     const nodes = [];
@@ -2222,7 +2275,6 @@ targets = new Map([
         }
       } finally { convertingNodes.delete(node); }
     }));
-    for (const node of convertedOriginals.keys()) if (!node.isConnected) convertedOriginals.delete(node);
   }
   return {
     get setting() { return SettingManager.instance.setting; },
@@ -2269,7 +2321,11 @@ targets = new Map([
       #sse-family-dialog .sse-family-scroll{overflow:auto;max-height:350px}#sse-family-dialog input{box-sizing:border-box;padding:8px;background:#0f141b;color:#c6d4df;border:1px solid #34465a;width:100%;margin:8px 0}
     `;
     document.head.appendChild(style);
-    scope.own(() => { style.remove(); close(); document.querySelectorAll('.sse-family-badge, .sse-family-banner, #sse-family-nav').forEach(node => node.remove()); });
+    scope.own(() => {
+      style.remove(); close();
+      document.querySelectorAll('.sse-family-badge, .sse-family-banner, #sse-family-nav').forEach(node => node.remove());
+      document.querySelectorAll('[data-sse-family-app]').forEach(node => node.removeAttribute('data-sse-family-app'));
+    });
 
     function readIdentity() {
       const session = readStoreSession(document, page);
@@ -2277,8 +2333,18 @@ targets = new Map([
     }
     try { if (onStore) accountId = readIdentity().steamid; }
     catch (error) { notice = '暂时无法读取登录信息，请刷新 Steam 商店页面。'; log.warn('session.read', notice, { error }); }
+    let validatedCache;
+    let cacheShapeValid = false;
     function validCache() {
-      return cache && cache.apps && Array.isArray(cache.members) && (!onStore || (accountId && cache.steamid === accountId));
+      if (validatedCache !== cache) {
+        validatedCache = cache;
+        cacheShapeValid = Boolean(cache && cache.apps && typeof cache.apps === 'object' && !Array.isArray(cache.apps) &&
+        Array.isArray(cache.members) && cache.members.length > 0 && /^\d{17}$/.test(String(cache.steamid)) &&
+        cache.members.every(id => /^\d{17}$/.test(String(id))) &&
+        Object.entries(cache.apps).every(([id, game]) => itemRef('app', id) && game && typeof game.name === 'string' &&
+          Array.isArray(game.owners) && game.owners.every(owner => /^\d{17}$/.test(String(owner)))));
+      }
+      return cacheShapeValid && (!onStore || (accountId && cache.steamid === accountId));
     }
     function ownerName(id) { return cache?.names?.[String(id)] || String(id); }
     function gameDescription(game) {
@@ -2338,11 +2404,13 @@ targets = new Map([
         }
         if (!scope.active || (readIdentity().steamid && readIdentity().steamid !== self)) return;
         cache = { steamid: self, familyId: String(family.family_groupid), name: family.family_group.name || 'Steam 家庭', members: members.map(member => String(member.steamid)), names, apps, updated: Date.now() };
+        validatedCache = undefined;
         accountId = self;
         GM_setValue(KEY, cache);
         task.debug('cache.save', '家庭库缓存已保存', { count: Object.keys(apps).length });
         notice = '扫描完成，已缓存 ' + Object.keys(apps).length + ' 个家庭库游戏。';
         updateMarks();
+        updateBanner();
         task.end(notice, { games: Object.keys(apps).length, members: members.length });
       })().catch(error => { notice = error.message || '家庭库扫描失败，原缓存已保留。'; task.fail(error); })
         .finally(() => { scanPromise = null; refreshNotice(); });
@@ -2460,7 +2528,7 @@ targets = new Map([
       panel.append(scanButton, action('清空缓存', () => {
         if (scanPromise) { notice = '请等待扫描完成后再清空缓存。'; refreshNotice(); return; }
         if (!window.confirm('确定清空本脚本保存的家庭库记录？')) return;
-        GM_deleteValue(KEY); cache = null; notice = '家庭库缓存已清空。'; updateMarks(); renderDialog();
+        GM_deleteValue(KEY); cache = null; validatedCache = undefined; notice = '家庭库缓存已清空。'; updateMarks(); updateBanner(); renderDialog();
         log.info('cache.clear', '家庭库缓存已清空');
       }), action('关闭', close));
       const summary = validCache() ? cache.name + ' · ' + Object.keys(cache.apps).length + ' 个游戏 · 上次扫描：' + new Date(cache.updated).toLocaleString() : '暂无当前账号的家庭库缓存。';
@@ -2469,14 +2537,24 @@ targets = new Map([
         log.debug('panel.statistics', '渲染家庭库统计', { games: Object.keys(cache.apps).length, members: cache.members.length });
         panel.append(createElement('h3', '家庭成员贡献统计'));
         const games = Object.values(cache.apps);
-        const totals = cache.members.map(id => games.filter(game => game.owners.includes(id)).length);
+        const totalsById = new Map(cache.members.map(id => [id, 0]));
+        const ownershipBands = new Map(cache.members.map(id => [id, Array(cache.members.length).fill(0)]));
+        for (const game of games) {
+          const band = Math.min(cache.members.length, game.owners.length) - 1;
+          if (band < 0) continue;
+          for (const owner of game.owners) {
+            if (!totalsById.has(owner)) continue;
+            totalsById.set(owner, totalsById.get(owner) + 1);
+            ownershipBands.get(owner)[band]++;
+          }
+        }
+        const totals = cache.members.map(id => totalsById.get(id));
         const maximum = Math.max(1, ...totals);
         const colors = ['#67c1f5', '#06cfbe', '#a0c85a', '#d7a64c', '#bb83db', '#e18484'];
         cache.members.forEach((id, index) => {
           const row = createElement('div', undefined, 'sse-family-chart-row');
           const bar = createElement('div', undefined, 'sse-family-chart-bar');
-          const counts = Array.from({ length: Math.max(1, cache.members.length) }, () => 0);
-          for (const game of games) if (game.owners.includes(id)) counts[Math.min(counts.length, game.owners.length) - 1]++;
+          const counts = ownershipBands.get(id);
           counts.forEach((count, group) => {
             const segment = createElement('span'); segment.style.width = count / maximum * 100 + '%'; segment.style.background = colors[group % colors.length];
             const category = group === 0 ? '单独贡献' : (group + 1) + ' 人共同拥有';
@@ -2536,7 +2614,7 @@ targets = new Map([
           marked.delete(element);
         }
       }
-      if (!elements) { ensureFamilyNav(); updateBanner(); }
+      if (!elements) ensureFamilyNav();
       if (!active) return;
       let added = 0;
       (elements || document.querySelectorAll(targets)).forEach(element => {
@@ -2574,12 +2652,21 @@ targets = new Map([
       }
     }
     if (enabled) {
-      createDomScanner({ scope, name: 'family', selector: targets, process: updateMarks,
-        attributes: ITEM_ATTRIBUTES, changed: () => { ensureFamilyNav(); updateBanner(); },
-        removed: () => { for (const node of marked) if (!node.isConnected) marked.delete(node); } });
+      createDomScanner({ scope, name: 'family', selector: targets + ',' + PAGE_ADAPTERS.family.anchors, process: nodes => {
+        if (nodes.some(node => node.matches(PAGE_ADAPTERS.family.anchors))) { ensureFamilyNav(); updateBanner(); }
+        updateMarks(nodes.filter(node => node.matches(targets)));
+      }, attributes: ITEM_ATTRIBUTES,
+        removed: nodes => {
+          for (const removed of nodes) {
+            const candidates = [removed, ...(removed.querySelectorAll?.('[data-sse-family-app]') || [])];
+            for (const node of candidates) if (marked.delete(node)) node.removeAttribute('data-sse-family-app');
+          }
+        } });
       log.debug('observer.ready', '家庭库标记动态监听已启用');
       scope.listen(window, 'hashchange', () => updateMarks());
+      ensureFamilyNav();
       updateMarks();
+      updateBanner();
       if (onStore && GM_getValue('sse_family_auto', true) && (!validCache() || Date.now() - cache.updated >= DAY)) {
         log.debug('scan.auto', '缓存缺失或过期，触发自动扫描'); scan();
       } else log.debug('scan.skip', '无需自动扫描');
@@ -2592,6 +2679,7 @@ targets = new Map([
     const nativeButton = row.querySelector('.E4PXslhR-fI- > button:not(.sse-quick-add), button.LrqeL6o22aQ-:not(.sse-quick-add), .purchase_area .btnv6_green_white_innerfade:not(.sse-quick-add), .purchase_area .btn_addtocart:not(.sse-quick-add)');
     if (nativeButton) return nativeButton;
     return Array.from(row.querySelectorAll('a, button')).find(element => {
+      if (element.classList?.contains?.('sse-quick-add')) return false;
       const label = [element.getAttribute('aria-label'), element.getAttribute('title'), element.getAttribute('data-tooltip-text'), element.textContent]
         .filter(Boolean).join(' ');
       return /加入购物车|在购物车中|已在购物车|已加入购物车|购物车中|add(?:ed)?\s+to\s+cart|in\s+cart|view\s+cart/i.test(label);
@@ -2617,6 +2705,7 @@ targets = new Map([
 
   function initializeCartTools() {
     const scope = createFeatureScope('cart');
+    const initialHost = location.hostname;
     const log = diagnostics.scope('cart');
     log.info('initialize', '快速加购与购物车管理已启用');
     const page = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
@@ -2641,6 +2730,7 @@ targets = new Map([
       .sse-cart-dialog h3{color:#e5e5e5;margin-top:0}.sse-cart-dialog .sse-cart-button{display:block;width:100%;margin-top:8px;text-align:left}
     `;
     document.head.appendChild(style);
+    const inCartPage = () => initialHost === location.hostname && /^\/cart(?:\/|$)/i.test(location.pathname);
     const nativeReplacements = new Map();
     scope.own(() => {
       for (const [control, native] of nativeReplacements) if (control.isConnected) control.replaceWith(native);
@@ -2688,6 +2778,7 @@ targets = new Map([
       if ((resultCode && resultCode !== '1') || (data.response?.result != null && data.response.result !== 1)) {
         throw new Error(text('Steam 拒绝了购物车操作。', 'Steam rejected the cart operation.'));
       }
+      if (payload !== undefined && resultCode !== '1' && data.response?.result !== 1) throw invalidResponse('Steam 未确认购物车操作成功');
       const response = validateCartResponse(data, method);
       task.end('购物车接口操作完成');
       return response;
@@ -2815,7 +2906,7 @@ targets = new Map([
     }
 
     function mountPanel() {
-      if (!isCartPage()) return;
+      if (!inCartPage()) return;
       const anchor = findCartPanelAnchor();
       if (!anchor) return;
       if (cartPanel) {
@@ -2888,6 +2979,7 @@ targets = new Map([
       toolbar.append(button(text('导出', 'Export'), run(async () => {
         log.info('export.start', '开始导出购物车');
         const { cart } = await account('GetCart');
+        if (!Array.isArray(cart?.line_items)) throw invalidResponse('购物车列表无效，无法导出。');
         const lines = [];
         for (const item of cart?.line_items || []) {
           const target = { type: item.packageid ? 'sub' : 'bundle', id: Number(item.packageid || item.bundleid) };
@@ -2929,6 +3021,7 @@ targets = new Map([
           }
         }
         const { cart } = await account('GetCart');
+        if (!Array.isArray(cart?.line_items)) throw invalidResponse('购物车列表无效，未执行修改。');
         const items = cart?.line_items || [];
         for (const [index, item] of items.entries()) {
           await account('ModifyLineItem', { line_item_id: item.line_item_id, gift_info: giftInfo, flags: { is_gift: gift, is_private: false } });
@@ -2962,8 +3055,7 @@ targets = new Map([
 
     const quickSelector = PAGE_ADAPTERS.quick.rows;
     function scanQuickButtons(rows = document.querySelectorAll(quickSelector)) {
-      mountPanel();
-      if (!isCartPage() && document.querySelector(quickSelector) && !document.getElementById('sse-cart-extract')) {
+      if (initialHost === location.hostname && !inCartPage() && document.querySelector(quickSelector) && !document.getElementById('sse-cart-extract')) {
         const host = document.querySelector('.wishlist_header, #search_results, .home_tabs_content, .page_content, main');
         if (host) {
           const extract = button(text('提取当前已加载商品', 'Extract loaded items'), () => {
@@ -3039,9 +3131,22 @@ targets = new Map([
       });
       if (mounted) log.debug('quick-add.mount', '已挂载快速加购按钮', { count: mounted });
     }
-    createDomScanner({ scope, selector: quickSelector, process: scanQuickButtons, name: 'cart',
-      attributes: ITEM_ATTRIBUTES, changed: mountPanel,
-      removed: () => { for (const [control] of nativeReplacements) if (!control.isConnected) nativeReplacements.delete(control); } });
+    createDomScanner({ scope, selector: quickSelector + ',' + PAGE_ADAPTERS.cart.anchors, process: nodes => {
+      if (nodes.some(node => node.matches(PAGE_ADAPTERS.cart.anchors))) mountPanel();
+      scanQuickButtons(nodes.filter(node => node.matches(quickSelector)));
+    }, name: 'cart', attributes: ITEM_ATTRIBUTES,
+      removed: nodes => {
+        for (const node of nodes) {
+          const candidates = [node, ...(node.querySelectorAll?.('.sse-native-cart') || [])];
+          for (const control of candidates) {
+            const native = nativeReplacements.get(control);
+            if (native && !control.isConnected && control.parentNode) {
+              control.replaceWith(native);
+              nativeReplacements.delete(control);
+            } else if (native && !control.isConnected) nativeReplacements.delete(control);
+          }
+        }
+      } });
     log.debug('observer.ready', '购物车动态节点监听已启用');
     let resizePending = false;
     scope.listen(window, 'resize', () => {
@@ -3049,7 +3154,7 @@ targets = new Map([
       resizePending = true;
       scope.timeout(() => { resizePending = false; mountPanel(); }, 150);
     }, { passive: true });
-    scanQuickButtons();
+    mountPanel();
     if (GM_getValue('sse_cart_country', false)) context().then(current => {
       const host = document.querySelector('#header_wallet_ctn');
       if (host && !host.querySelector('.sse-account-country')) {
@@ -3177,7 +3282,9 @@ targets = new Map([
     log.debug('panel.mount', '好友工具已挂载', { nativeManagement: Boolean(managePanel) });
     scope.own(() => root.remove());
 
-    const getFriendRows = () => [...document.querySelectorAll('#search_results .selectable[data-steamid]')]
+    // Steam only adds `.selectable` while its native management mode is active.
+    // Scan stable identity-bearing friend cards so normal mode remains selectable too.
+    const getFriendRows = () => [...document.querySelectorAll('#search_results [data-steamid]')]
       .filter(row => /^\d{17}$/.test(row.dataset.steamid || ''));
     const page = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
     const accountId = String(page.g_steamID || page.UserConfig?.steamid || 'anonymous');
@@ -3209,12 +3316,16 @@ targets = new Map([
       for (const friend of friends) {
         const steamId = friend.dataset.steamid;
         const name = friend.querySelector('.friend_block_content')?.textContent.trim().split('\n')[0] || steamId;
-        let checkbox = friend.querySelector('.select_friend_checkbox, .sse-friend-select');
-        if (!checkbox) {
+        const nativeCheckbox = friend.querySelector('.select_friend_checkbox');
+        let checkbox = friend.querySelector('.sse-friend-select');
+        if (isCheckboxVisible(nativeCheckbox)) {
+          checkbox?.remove();
+          checkbox = nativeCheckbox;
+        } else if (!checkbox) {
           checkbox = createElement('input');
           checkbox.type = 'checkbox';
           checkbox.className = 'sse-friend-select';
-          friend.style.position = 'relative';
+          if (window.getComputedStyle?.(friend).position === 'static') friend.style.position = 'relative';
           checkbox.addEventListener('click', event => event.stopPropagation());
           friend.appendChild(checkbox);
         }
@@ -3236,8 +3347,18 @@ targets = new Map([
       selectionCount.textContent = `已选 ${getSelectedFriends().length} 位`;
       log.debug('selection.update', '好友选择已更新', { selected: getSelectedFriends().length });
     }
+    function isCheckboxVisible(checkbox) {
+      if (!checkbox || checkbox.hidden) return false;
+      const style = window.getComputedStyle?.(checkbox);
+      if (style && (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0)) return false;
+      return typeof checkbox.getClientRects !== 'function' || checkbox.getClientRects().length > 0;
+    }
+    function checkboxFor(friend) {
+      const nativeCheckbox = friend.querySelector('.select_friend_checkbox');
+      return isCheckboxVisible(nativeCheckbox) ? nativeCheckbox : friend.querySelector('.sse-friend-select');
+    }
     const getSelectedFriends = () => {
-      return getFriendRows().filter(row => row.querySelector('.select_friend_checkbox, .sse-friend-select')?.checked);
+      return getFriendRows().filter(row => checkboxFor(row)?.checked);
     };
     const getSessionId = () => {
       const page = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
@@ -3345,17 +3466,18 @@ targets = new Map([
             signal: scope.signal,
             headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' }, body
           });
-          if (result?.success !== true && result?.success !== 1) throw new Error(result?.error || 'Steam 未确认留言成功');
+          if (![true, 1, '1'].includes(result?.success)) throw new Error(result?.error || 'Steam 未确认留言成功');
           results.push(`已发送 ${name}`);
           task.debug('sent', '留言发送成功', { index: index + 1, total: friends.length });
           } catch (error) {
+            if (!scope.active) break;
             task.warn('failed', '留言发送失败', { index: index + 1, error });
             results.push(`发送失败 ${name}：${error.message || '请求失败'}`);
           }
           status.textContent = `${index + 1}/${friends.length}\n${results.slice(-5).join('\n')}`;
-          if (index + 1 < friends.length) {
+          if (scope.active && index + 1 < friends.length) {
             task.debug('interval', '等待下一次发送', { delayMs: 4000 });
-            await new Promise(resolve => setTimeout(resolve, 4000));
+            if (!await scope.wait(4000)) break;
           }
         }
         status.textContent = `处理完成：${results.filter(result => result.startsWith('已发送')).length} 成功，${results.filter(result => result.startsWith('发送失败')).length} 失败。\n${results.join('\n')}`;
@@ -3396,7 +3518,7 @@ targets = new Map([
     return result;
   }
 
-  function createRestrictionDatabase({ read, write, request = restrictionRequest, now = () => Date.now(), sources = RESTRICTION_SOURCES }) {
+  function createRestrictionDatabase({ read, write, request = restrictionRequest, now = () => Date.now(), sources = RESTRICTION_SOURCES, signal }) {
     const log = diagnostics.scope('restrictions.database');
     const key = 'sse_restrictions_database_v1';
     const ttl = 24 * 60 * 60 * 1000;
@@ -3408,6 +3530,7 @@ targets = new Map([
     const listeners = new Set();
 
     async function load() {
+      if (signal?.aborted) return memory;
       if (!hydrated) {
         hydrated = true;
         let cached;
@@ -3430,15 +3553,16 @@ targets = new Map([
         // Pin mirrors to the latest commit so CDN branch-cache latency cannot select older data.
         let ref = 'main';
         try {
-          const response = await request('https://api.github.com/repos/F1NN1ER/getSteamRestrictedGameLIst/commits?path=data/fulllist.json&per_page=1', { timeout: 8000 });
+          const response = await request('https://api.github.com/repos/F1NN1ER/getSteamRestrictedGameLIst/commits?path=data/fulllist.json&per_page=1', { timeout: 8000, signal });
           const commits = JSON.parse(response.text);
           if (/^[a-f0-9]{40}$/.test(commits?.[0]?.sha || '')) ref = commits[0].sha;
         } catch (error) { log.debug('revision.fallback', '无法确认最新提交，使用主分支', { error }); }
+        if (signal?.aborted) return memory;
         const task = log.begin('refresh', { revision: ref }, 'info');
         const measured = await Promise.all(sources.map(async source => {
           const url = source.url(ref);
           try {
-            const probe = await request(url, { probe: true });
+            const probe = await request(url, { probe: true, signal });
             log.debug('source.probe', '数据源测速完成', { source: source.id, ms: probe.ms });
             return { source, url, ms: probe.ms };
           } catch (error) {
@@ -3449,8 +3573,10 @@ targets = new Map([
         measured.sort((a, b) => a.ms - b.ms);
         for (const candidate of measured) {
           try {
+            if (signal?.aborted) { task.end('数据库刷新已取消'); return memory; }
             task.debug('download', '下载受限数据库', { source: candidate.source.id, probeMs: candidate.ms });
-            const response = await request(candidate.url, {});
+            const response = await request(candidate.url, { signal });
+            if (signal?.aborted) { task.end('数据库刷新已取消'); return memory; }
             const data = parseRestrictionDatabase(response.text);
             memory = data;
             updated = now();
@@ -3656,7 +3782,7 @@ targets = new Map([
     const scope = createFeatureScope('restrictions');
     const read = key => GM_getValue(key, null);
     const write = (key, value) => GM_setValue(key, value);
-    const database = createRestrictionDatabase({ read, write, request: (url, options) => restrictionRequest(url, { ...options, signal: scope.signal }) });
+    const database = createRestrictionDatabase({ read, write, signal: scope.signal });
     const resolve = createRestrictionResolver(database, createSteamRestrictionLookup({ read, write, signal: scope.signal }));
     const style = createElement('style');
     style.textContent = `
@@ -3680,6 +3806,7 @@ targets = new Map([
     const selector = PAGE_ADAPTERS.restrictions.titles;
     let states = new WeakMap();
     let revision = 0;
+    const trackedTitles = new Set();
     async function enhance(title) {
       if (title.closest('#sapx-ui-root, #sse-family-dialog, #sse-cart-tools') || !title.textContent.trim()) return;
       // Wishlist app links include artwork and purchase links as well as the game name.
@@ -3691,6 +3818,7 @@ targets = new Map([
       // Select the innermost title when the carousel wraps its name in another div.
       if (title.matches('.store_main_capsule .app_name') && title.querySelector('div')) return;
       const appid = restrictionAppId(title);
+      trackedTitles.add(title);
       const previous = states.get(title);
       if (!appid) {
         title.querySelectorAll('.sse-restriction-badge').forEach(badge => badge.remove());
@@ -3718,9 +3846,16 @@ targets = new Map([
       title.appendChild(badge);
       log.debug('badge.render', '游戏受限状态已显示', { appid, ...result });
     }
-    const scanner = createDomScanner({ scope, selector, name: 'restrictions', attributes: ITEM_ATTRIBUTES, process: titles => {
+    const scanner = createDomScanner({ scope, selector, name: 'restrictions', attributes: ITEM_ATTRIBUTES, initial: false, process: titles => {
       log.debug('scan', '扫描游戏标题', { count: titles.length });
       titles.forEach(title => { enhance(title).catch(error => log.error('badge.failed', '游戏受限标记失败', { error })); });
+    }, removed: nodes => {
+      for (const node of nodes) {
+        if (!node.isConnected && node.matches?.(selector)) { trackedTitles.delete(node); states.delete(node); }
+        node.querySelectorAll?.(selector).forEach(title => {
+          if (!title.isConnected) { trackedTitles.delete(title); states.delete(title); }
+        });
+      }
     } });
     const scan = () => scanner.scan();
     const unsubscribe = database.subscribe?.(() => {
@@ -3732,11 +3867,16 @@ targets = new Map([
     // Recheck on long-lived tabs and when returning from a suspended/background tab.
     const refresh = () => {
       database.load().catch(error => log.warn('refresh.failed', '数据库刷新失败', { error }));
-      scan();
+      for (const title of trackedTitles) {
+        if (!title.isConnected) { trackedTitles.delete(title); continue; }
+        const state = states.get(title);
+        if (state?.retryAt && Date.now() >= state.retryAt) enhance(title).catch(error => log.debug('retry.failed', '标签重试失败', { error }));
+      }
     };
+    scope.own(() => trackedTitles.clear());
     scope.interval(() => { if (!document.hidden) refresh(); }, 60 * 1000);
-    scope.listen(window, 'pageshow', refresh);
-    scope.listen(document, 'visibilitychange', () => { if (!document.hidden) refresh(); });
+    scope.listen(window, 'pageshow', () => { refresh(); scan(); });
+    scope.listen(document, 'visibilitychange', () => { if (!document.hidden) { refresh(); scan(); } });
     log.info('initialize', '游戏受限状态标记已启用');
     scan();
   }
@@ -3808,6 +3948,7 @@ targets = new Map([
     const log = diagnostics.scope('wishlist-sale');
     const scope = createFeatureScope('wishlist-sale');
     const page = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
+    const initialPath = location.pathname;
     const rowsByApp = new Map();
     const expiryByApp = new Map();
     const queuedApps = new Set();
@@ -3817,6 +3958,7 @@ targets = new Map([
     const rowIds = new WeakMap();
     const badges = new Set();
     let cancelRetry;
+    let cancelHydration;
     let flushTimer = null;
     const hydrationWaitStarted = Date.now();
 
@@ -3841,6 +3983,7 @@ targets = new Map([
     }
 
     function renderExpiry(appId) {
+      if (!scope.active) return;
       const endTime = expiryByApp.get(appId);
       const rows = rowsByApp.get(appId);
       if (!rows) return;
@@ -3864,7 +4007,6 @@ targets = new Map([
         if (position.container) position.container.insertBefore(badge, position.reference || null);
         else price.after(badge);
       }
-      updateCountdowns();
     }
 
     function updateCountdowns() {
@@ -3882,7 +4024,8 @@ targets = new Map([
           badge.classList.add('sse-sale-ended');
           badge.classList.remove('sse-ending-soon');
         } else {
-          badge.textContent = `折扣结束：${dateText} · 剩余 ${formatWishlistSaleCountdown(remaining)}`;
+          const text = `折扣结束：${dateText} · 剩余 ${formatWishlistSaleCountdown(remaining)}`;
+          if (badge.textContent !== text) badge.textContent = text;
           badge.classList.toggle('sse-ending-soon', remaining <= 3600000);
           badge.classList.remove('sse-sale-ended');
         }
@@ -3905,12 +4048,13 @@ targets = new Map([
     }
 
     async function fetchExpirations(appIds) {
-      const session = readStoreSession(document, page);
+      if (!scope.active || location.hostname !== 'store.steampowered.com' || location.pathname !== initialPath) return;
       for (let offset = 0; offset < appIds.length; offset += 100) {
         if (!scope.active) return;
         const batch = appIds.slice(offset, offset + 100);
         batch.forEach(id => pendingApps.add(id));
         try {
+          const session = readStoreSession(document, page);
           const payload = {
             ids: batch.map(appid => ({ appid: Number(appid) })),
             context: { language: session.language || 'schinese', country_code: session.country || 'US', steam_realm: 1 },
@@ -3940,6 +4084,8 @@ targets = new Map([
           renderExpiry(id);
         }
       }
+      pruneRows();
+      updateCountdowns();
       scheduleRetry();
     }
 
@@ -3956,7 +4102,7 @@ targets = new Map([
 
     function scan(rows) {
       if (page.SSR && !page.SSR.hydrated && Date.now() - hydrationWaitStarted < 15000) {
-        scope.timeout(() => scanner.scan(), 500);
+        if (!cancelHydration) cancelHydration = scope.timeout(() => { cancelHydration = null; scanner.scan(); }, 500);
         return;
       }
       for (const row of rows) {
@@ -3981,11 +4127,25 @@ targets = new Map([
         if ((!refreshedAt.has(appId) || Date.now() - refreshedAt.get(appId) >= ttl) && !pendingApps.has(appId)) queuedApps.add(appId);
       }
       pruneRows();
+      updateCountdowns();
       if (queuedApps.size && !flushTimer) flushTimer = scope.timeout(flushQueuedApps, 180);
     }
-    function pruneRows() {
+    function pruneRows(removed = []) {
+      for (const node of removed) {
+        const rows = [node, ...(node.querySelectorAll?.(PAGE_ADAPTERS.wishlist.rows) || [])];
+        for (const row of rows) {
+          const id = rowIds.get(row);
+          if (!id || row.isConnected) continue;
+          rowsByApp.get(id)?.delete(row);
+          row.querySelectorAll?.('.sse-wishlist-sale-expiration').forEach(badge => { badges.delete(badge); badge.remove(); });
+          rowIds.delete(row);
+        }
+      }
       for (const [appId, appRows] of rowsByApp) {
-        for (const row of appRows) if (!row.isConnected || appIdFor(row) !== appId) appRows.delete(row);
+        for (const row of appRows) if (appIdFor(row) !== appId || !isDiscounted(row)) {
+          appRows.delete(row);
+          row.querySelectorAll('.sse-wishlist-sale-expiration').forEach(badge => badges.delete(badge));
+        }
         if (!appRows.size) {
           rowsByApp.delete(appId); expiryByApp.delete(appId); refreshedAt.delete(appId); retryByApp.delete(appId); queuedApps.delete(appId);
         }
@@ -4031,16 +4191,21 @@ targets = new Map([
     const runtime = createFeatureScope('runtime');
     let signature;
     function reconcile() {
+      try { reconcileFeatures(); }
+      catch (error) { diagnostics.scope('core').error('runtime.failed', '页面功能协调失败', { error }); }
+    }
+    function reconcileFeatures() {
       const page = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
       const user = page.UserConfig?.steamid || page.g_steamID || page.g_AccountID || '';
-      const next = JSON.stringify([location.pathname, location.search, user,
+      const next = JSON.stringify([location.hostname, location.pathname, location.search, user,
         ...FEATURE_DEFINITIONS.map(feature => feature.key ? GM_getValue(feature.key, true) : null),
         GM_getValue('sse_family_enabled', true), GM_getValue('sse_family_auto', true)]);
       if (next === signature) return;
       signature = next;
       for (const feature of FEATURE_DEFINITIONS) featureScopes.get(feature.name)?.dispose();
       for (const feature of FEATURE_DEFINITIONS) {
-        if (!feature.match() || (feature.key && !GM_getValue(feature.key, true))) continue;
+        const isEnabled = !feature.key || GM_getValue(feature.key, true);
+        if (!feature.match() || !isEnabled) continue;
         try {
           const result = feature.start();
           if (result?.catch) result.catch(error => diagnostics.scope('core').error('feature.failed', '功能初始化失败', { name: feature.name, error }));
@@ -4048,6 +4213,12 @@ targets = new Map([
       }
     }
     runtime.interval(reconcile, 1000);
+    if (typeof GM_addValueChangeListener === 'function') {
+      for (const key of ['sse_extra_enabled', 'sse_convert_enabled', 'sse_cart_enabled', 'sse_family_enabled', 'sse_restrictions_enabled', 'sse_wishlist_sale_enabled']) {
+        const id = GM_addValueChangeListener(key, reconcile);
+        runtime.own(() => { if (typeof GM_removeValueChangeListener === 'function') GM_removeValueChangeListener(id); });
+      }
+    }
     runtime.listen(window, 'popstate', reconcile);
     runtime.listen(window, 'pageshow', reconcile);
     runtime.listen(window, 'pagehide', event => {

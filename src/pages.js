@@ -1,8 +1,9 @@
   const PAGE_ADAPTERS = Object.freeze({
     wishlist: { rows: '.wishlist_row, .wishlistRowItem, [data-rfd-draggable-id^="WishlistItem-"], .Panel div[data-index]' },
-    cart: { rows: '.i-xXuvHLioU-[role="button"], .bKkQiLkI-vk-', total: '.i1XZFikuzME- .n9HLAjXXhvI-' },
+    cart: { rows: '.i-xXuvHLioU-[role="button"], .bKkQiLkI-vk-', total: '.i1XZFikuzME- .n9HLAjXXhvI-', anchors: '.i1XZFikuzME-, a[href*="checkout.steampowered.com/checkout"]' },
     quick: { rows: 'a.search_result_row, a.tab_item, a.recommendation_link, .wishlist_row, [data-rfd-draggable-id^="WishlistItem-"], .game_purchase_action' },
-    family: { rows: 'a[href*="/app/"], [data-ds-appid], [data-app-id], [data-rfd-draggable-id^="WishlistItem-"]' },
+    family: { rows: 'a[href*="/app/"], [data-ds-appid], [data-app-id], [data-rfd-draggable-id^="WishlistItem-"]',
+      anchors: '#wishlist_link, #store_nav_wishlist_link, a[href*="/wishlist"], .queue_and_playtime, #game_area_purchase, .game_area_purchase, #game_score' },
     restrictions: { titles: '#appHubAppName, .search_result_row .title, .tab_item_name, .wishlist_row .title, ' +
       '[data-rfd-draggable-id^="WishlistItem-"] a[href*="/app/"], .gameListRow .gameListRowItemName, ' +
       '.recommendation_link .game_name, .capsule .title, .store_capsule .title, .tab_item_title, ' +
@@ -21,7 +22,7 @@
     '.StoreOriginalPrice', '.j3jr1YqpBGk- > .-nS4ZC0Bruo-'
   ].join(',');
   const CONVERSION_SELECTORS = [
-    '.discount_prices > .discount_final_price', '.Hxi-pnf9XlwQ- span.HOrB6lehQpg-',
+    '.discount_prices > .discount_final_price',
     '.Hxi-pnf9Xlw- span.HOrB6lehQpg-', '.btnv6_white_transparent > span',
     '.Wh0L8EnwsPV_8VAu8TOYr', '._3j4dI1yA7cRfCvK8h406OB', '._1EKGZBnKFWOr3RqVdnLMRN', '._3fFFsvII7Y2KXNLDk_krOW',
     'div.accountData.price', '.addfunds_area_purchase_game.game_area_purchase_game > h1',

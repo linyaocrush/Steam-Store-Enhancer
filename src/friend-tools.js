@@ -113,7 +113,9 @@
     log.debug('panel.mount', '好友工具已挂载', { nativeManagement: Boolean(managePanel) });
     scope.own(() => root.remove());
 
-    const getFriendRows = () => [...document.querySelectorAll('#search_results .selectable[data-steamid]')]
+    // Steam only adds `.selectable` while its native management mode is active.
+    // Scan stable identity-bearing friend cards so normal mode remains selectable too.
+    const getFriendRows = () => [...document.querySelectorAll('#search_results [data-steamid]')]
       .filter(row => /^\d{17}$/.test(row.dataset.steamid || ''));
     const page = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
     const accountId = String(page.g_steamID || page.UserConfig?.steamid || 'anonymous');
@@ -145,12 +147,16 @@
       for (const friend of friends) {
         const steamId = friend.dataset.steamid;
         const name = friend.querySelector('.friend_block_content')?.textContent.trim().split('\n')[0] || steamId;
-        let checkbox = friend.querySelector('.select_friend_checkbox, .sse-friend-select');
-        if (!checkbox) {
+        const nativeCheckbox = friend.querySelector('.select_friend_checkbox');
+        let checkbox = friend.querySelector('.sse-friend-select');
+        if (isCheckboxVisible(nativeCheckbox)) {
+          checkbox?.remove();
+          checkbox = nativeCheckbox;
+        } else if (!checkbox) {
           checkbox = createElement('input');
           checkbox.type = 'checkbox';
           checkbox.className = 'sse-friend-select';
-          friend.style.position = 'relative';
+          if (window.getComputedStyle?.(friend).position === 'static') friend.style.position = 'relative';
           checkbox.addEventListener('click', event => event.stopPropagation());
           friend.appendChild(checkbox);
         }
@@ -172,8 +178,18 @@
       selectionCount.textContent = `已选 ${getSelectedFriends().length} 位`;
       log.debug('selection.update', '好友选择已更新', { selected: getSelectedFriends().length });
     }
+    function isCheckboxVisible(checkbox) {
+      if (!checkbox || checkbox.hidden) return false;
+      const style = window.getComputedStyle?.(checkbox);
+      if (style && (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0)) return false;
+      return typeof checkbox.getClientRects !== 'function' || checkbox.getClientRects().length > 0;
+    }
+    function checkboxFor(friend) {
+      const nativeCheckbox = friend.querySelector('.select_friend_checkbox');
+      return isCheckboxVisible(nativeCheckbox) ? nativeCheckbox : friend.querySelector('.sse-friend-select');
+    }
     const getSelectedFriends = () => {
-      return getFriendRows().filter(row => row.querySelector('.select_friend_checkbox, .sse-friend-select')?.checked);
+      return getFriendRows().filter(row => checkboxFor(row)?.checked);
     };
     const getSessionId = () => {
       const page = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
@@ -281,17 +297,18 @@
             signal: scope.signal,
             headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' }, body
           });
-          if (result?.success !== true && result?.success !== 1) throw new Error(result?.error || 'Steam 未确认留言成功');
+          if (![true, 1, '1'].includes(result?.success)) throw new Error(result?.error || 'Steam 未确认留言成功');
           results.push(`已发送 ${name}`);
           task.debug('sent', '留言发送成功', { index: index + 1, total: friends.length });
           } catch (error) {
+            if (!scope.active) break;
             task.warn('failed', '留言发送失败', { index: index + 1, error });
             results.push(`发送失败 ${name}：${error.message || '请求失败'}`);
           }
           status.textContent = `${index + 1}/${friends.length}\n${results.slice(-5).join('\n')}`;
-          if (index + 1 < friends.length) {
+          if (scope.active && index + 1 < friends.length) {
             task.debug('interval', '等待下一次发送', { delayMs: 4000 });
-            await new Promise(resolve => setTimeout(resolve, 4000));
+            if (!await scope.wait(4000)) break;
           }
         }
         status.textContent = `处理完成：${results.filter(result => result.startsWith('已发送')).length} 成功，${results.filter(result => result.startsWith('发送失败')).length} 失败。\n${results.join('\n')}`;

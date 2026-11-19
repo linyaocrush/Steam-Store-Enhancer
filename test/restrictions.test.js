@@ -118,10 +118,14 @@ test('badge mounts next to game title, updates recycled AppIDs and ignores its o
   let scheduled;
   let id = '10';
   const badges = [];
-  const row = { getAttribute: key => key === 'data-ds-appid' ? id : null };
+  const row = {
+    nodeType: 1,
+    getAttribute: key => key === 'data-ds-appid' ? id : null,
+    querySelectorAll: () => [title]
+  };
   const title = {
     textContent: 'Game', isConnected: true,
-    closest: selector => selector.startsWith('[data-rfd-') ? row : null,
+    closest: selector => selector === '[data-rfd-draggable-id^="WishlistItem-"], [data-ds-appid], [data-app-id], .search_result_row, .tab_item, .wishlist_row, .gameListRow, .recommendation_link' ? row : null,
     matches: () => false,
     querySelectorAll: () => [...badges], querySelector: () => badges[0] || null,
     appendChild(badge) { badges.push(badge); }
@@ -134,7 +138,7 @@ test('badge mounts next to game title, updates recycled AppIDs and ignores its o
     document: {
       head: { appendChild() {} }, body: {}, querySelectorAll: () => [title],
       addEventListener() {},
-      createElement() { return { setAttribute() {}, remove() { badges.splice(badges.indexOf(this), 1); } }; }
+      createElement() { return { matches: () => true, setAttribute() {}, remove() { badges.splice(badges.indexOf(this), 1); } }; }
     }
   });
   vm.runInContext(`createRestrictionDatabase = () => ({load: async () => new Map([[10, 0], [20, 2]])});
@@ -147,7 +151,7 @@ test('badge mounts next to game title, updates recycled AppIDs and ignores its o
   observer([{ type: 'childList', target: title, addedNodes: [{ nodeType: 1, matches: () => true }], removedNodes: [] }]);
   assert.equal(scheduled, null);
   id = '20';
-  observer([{ type: 'attributes', target: title }]);
+  observer([{ type: 'attributes', target: row }]);
   scheduled(); scheduled = null;
   await flush();
   assert.equal(badges.length, 1);

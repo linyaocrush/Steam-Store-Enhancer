@@ -18,14 +18,24 @@
         scope.own(() => target.removeEventListener(event, callback, options));
       },
       timeout(callback, delay) {
-        const cancel = () => clearTimeout(id);
-        const id = setTimeout(() => { disposers.delete(cancel); if (scope.active) callback(); }, delay);
+        let id;
+        const cancel = () => { clearTimeout(id); disposers.delete(cancel); };
+        id = setTimeout(() => { disposers.delete(cancel); if (scope.active) callback(); }, delay);
         scope.own(cancel);
         return cancel;
       },
       interval(callback, delay) {
         const id = setInterval(() => { if (scope.active) callback(); }, delay);
         return scope.own(() => clearInterval(id));
+      },
+      wait(delay) {
+        return new Promise(resolve => {
+          const finish = value => { controller.signal.removeEventListener('abort', abort); resolve(value); };
+          const abort = () => { cancel(); finish(false); };
+          const cancel = scope.timeout(() => finish(true), delay);
+          if (!scope.active) abort();
+          else controller.signal.addEventListener('abort', abort, { once: true });
+        });
       },
       dispose() {
         if (!scope.active) return;
@@ -56,7 +66,8 @@
     let cancelTimer;
     let dirty = false;
     let lost = false;
-    const owned = node => Boolean(node?.closest?.(SCRIPT_OWNED_SELECTOR));
+    const removedNodes = new Set();
+    const owned = node => Boolean(node?.matches?.(SCRIPT_OWNED_SELECTOR) || node?.closest?.(SCRIPT_OWNED_SELECTOR));
     function collect(node, descendants = true) {
       if (!node || owned(node)) return;
       if (node.nodeType === 3) node = node.parentElement;
@@ -76,10 +87,12 @@
       const targets = [...pending].filter(node => node.isConnected !== false);
       pending.clear();
       const hadChanges = dirty, hadRemovals = lost;
+      const detachedNodes = [...removedNodes];
+      removedNodes.clear();
       dirty = lost = false;
       const start = Date.now();
       try {
-        if (hadRemovals) removed?.();
+        if (hadRemovals) removed?.(detachedNodes);
         if (hadChanges) changed?.();
         if (targets.length) await process(targets);
       } catch (error) { if (scope.active) log.error('scan.failed', '动态节点处理失败', { error }); }
@@ -90,6 +103,14 @@
     }
     function schedule() { if (!cancelTimer) cancelTimer = scope.timeout(flush, delay); }
     function notify(mutations) {
+      const visited = new Set();
+      const collectOnce = (node, descendants) => {
+        if (!node) return;
+        const key = descendants ? node : null;
+        if (key && visited.has(key)) return;
+        if (key) visited.add(key);
+        collect(node, descendants);
+      };
       for (const mutation of mutations) {
         if (owned(mutation.target.nodeType === 3 ? mutation.target.parentElement : mutation.target)) continue;
         metrics.mutations++;
@@ -97,11 +118,15 @@
           const additions = Array.from(mutation.addedNodes || []);
           const removals = Array.from(mutation.removedNodes || []);
           const external = node => node.nodeType === 3 || (node.nodeType === 1 && !owned(node));
-          if (![...additions, ...removals].some(external)) continue;
+          const externalChange = [...additions, ...removals].some(external);
+          if (!externalChange && (additions.length || removals.length)) continue;
           collect(mutation.target, false);
-          additions.filter(external).forEach(node => collect(node));
-          if (removals.some(external)) lost = true;
-        } else collect(mutation.target, mutation.type === 'attributes');
+          additions.filter(external).forEach(node => collectOnce(node, true));
+          if (removals.some(external)) {
+            lost = true;
+            removals.filter(external).forEach(node => removedNodes.add(node));
+          }
+        } else collectOnce(mutation.target, mutation.type === 'attributes');
         dirty = true;
       }
       if (dirty) schedule();
@@ -109,7 +134,7 @@
     const observer = new MutationObserver(notify);
     observer.observe(root, { childList: true, subtree: true, characterData: true,
       ...(attributes.length ? { attributes: true, attributeFilter: attributes } : {}) });
-    scope.own(() => { observer.disconnect(); cancelTimer?.(); pending.clear(); });
+    scope.own(() => { observer.disconnect(); cancelTimer?.(); pending.clear(); removedNodes.clear(); });
     const scan = () => {
       metrics.fullScans++;
       if (root === document.body && document.querySelectorAll) {

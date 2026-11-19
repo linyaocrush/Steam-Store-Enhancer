@@ -33,7 +33,11 @@
       #sse-family-dialog .sse-family-scroll{overflow:auto;max-height:350px}#sse-family-dialog input{box-sizing:border-box;padding:8px;background:#0f141b;color:#c6d4df;border:1px solid #34465a;width:100%;margin:8px 0}
     `;
     document.head.appendChild(style);
-    scope.own(() => { style.remove(); close(); document.querySelectorAll('.sse-family-badge, .sse-family-banner, #sse-family-nav').forEach(node => node.remove()); });
+    scope.own(() => {
+      style.remove(); close();
+      document.querySelectorAll('.sse-family-badge, .sse-family-banner, #sse-family-nav').forEach(node => node.remove());
+      document.querySelectorAll('[data-sse-family-app]').forEach(node => node.removeAttribute('data-sse-family-app'));
+    });
 
     function readIdentity() {
       const session = readStoreSession(document, page);
@@ -41,13 +45,18 @@
     }
     try { if (onStore) accountId = readIdentity().steamid; }
     catch (error) { notice = '暂时无法读取登录信息，请刷新 Steam 商店页面。'; log.warn('session.read', notice, { error }); }
+    let validatedCache;
+    let cacheShapeValid = false;
     function validCache() {
-      return cache && cache.apps && typeof cache.apps === 'object' && !Array.isArray(cache.apps) &&
+      if (validatedCache !== cache) {
+        validatedCache = cache;
+        cacheShapeValid = Boolean(cache && cache.apps && typeof cache.apps === 'object' && !Array.isArray(cache.apps) &&
         Array.isArray(cache.members) && cache.members.length > 0 && /^\d{17}$/.test(String(cache.steamid)) &&
         cache.members.every(id => /^\d{17}$/.test(String(id))) &&
         Object.entries(cache.apps).every(([id, game]) => itemRef('app', id) && game && typeof game.name === 'string' &&
-          Array.isArray(game.owners) && game.owners.every(owner => /^\d{17}$/.test(String(owner)))) &&
-        (!onStore || (accountId && cache.steamid === accountId));
+          Array.isArray(game.owners) && game.owners.every(owner => /^\d{17}$/.test(String(owner)))));
+      }
+      return cacheShapeValid && (!onStore || (accountId && cache.steamid === accountId));
     }
     function ownerName(id) { return cache?.names?.[String(id)] || String(id); }
     function gameDescription(game) {
@@ -107,11 +116,13 @@
         }
         if (!scope.active || (readIdentity().steamid && readIdentity().steamid !== self)) return;
         cache = { steamid: self, familyId: String(family.family_groupid), name: family.family_group.name || 'Steam 家庭', members: members.map(member => String(member.steamid)), names, apps, updated: Date.now() };
+        validatedCache = undefined;
         accountId = self;
         GM_setValue(KEY, cache);
         task.debug('cache.save', '家庭库缓存已保存', { count: Object.keys(apps).length });
         notice = '扫描完成，已缓存 ' + Object.keys(apps).length + ' 个家庭库游戏。';
         updateMarks();
+        updateBanner();
         task.end(notice, { games: Object.keys(apps).length, members: members.length });
       })().catch(error => { notice = error.message || '家庭库扫描失败，原缓存已保留。'; task.fail(error); })
         .finally(() => { scanPromise = null; refreshNotice(); });
@@ -229,7 +240,7 @@
       panel.append(scanButton, action('清空缓存', () => {
         if (scanPromise) { notice = '请等待扫描完成后再清空缓存。'; refreshNotice(); return; }
         if (!window.confirm('确定清空本脚本保存的家庭库记录？')) return;
-        GM_deleteValue(KEY); cache = null; notice = '家庭库缓存已清空。'; updateMarks(); renderDialog();
+        GM_deleteValue(KEY); cache = null; validatedCache = undefined; notice = '家庭库缓存已清空。'; updateMarks(); updateBanner(); renderDialog();
         log.info('cache.clear', '家庭库缓存已清空');
       }), action('关闭', close));
       const summary = validCache() ? cache.name + ' · ' + Object.keys(cache.apps).length + ' 个游戏 · 上次扫描：' + new Date(cache.updated).toLocaleString() : '暂无当前账号的家庭库缓存。';
@@ -238,14 +249,24 @@
         log.debug('panel.statistics', '渲染家庭库统计', { games: Object.keys(cache.apps).length, members: cache.members.length });
         panel.append(createElement('h3', '家庭成员贡献统计'));
         const games = Object.values(cache.apps);
-        const totals = cache.members.map(id => games.filter(game => game.owners.includes(id)).length);
+        const totalsById = new Map(cache.members.map(id => [id, 0]));
+        const ownershipBands = new Map(cache.members.map(id => [id, Array(cache.members.length).fill(0)]));
+        for (const game of games) {
+          const band = Math.min(cache.members.length, game.owners.length) - 1;
+          if (band < 0) continue;
+          for (const owner of game.owners) {
+            if (!totalsById.has(owner)) continue;
+            totalsById.set(owner, totalsById.get(owner) + 1);
+            ownershipBands.get(owner)[band]++;
+          }
+        }
+        const totals = cache.members.map(id => totalsById.get(id));
         const maximum = Math.max(1, ...totals);
         const colors = ['#67c1f5', '#06cfbe', '#a0c85a', '#d7a64c', '#bb83db', '#e18484'];
         cache.members.forEach((id, index) => {
           const row = createElement('div', undefined, 'sse-family-chart-row');
           const bar = createElement('div', undefined, 'sse-family-chart-bar');
-          const counts = Array.from({ length: Math.max(1, cache.members.length) }, () => 0);
-          for (const game of games) if (game.owners.includes(id)) counts[Math.min(counts.length, game.owners.length) - 1]++;
+          const counts = ownershipBands.get(id);
           counts.forEach((count, group) => {
             const segment = createElement('span'); segment.style.width = count / maximum * 100 + '%'; segment.style.background = colors[group % colors.length];
             const category = group === 0 ? '单独贡献' : (group + 1) + ' 人共同拥有';
@@ -305,7 +326,7 @@
           marked.delete(element);
         }
       }
-      if (!elements) { ensureFamilyNav(); updateBanner(); }
+      if (!elements) ensureFamilyNav();
       if (!active) return;
       let added = 0;
       (elements || document.querySelectorAll(targets)).forEach(element => {
@@ -343,12 +364,21 @@
       }
     }
     if (enabled) {
-      createDomScanner({ scope, name: 'family', selector: targets, process: updateMarks,
-        attributes: ITEM_ATTRIBUTES, changed: () => { ensureFamilyNav(); updateBanner(); },
-        removed: () => { for (const node of marked) if (!node.isConnected) marked.delete(node); } });
+      createDomScanner({ scope, name: 'family', selector: targets + ',' + PAGE_ADAPTERS.family.anchors, process: nodes => {
+        if (nodes.some(node => node.matches(PAGE_ADAPTERS.family.anchors))) { ensureFamilyNav(); updateBanner(); }
+        updateMarks(nodes.filter(node => node.matches(targets)));
+      }, attributes: ITEM_ATTRIBUTES,
+        removed: nodes => {
+          for (const removed of nodes) {
+            const candidates = [removed, ...(removed.querySelectorAll?.('[data-sse-family-app]') || [])];
+            for (const node of candidates) if (marked.delete(node)) node.removeAttribute('data-sse-family-app');
+          }
+        } });
       log.debug('observer.ready', '家庭库标记动态监听已启用');
       scope.listen(window, 'hashchange', () => updateMarks());
+      ensureFamilyNav();
       updateMarks();
+      updateBanner();
       if (onStore && GM_getValue('sse_family_auto', true) && (!validCache() || Date.now() - cache.updated >= DAY)) {
         log.debug('scan.auto', '缓存缺失或过期，触发自动扫描'); scan();
       } else log.debug('scan.skip', '无需自动扫描');

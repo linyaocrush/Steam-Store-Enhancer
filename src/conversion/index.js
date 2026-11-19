@@ -454,11 +454,14 @@ targets = new Map([
   async function initializeConversion() {
     if (!GM_getValue("sse_convert_enabled", true)) { log.debug('initialize.skip', '价格转换已关闭'); return; }
     const scope = conversionScope = createFeatureScope('conversion');
+    RateManager.instance.resetPending();
     scope.own(() => {
-      for (const [node, state] of convertedOriginals) {
-        if (node.isConnected && node.nodeValue === state.result) node.nodeValue = state.original;
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+      while (walker.nextNode()) {
+        const node = walker.currentNode;
+        const state = convertedOriginals.get(node);
+        if (state && node.nodeValue === state.result) node.nodeValue = state.original;
       }
-      convertedOriginals.clear();
       document.querySelectorAll('[' + Attrs.STATUS_KEY + ']').forEach(node => node.removeAttribute(Attrs.STATUS_KEY));
     });
     const task = log.begin('initialize', undefined, 'info');
@@ -468,7 +471,7 @@ targets = new Map([
         task.debug('hydrate.wait', '等待购物车页面接管服务端内容');
         const deadline = Date.now() + 15000;
         while (scope.active && !_unsafeWindow.SSR.hydrated && Date.now() < deadline) {
-          await new Promise(resolve => setTimeout(resolve, 100));
+          if (!await scope.wait(100)) return;
         }
         task.debug('hydrate.ready', '结束页面就绪等待', { hydrated: Boolean(_unsafeWindow.SSR.hydrated) });
       }
@@ -496,11 +499,10 @@ targets = new Map([
     const exchangerManager = ConverterManager.instance;
     const selector = exchangerManager.getSelector();
     const scope = conversionScope || (conversionScope = createFeatureScope('conversion'));
-    const initial = document.querySelectorAll(selector);
-    await exchangerManager.convert(initial);
-    if (!scope.active) return;
     const scanner = createDomScanner({ scope, selector, name: 'conversion', initial: false,
       process: nodes => exchangerManager.convert(nodes) });
+    scanner.scan();
+    await scanner.flush();
     return scanner;
     log.debug('observer.ready', '价格变化监听已启用');
   }
@@ -536,7 +538,7 @@ targets = new Map([
 
   const convertedNodes = new WeakMap();
   const convertingNodes = new WeakSet();
-  const convertedOriginals = new Map();
+  const convertedOriginals = new WeakMap();
   async function convertPriceTextNodes(root) {
     const scope = conversionScope;
     const nodes = [];
@@ -562,7 +564,6 @@ targets = new Map([
         }
       } finally { convertingNodes.delete(node); }
     }));
-    for (const node of convertedOriginals.keys()) if (!node.isConnected) convertedOriginals.delete(node);
   }
   return {
     get setting() { return SettingManager.instance.setting; },

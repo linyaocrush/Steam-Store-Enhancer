@@ -59,6 +59,8 @@
     }
     if (refs.size === 1) return refs.values().next().value;
     if (!refs.size && purchase) return itemFromLink(location.pathname);
+    const current = itemFromLink(location.pathname);
+    if (current && (purchase || (current.type === 'app' && scopeEl.closest('#game_area_purchase')))) return current;
     return null;
   }
 

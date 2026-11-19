@@ -45,6 +45,7 @@
               this.memoryCache.setCache(cache);
               this.saveRateCache();
             } catch (error) {
+              if (error.kind === 'aborted') throw error;
               if (cache?.rate) {
                 log.warn('cache.stale', '远程刷新失败，使用旧汇率缓存', { from, to, error });
                 return cache.rate;
@@ -58,7 +59,7 @@
         })();
         this.pendingRequests.set(key, request);
         try { return await request; }
-        finally { this.pendingRequests.delete(key); }
+        finally { if (this.pendingRequests.get(key) === request) this.pendingRequests.delete(key); }
       }
       loadRateCache() {
         const setting = getContext().setting;
@@ -79,6 +80,7 @@
         storage.deleteValue(cacheKey);
         log.info('cache.clear', '汇率缓存已清除');
       }
+      resetPending() { this.pendingRequests.clear(); this.isBroken = false; }
     }
     return new RateManager();
   }
