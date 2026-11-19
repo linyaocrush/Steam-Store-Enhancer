@@ -5,7 +5,7 @@
 // @homepageURL  https://github.com/linyaocrush/Steam-Store-Enhancer
 // @downloadURL  https://raw.githubusercontent.com/linyaocrush/Steam-Store-Enhancer/main/Steam%20Store%20Enhancer.user.js
 // @updateURL    https://raw.githubusercontent.com/linyaocrush/Steam-Store-Enhancer/main/Steam%20Store%20Enhancer.user.js
-// @version      1.7.4
+// @version      1.8.0
 // @description  Steam 额外地区价格、汇率转换、快速加购、愿望单及商店列表折扣倒计时、购物车批量管理与家庭库游戏标记。
 // @author       linyaocrush, marioplus, Chr_, Cliencer Goge, Miku39
 // @license      AGPL-3.0
@@ -266,6 +266,18 @@
     if (content !== undefined) element.textContent = content;
     if (className) element.className = className;
     return element;
+  }
+
+  async function forEachConcurrent(items, concurrency, callback) {
+    const values = Array.from(items);
+    let next = 0;
+    const workerCount = Math.min(values.length, Math.max(1, Math.floor(concurrency) || 1));
+    await Promise.all(Array.from({ length: workerCount }, async () => {
+      while (next < values.length) {
+        const index = next++;
+        await callback(values[index], index);
+      }
+    }));
   }
 
   function readStoreSession(doc, globals = {}) {
@@ -1596,6 +1608,7 @@
     const numberPattern = new RegExp(`\\d[\\d${separators.map(value => value === ' ' ? '\\s' : escapeRegex(value)).join('')}]*\\d|\\d`, 'g');
     const rules = [...countries].sort((a, b) => b.symbol.length - a.symbol.length ||
       Number(a.fractionDigits === 0) - Number(b.fractionDigits === 0) || a.currencyCode.localeCompare(b.currencyCode));
+    const ruleSets = new Map();
 
     function symbolRange(text, start, end, rule, relaxed) {
       if (rule.symbolPos === 'front') {
@@ -1643,10 +1656,18 @@
     }
     async function processTextAsync(text, countryCode, targetSymbol, before, sourceCode) {
       if (!/\d/.test(text)) return text;
-      const currentRule = countries.find(country => country.code === sourceCode);
       const cart = isCart();
-      const otherRules = rules.filter(country => country.code !== sourceCode &&
-        (cart || (country.code !== countryCode && country.currencyCode !== countryMap.get(countryCode)?.currencyCode)));
+      const ruleKey = `${sourceCode}:${countryCode}:${cart}`;
+      let ruleSet = ruleSets.get(ruleKey);
+      if (!ruleSet) {
+        ruleSet = {
+          currentRule: countryMap.get(sourceCode),
+          otherRules: rules.filter(country => country.code !== sourceCode &&
+            (cart || (country.code !== countryCode && country.currencyCode !== countryMap.get(countryCode)?.currencyCode)))
+        };
+        ruleSets.set(ruleKey, ruleSet);
+      }
+      const { currentRule, otherRules } = ruleSet;
       const matches = [];
       for (const number of text.matchAll(numberPattern)) {
         const start = number.index;
@@ -2002,6 +2023,22 @@ static readString(jsonString, cls) {
     }
   }
   class AbstractConverter {
+    selectorCache;
+    selectorCacheCartMode;
+    combinedSelectorCache;
+    getCachedSelectors() {
+      const cartMode = isCartPage();
+      if (!this.selectorCache || this.selectorCacheCartMode !== cartMode) {
+        this.selectorCache = this.getCssSelectors();
+        this.selectorCacheCartMode = cartMode;
+        this.combinedSelectorCache = this.selectorCache.join(', ');
+      }
+      return this.selectorCache;
+    }
+    findSelector(element) {
+      for (const selector of this.getCachedSelectors()) if (element.matches(selector)) return selector;
+      return null;
+    }
 match(elementSnap) {
       if (!elementSnap || !elementSnap.element) {
         return false;
@@ -2021,13 +2058,10 @@ match(elementSnap) {
       if (/^[,.\d\s]+$/.test(content)) {
         return false;
       }
-      for (const selector of this.getCssSelectors()) {
-        if (elementSnap.element.matches(selector)) {
-          elementSnap.selector = selector;
-          return true;
-        }
-      }
-      return false;
+      const selector = this.findSelector(elementSnap.element);
+      if (!selector) return false;
+      elementSnap.selector = selector === true ? '' : selector;
+      return true;
     }
 
 afterConvert(elementSnap, result) {
@@ -2043,6 +2077,10 @@ afterConvert(elementSnap, result) {
   class ElementConverter extends AbstractConverter {
     getCssSelectors() {
       return getConversionSelectors();
+    }
+    findSelector(element) {
+      this.getCachedSelectors();
+      return element.matches(this.combinedSelectorCache) || null;
     }
     async convert(elementSnap) {
       await convertPriceTextNodes(elementSnap.element);
@@ -2119,22 +2157,21 @@ targets = new Map([
       ];
     }
     getSelector() {
-      return this.converters.map((exchanger) => exchanger.getCssSelectors()).flat(1).join(", ");
+      return this.converters.flatMap(exchanger => exchanger.getCssSelectors()).join(', ');
     }
     async convert(elements) {
       if (!elements) {
         return;
       }
-      const tasks = [];
-      elements.forEach((element) => {
+      await forEachConcurrent(elements, 8, async element => {
         const elementSnap = {
           element,
           textContext: element.textContent,
           classList: element.classList,
           attributes: element.attributes
         };
-        this.converters.filter((converter) => converter.match(elementSnap)).forEach((converter) => {
-          const task = (async () => {
+        const matched = this.converters.filter(converter => converter.match(elementSnap));
+        await Promise.all(matched.map(async converter => {
             try {
               const elementConverted = await converter.convert(elementSnap);
               if (elementConverted) {
@@ -2143,11 +2180,8 @@ targets = new Map([
             } catch (e) {
               log.error('nodes.convert-failed', '价格转换失败', { error: e, element });
             }
-          })();
-          tasks.push(task);
-        });
+          }));
       });
-      await Promise.all(tasks);
     }
   }
   let conversionScope;
@@ -2247,7 +2281,7 @@ targets = new Map([
       const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
       while (walker.nextNode()) nodes.push(walker.currentNode);
     }
-    await Promise.all(nodes.map(async node => {
+    await forEachConcurrent(nodes, 12, async node => {
       if (node.parentElement?.closest('.sapx-extra-price, #sapx-cart-summary, #sapx-ui-root') ||
           convertedNodes.get(node) === node.nodeValue || convertingNodes.has(node)) return;
       const original = node.nodeValue;
@@ -2263,7 +2297,7 @@ targets = new Map([
           }
         }
       } finally { convertingNodes.delete(node); }
-    }));
+    });
   }
   return {
     get setting() { return SettingManager.instance.setting; },
@@ -4261,7 +4295,12 @@ targets = new Map([
   ];
   function startFeatureRuntime() {
     const runtime = createFeatureScope('runtime');
-    let signature;
+    const settingKeys = ['sse_extra_enabled', 'sse_convert_enabled', 'sse_cart_enabled',
+      'sse_family_enabled', 'sse_family_auto', 'sse_restrictions_enabled', 'sse_wishlist_sale_enabled'];
+    const settingListenersAvailable = typeof GM_addValueChangeListener === 'function';
+    const featureSignatures = new Map();
+    let settings = null;
+    let settingsDirty = true;
     function reconcile() {
       try { reconcileFeatures(); }
       catch (error) { diagnostics.scope('core').error('runtime.failed', '页面功能协调失败', { error }); }
@@ -4269,15 +4308,26 @@ targets = new Map([
     function reconcileFeatures() {
       const page = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
       const user = page.UserConfig?.steamid || page.g_steamID || page.g_AccountID || '';
-      const next = JSON.stringify([location.hostname, location.pathname, location.search, user,
-        ...FEATURE_DEFINITIONS.map(feature => feature.key ? GM_getValue(feature.key, true) : null),
-        GM_getValue('sse_family_enabled', true), GM_getValue('sse_family_auto', true)]);
-      if (next === signature) return;
-      signature = next;
-      for (const feature of FEATURE_DEFINITIONS) featureScopes.get(feature.name)?.dispose();
+      if (!settings || settingsDirty || !settingListenersAvailable) {
+        settings = Object.fromEntries(settingKeys.map(key => [key, GM_getValue(key, true)]));
+        settingsDirty = false;
+      }
+      const pageSignature = JSON.stringify([location.hostname, location.pathname, location.search, user]);
+      const changes = [];
       for (const feature of FEATURE_DEFINITIONS) {
-        const isEnabled = !feature.key || GM_getValue(feature.key, true);
-        if (!feature.match() || !isEnabled) continue;
+        const enabled = !feature.key || settings[feature.key];
+        const active = feature.match() && enabled;
+        // Family initialization also owns its management UI, so its switches restart it
+        // without preventing initialization when marking is disabled.
+        const familySettings = feature.name === 'family'
+          ? `${settings.sse_family_enabled}|${settings.sse_family_auto}` : '';
+        const next = `${pageSignature}|${feature.name}|${active}|${familySettings}`;
+        if (featureSignatures.get(feature.name) !== next) changes.push({ feature, active, next });
+      }
+      for (const { feature } of changes) featureScopes.get(feature.name)?.dispose();
+      for (const { feature, active, next } of changes) {
+        featureSignatures.set(feature.name, next);
+        if (!active) continue;
         try {
           const result = feature.start();
           if (result?.catch) result.catch(error => diagnostics.scope('core').error('feature.failed', '功能初始化失败', { name: feature.name, error }));
@@ -4285,9 +4335,9 @@ targets = new Map([
       }
     }
     runtime.interval(reconcile, 1000);
-    if (typeof GM_addValueChangeListener === 'function') {
-      for (const key of ['sse_extra_enabled', 'sse_convert_enabled', 'sse_cart_enabled', 'sse_family_enabled', 'sse_restrictions_enabled', 'sse_wishlist_sale_enabled']) {
-        const id = GM_addValueChangeListener(key, reconcile);
+    if (settingListenersAvailable) {
+      for (const key of settingKeys) {
+        const id = GM_addValueChangeListener(key, () => { settingsDirty = true; reconcile(); });
         runtime.own(() => { if (typeof GM_removeValueChangeListener === 'function') GM_removeValueChangeListener(id); });
       }
     }

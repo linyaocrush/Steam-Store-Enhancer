@@ -5,7 +5,7 @@
 // @homepageURL  https://github.com/linyaocrush/Steam-Store-Enhancer
 // @downloadURL  https://raw.githubusercontent.com/linyaocrush/Steam-Store-Enhancer/main/Steam%20Store%20Enhancer.user.js
 // @updateURL    https://raw.githubusercontent.com/linyaocrush/Steam-Store-Enhancer/main/Steam%20Store%20Enhancer.user.js
-// @version      1.7.4
+// @version      1.8.0
 // @description  Steam 额外地区价格、汇率转换、快速加购、愿望单及商店列表折扣倒计时、购物车批量管理与家庭库游戏标记。
 // @author       linyaocrush, marioplus, Chr_, Cliencer Goge, Miku39
 // @license      AGPL-3.0

@@ -24,6 +24,20 @@ test('feature replacement cancels waits, timers, listeners and old observer exac
   assert.equal(context.unexpected, undefined);
 });
 
+test('bounded async worker pool never exceeds its configured concurrency', async () => {
+  const { context } = await harness();
+  let active = 0, maximum = 0, completed = 0;
+  await context.forEachConcurrent(Array.from({ length: 100 }, (_, index) => index), 7, async () => {
+    active++;
+    maximum = Math.max(maximum, active);
+    await Promise.resolve();
+    completed++;
+    active--;
+  });
+  assert.equal(maximum, 7);
+  assert.equal(completed, 100);
+});
+
 test('100 mutations process only one new price instead of rescanning 1000 existing prices', async () => {
   let fullQueries = 0;
   let subtreeQueries = 0;
@@ -99,6 +113,7 @@ test('runtime handles SPA routing, feature switches, repeated startup and page t
   store.set('sse_cart_enabled', false);
   await time.advance(1000);
   assert.equal(vm.runInContext("featureScopes.has('cart')", context), false);
+  assert.equal(starts.get('wishlist-sale'), 1, 'unrelated feature should not restart when cart setting changes');
   context.location.pathname = '/app/10/';
   window.emit('popstate');
   assert.equal(vm.runInContext("featureScopes.has('wishlist-sale')", context), true);

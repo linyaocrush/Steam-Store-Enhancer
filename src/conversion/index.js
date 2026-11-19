@@ -302,6 +302,22 @@ static readString(jsonString, cls) {
     }
   }
   class AbstractConverter {
+    selectorCache;
+    selectorCacheCartMode;
+    combinedSelectorCache;
+    getCachedSelectors() {
+      const cartMode = isCartPage();
+      if (!this.selectorCache || this.selectorCacheCartMode !== cartMode) {
+        this.selectorCache = this.getCssSelectors();
+        this.selectorCacheCartMode = cartMode;
+        this.combinedSelectorCache = this.selectorCache.join(', ');
+      }
+      return this.selectorCache;
+    }
+    findSelector(element) {
+      for (const selector of this.getCachedSelectors()) if (element.matches(selector)) return selector;
+      return null;
+    }
 match(elementSnap) {
       if (!elementSnap || !elementSnap.element) {
         return false;
@@ -321,13 +337,10 @@ match(elementSnap) {
       if (/^[,.\d\s]+$/.test(content)) {
         return false;
       }
-      for (const selector of this.getCssSelectors()) {
-        if (elementSnap.element.matches(selector)) {
-          elementSnap.selector = selector;
-          return true;
-        }
-      }
-      return false;
+      const selector = this.findSelector(elementSnap.element);
+      if (!selector) return false;
+      elementSnap.selector = selector === true ? '' : selector;
+      return true;
     }
 
 afterConvert(elementSnap, result) {
@@ -343,6 +356,10 @@ afterConvert(elementSnap, result) {
   class ElementConverter extends AbstractConverter {
     getCssSelectors() {
       return getConversionSelectors();
+    }
+    findSelector(element) {
+      this.getCachedSelectors();
+      return element.matches(this.combinedSelectorCache) || null;
     }
     async convert(elementSnap) {
       await convertPriceTextNodes(elementSnap.element);
@@ -419,22 +436,21 @@ targets = new Map([
       ];
     }
     getSelector() {
-      return this.converters.map((exchanger) => exchanger.getCssSelectors()).flat(1).join(", ");
+      return this.converters.flatMap(exchanger => exchanger.getCssSelectors()).join(', ');
     }
     async convert(elements) {
       if (!elements) {
         return;
       }
-      const tasks = [];
-      elements.forEach((element) => {
+      await forEachConcurrent(elements, 8, async element => {
         const elementSnap = {
           element,
           textContext: element.textContent,
           classList: element.classList,
           attributes: element.attributes
         };
-        this.converters.filter((converter) => converter.match(elementSnap)).forEach((converter) => {
-          const task = (async () => {
+        const matched = this.converters.filter(converter => converter.match(elementSnap));
+        await Promise.all(matched.map(async converter => {
             try {
               const elementConverted = await converter.convert(elementSnap);
               if (elementConverted) {
@@ -443,11 +459,8 @@ targets = new Map([
             } catch (e) {
               log.error('nodes.convert-failed', '价格转换失败', { error: e, element });
             }
-          })();
-          tasks.push(task);
-        });
+          }));
       });
-      await Promise.all(tasks);
     }
   }
   let conversionScope;
@@ -547,7 +560,7 @@ targets = new Map([
       const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
       while (walker.nextNode()) nodes.push(walker.currentNode);
     }
-    await Promise.all(nodes.map(async node => {
+    await forEachConcurrent(nodes, 12, async node => {
       if (node.parentElement?.closest('.sapx-extra-price, #sapx-cart-summary, #sapx-ui-root') ||
           convertedNodes.get(node) === node.nodeValue || convertingNodes.has(node)) return;
       const original = node.nodeValue;
@@ -563,7 +576,7 @@ targets = new Map([
           }
         }
       } finally { convertingNodes.delete(node); }
-    }));
+    });
   }
   return {
     get setting() { return SettingManager.instance.setting; },

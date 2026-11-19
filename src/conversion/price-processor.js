@@ -5,6 +5,7 @@
     const numberPattern = new RegExp(`\\d[\\d${separators.map(value => value === ' ' ? '\\s' : escapeRegex(value)).join('')}]*\\d|\\d`, 'g');
     const rules = [...countries].sort((a, b) => b.symbol.length - a.symbol.length ||
       Number(a.fractionDigits === 0) - Number(b.fractionDigits === 0) || a.currencyCode.localeCompare(b.currencyCode));
+    const ruleSets = new Map();
 
     function symbolRange(text, start, end, rule, relaxed) {
       if (rule.symbolPos === 'front') {
@@ -52,10 +53,18 @@
     }
     async function processTextAsync(text, countryCode, targetSymbol, before, sourceCode) {
       if (!/\d/.test(text)) return text;
-      const currentRule = countries.find(country => country.code === sourceCode);
       const cart = isCart();
-      const otherRules = rules.filter(country => country.code !== sourceCode &&
-        (cart || (country.code !== countryCode && country.currencyCode !== countryMap.get(countryCode)?.currencyCode)));
+      const ruleKey = `${sourceCode}:${countryCode}:${cart}`;
+      let ruleSet = ruleSets.get(ruleKey);
+      if (!ruleSet) {
+        ruleSet = {
+          currentRule: countryMap.get(sourceCode),
+          otherRules: rules.filter(country => country.code !== sourceCode &&
+            (cart || (country.code !== countryCode && country.currencyCode !== countryMap.get(countryCode)?.currencyCode)))
+        };
+        ruleSets.set(ruleKey, ruleSet);
+      }
+      const { currentRule, otherRules } = ruleSet;
       const matches = [];
       for (const number of text.matchAll(numberPattern)) {
         const start = number.index;

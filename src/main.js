@@ -22,7 +22,12 @@
   ];
   function startFeatureRuntime() {
     const runtime = createFeatureScope('runtime');
-    let signature;
+    const settingKeys = ['sse_extra_enabled', 'sse_convert_enabled', 'sse_cart_enabled',
+      'sse_family_enabled', 'sse_family_auto', 'sse_restrictions_enabled', 'sse_wishlist_sale_enabled'];
+    const settingListenersAvailable = typeof GM_addValueChangeListener === 'function';
+    const featureSignatures = new Map();
+    let settings = null;
+    let settingsDirty = true;
     function reconcile() {
       try { reconcileFeatures(); }
       catch (error) { diagnostics.scope('core').error('runtime.failed', '页面功能协调失败', { error }); }
@@ -30,15 +35,26 @@
     function reconcileFeatures() {
       const page = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
       const user = page.UserConfig?.steamid || page.g_steamID || page.g_AccountID || '';
-      const next = JSON.stringify([location.hostname, location.pathname, location.search, user,
-        ...FEATURE_DEFINITIONS.map(feature => feature.key ? GM_getValue(feature.key, true) : null),
-        GM_getValue('sse_family_enabled', true), GM_getValue('sse_family_auto', true)]);
-      if (next === signature) return;
-      signature = next;
-      for (const feature of FEATURE_DEFINITIONS) featureScopes.get(feature.name)?.dispose();
+      if (!settings || settingsDirty || !settingListenersAvailable) {
+        settings = Object.fromEntries(settingKeys.map(key => [key, GM_getValue(key, true)]));
+        settingsDirty = false;
+      }
+      const pageSignature = JSON.stringify([location.hostname, location.pathname, location.search, user]);
+      const changes = [];
       for (const feature of FEATURE_DEFINITIONS) {
-        const isEnabled = !feature.key || GM_getValue(feature.key, true);
-        if (!feature.match() || !isEnabled) continue;
+        const enabled = !feature.key || settings[feature.key];
+        const active = feature.match() && enabled;
+        // Family initialization also owns its management UI, so its switches restart it
+        // without preventing initialization when marking is disabled.
+        const familySettings = feature.name === 'family'
+          ? `${settings.sse_family_enabled}|${settings.sse_family_auto}` : '';
+        const next = `${pageSignature}|${feature.name}|${active}|${familySettings}`;
+        if (featureSignatures.get(feature.name) !== next) changes.push({ feature, active, next });
+      }
+      for (const { feature } of changes) featureScopes.get(feature.name)?.dispose();
+      for (const { feature, active, next } of changes) {
+        featureSignatures.set(feature.name, next);
+        if (!active) continue;
         try {
           const result = feature.start();
           if (result?.catch) result.catch(error => diagnostics.scope('core').error('feature.failed', '功能初始化失败', { name: feature.name, error }));
@@ -46,9 +62,9 @@
       }
     }
     runtime.interval(reconcile, 1000);
-    if (typeof GM_addValueChangeListener === 'function') {
-      for (const key of ['sse_extra_enabled', 'sse_convert_enabled', 'sse_cart_enabled', 'sse_family_enabled', 'sse_restrictions_enabled', 'sse_wishlist_sale_enabled']) {
-        const id = GM_addValueChangeListener(key, reconcile);
+    if (settingListenersAvailable) {
+      for (const key of settingKeys) {
+        const id = GM_addValueChangeListener(key, () => { settingsDirty = true; reconcile(); });
         runtime.own(() => { if (typeof GM_removeValueChangeListener === 'function') GM_removeValueChangeListener(id); });
       }
     }

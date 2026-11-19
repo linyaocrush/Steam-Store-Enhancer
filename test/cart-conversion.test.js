@@ -6,7 +6,7 @@ import { loggingSource } from './helpers/logging.mjs';
 
 async function harness() {
   const source = (await Promise.all(['settings', 'rates', 'price-processor', 'index'].map(name => readFile(new URL(`../src/conversion/${name}.js`, import.meta.url), 'utf8')))).join('\n');
-  const pageSources = await Promise.all(['pages.js', 'items.js', 'runtime.js'].map(name => readFile(new URL(`../src/${name}`, import.meta.url), 'utf8')));
+  const pageSources = await Promise.all(['shared.js', 'pages.js', 'items.js', 'runtime.js'].map(name => readFile(new URL(`../src/${name}`, import.meta.url), 'utf8')));
   const page = {};
   let observer;
   const timers = new Map();
