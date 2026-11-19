@@ -4061,9 +4061,7 @@ targets = new Map([
           if (getComputedStyle(position.container).position === 'static') position.container.style.position = 'relative';
         }
         badges.add(badge);
-        if (position.append) position.container.appendChild(badge);
-        else if (position.container) position.container.insertBefore(badge, position.reference || null);
-        else price.after(badge);
+        position.container.insertBefore(badge, position.reference || null);
       }
     }
 
