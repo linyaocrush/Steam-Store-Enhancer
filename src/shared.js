@@ -5,18 +5,6 @@
     return element;
   }
 
-  // Coalesce repeated requests without postponing the first scheduled scan.
-  function createScheduledTask(task, delay) {
-    let timer = null;
-    return () => {
-      if (timer !== null) return;
-      timer = setTimeout(() => {
-        timer = null;
-        task();
-      }, delay);
-    };
-  }
-
   function readStoreSession(doc, globals = {}) {
     const config = doc.querySelector('#application_config');
     const read = name => {
