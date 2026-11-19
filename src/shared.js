@@ -6,13 +6,14 @@
   }
 
   async function forEachConcurrent(items, concurrency, callback) {
-    const values = Array.from(items);
-    let next = 0;
-    const workerCount = Math.min(values.length, Math.max(1, Math.floor(concurrency) || 1));
+    const iterator = items?.[Symbol.iterator]?.() || Array.from(items || []).values();
+    const workerCount = Math.max(1, Math.floor(concurrency) || 1);
+    let nextIndex = 0;
     await Promise.all(Array.from({ length: workerCount }, async () => {
-      while (next < values.length) {
-        const index = next++;
-        await callback(values[index], index);
+      for (;;) {
+        const entry = iterator.next();
+        if (entry.done) return;
+        await callback(entry.value, nextIndex++);
       }
     }));
   }

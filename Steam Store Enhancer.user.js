@@ -269,13 +269,14 @@
   }
 
   async function forEachConcurrent(items, concurrency, callback) {
-    const values = Array.from(items);
-    let next = 0;
-    const workerCount = Math.min(values.length, Math.max(1, Math.floor(concurrency) || 1));
+    const iterator = items?.[Symbol.iterator]?.() || Array.from(items || []).values();
+    const workerCount = Math.max(1, Math.floor(concurrency) || 1);
+    let nextIndex = 0;
     await Promise.all(Array.from({ length: workerCount }, async () => {
-      while (next < values.length) {
-        const index = next++;
-        await callback(values[index], index);
+      for (;;) {
+        const entry = iterator.next();
+        if (entry.done) return;
+        await callback(entry.value, nextIndex++);
       }
     }));
   }
@@ -2172,15 +2173,15 @@ targets = new Map([
         };
         const matched = this.converters.filter(converter => converter.match(elementSnap));
         await Promise.all(matched.map(async converter => {
-            try {
-              const elementConverted = await converter.convert(elementSnap);
-              if (elementConverted) {
-                converter.afterConvert(elementSnap, elementConverted);
-              }
-            } catch (e) {
-              log.error('nodes.convert-failed', '价格转换失败', { error: e, element });
+          try {
+            const elementConverted = await converter.convert(elementSnap);
+            if (elementConverted) {
+              converter.afterConvert(elementSnap, elementConverted);
             }
-          }));
+          } catch (e) {
+            log.error('nodes.convert-failed', '价格转换失败', { error: e, element });
+          }
+        }));
       });
     }
   }
@@ -2275,13 +2276,11 @@ targets = new Map([
   const convertedOriginals = new WeakMap();
   async function convertPriceTextNodes(root) {
     const scope = conversionScope;
-    const nodes = [];
-    if (root.nodeType === 3) nodes.push(root);
-    else {
+    function* textNodes() {
       const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-      while (walker.nextNode()) nodes.push(walker.currentNode);
+      while (walker.nextNode()) yield walker.currentNode;
     }
-    await forEachConcurrent(nodes, 12, async node => {
+    await forEachConcurrent(root.nodeType === 3 ? [root] : textNodes(), 12, async node => {
       if (node.parentElement?.closest('.sapx-extra-price, #sapx-cart-summary, #sapx-ui-root') ||
           convertedNodes.get(node) === node.nodeValue || convertingNodes.has(node)) return;
       const original = node.nodeValue;

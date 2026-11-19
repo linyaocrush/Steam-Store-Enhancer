@@ -145,6 +145,8 @@ npm run build
 
 模块职责和日志接口见 [维护说明](docs/architecture.md)。日志核心位于 `src/logging/`，转换设置、汇率服务、价格文本处理分别位于 `src/conversion/`；公共请求队列位于 `src/network.js`。模块的构建顺序由 `scripts/build.mjs` 定义。
 
+页面功能由 `src/main.js` 按页面与单项设置协调，GM 设置变更时只重启受影响的功能。价格转换使用有并发上限的异步工作池处理动态 DOM，避免大型页面同时创建过多任务；网络请求仍遵守各自队列与 Steam 限速策略。
+
 运行以下命令检查生成文件是否与源码一致、逐个验证仓库内 JavaScript（源码、构建脚本、测试和生成文件）的语法，并执行测试：
 
 ```sh

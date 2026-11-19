@@ -27,7 +27,8 @@ test('feature replacement cancels waits, timers, listeners and old observer exac
 test('bounded async worker pool never exceeds its configured concurrency', async () => {
   const { context } = await harness();
   let active = 0, maximum = 0, completed = 0;
-  await context.forEachConcurrent(Array.from({ length: 100 }, (_, index) => index), 7, async () => {
+  function* values() { for (let index = 0; index < 100; index++) yield index; }
+  await context.forEachConcurrent(values(), 7, async () => {
     active++;
     maximum = Math.max(maximum, active);
     await Promise.resolve();
