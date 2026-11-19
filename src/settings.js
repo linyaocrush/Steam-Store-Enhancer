@@ -21,7 +21,7 @@
       '<div class="sapx-field"><label class="sapx-check"><input class="sapx-checkbox" id="sse-cart-enabled" type="checkbox" />启用快速加购与购物车管理</label></div>' +
       '<div class="sapx-field"><label class="sapx-check"><input class="sapx-checkbox" id="sse-family-enabled" type="checkbox" />启用家庭库游戏标记</label></div>' +
       '<div class="sapx-field"><label class="sapx-check"><input class="sapx-checkbox" id="sse-restrictions-enabled" type="checkbox" />显示游戏受限状态</label></div>' +
-      '<div class="sapx-field"><label class="sapx-check"><input class="sapx-checkbox" id="sse-wishlist-sale-enabled" type="checkbox" />显示愿望单折扣倒计时</label></div>' +
+      '<div class="sapx-field"><label class="sapx-check"><input class="sapx-checkbox" id="sse-wishlist-sale-enabled" type="checkbox" />显示愿望单及商店列表折扣倒计时</label></div>' +
       '<div class="sapx-field"><label class="sapx-check"><input class="sapx-checkbox" id="sse-family-auto" type="checkbox" />每隔 24 小时自动扫描家庭库</label></div>' +
       '<div class="sapx-field"><button class="sapx-btn sapx-btn-ghost" type="button" id="sse-family-open">管理家庭库：扫描、贡献统计与最近购入</button></div>' +
       '<div class="sapx-field"><label class="sapx-label" for="sse-convert-region">价格转换目标地区</label><select class="sapx-select" id="sse-convert-region"></select></div>' +

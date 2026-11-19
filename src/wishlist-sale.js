@@ -30,7 +30,8 @@
     if (discountedBlock) return discountedBlock;
 
     // Steam's current React wishlist renders prices inside an app link and uses hashed classes.
-    for (const link of row.querySelectorAll('a[href*="/app/"]')) {
+    const links = [...(row.matches?.('a[href*="/app/"]') ? [row] : []), ...row.querySelectorAll('a[href*="/app/"]')];
+    for (const link of links) {
       const accessiblePrice = [...link.querySelectorAll('[aria-label]')].find(element =>
         /(?:立省|节省|save)\s*\d+\s*%/i.test(element.getAttribute('aria-label') || '')
       );
@@ -58,8 +59,66 @@
       : { container: priceContainer, reference: priceLink.nextSibling };
   }
 
-  function initializeWishlistSaleCountdown() {
-    if (location.hostname !== 'store.steampowered.com' || !isWishlistPage() || !GM_getValue('sse_wishlist_sale_enabled', true)) return;
+  function normalizeStoreSaleRow(row) {
+    return row.closest?.('a.search_result_row, a.tab_item, a.tab_row_item, a.recommendation_link, .store_main_capsule, .store_capsule, .small_cap, .large_cap, .wishlist_row, .wishlistRowItem, [data-rfd-draggable-id^="WishlistItem-"]') ||
+      row.closest?.('[data-ds-appid], [data-app-id]') || row;
+  }
+
+  function isVisibleSaleRow(row) {
+    return row.isConnected && (!row.getClientRects || row.getClientRects().length > 0);
+  }
+
+  function storeSaleCountdownStyle() {
+    return '.sse-wishlist-sale-expiration{display:block;margin:5px 0 0;color:#9acb7a;font-size:11px;line-height:1.4;white-space:normal;pointer-events:none}.sse-wishlist-sale-expiration.sse-ending-soon{color:#e6a15a}.sse-wishlist-sale-expiration.sse-sale-ended{color:#e46767}' +
+      '.tab_row_item .sse-home-sale-expiration{contain:inline-size;margin:2px 0 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-variant-numeric:tabular-nums;pointer-events:auto}' +
+      '.search_result_row .sse-search-sale-expiration{display:block;box-sizing:border-box;width:max-content;max-width:none;margin:0;white-space:nowrap;overflow:visible;text-overflow:clip;text-align:left;font-variant-numeric:tabular-nums;position:absolute;left:0;top:100%;z-index:1;pointer-events:auto}';
+  }
+
+  function findStoreSaleBadgePosition(row) {
+    if (row.matches('.wishlist_row, .wishlistRowItem, [data-rfd-draggable-id^="WishlistItem-"]') ||
+        row.getAttribute?.('data-rfd-draggable-id')?.startsWith('WishlistItem-')) {
+      return { ...findWishlistSaleBadgePosition(row, findWishlistSalePrice(row)), className: '', compact: false };
+    }
+    if (row.matches('a.tab_row_item') && row.closest?.('#home_tabs_row')) {
+      const info = row.querySelector(':scope > .tab_item_content > .tab_item_col:not(.tab_item_price)');
+      return info ? { container: info, className: 'sse-home-sale-expiration', compact: true } : null;
+    }
+    if (row.matches('.search_result_row')) {
+      const price = row.querySelector('.discount_block');
+      if (!price) return null;
+      return { container: row, anchor: price, className: 'sse-search-sale-expiration', compact: true };
+    }
+    return { container: row, className: '', compact: false };
+  }
+
+  function positionSearchSaleBadge(badge, row, price) {
+    const rowRect = row.getBoundingClientRect();
+    const priceRect = price.getBoundingClientRect();
+    const badgeRect = badge.getBoundingClientRect();
+    const left = priceRect.right - rowRect.left - (row.clientLeft || 0) - badgeRect.width;
+    badge.style.top = `${priceRect.bottom - rowRect.top - (row.clientTop || 0)}px`;
+    badge.style.left = `${Math.max(0, left)}px`;
+  }
+
+  function storeSaleAppId(row) {
+    const draggableId = row.getAttribute('data-rfd-draggable-id') || '';
+    const wishlistId = draggableId.match(/^WishlistItem-(\d+)/);
+    if (wishlistId) return wishlistId[1];
+    const ids = new Set();
+    for (const element of [row, ...row.querySelectorAll('[data-ds-appid], [data-app-id]')]) {
+      const id = element.getAttribute('data-ds-appid') || element.getAttribute('data-app-id') || '';
+      if (/^\d+$/.test(id)) ids.add(id);
+    }
+    const links = [...(row.matches?.('a[href*="/app/"]') ? [row] : []), ...row.querySelectorAll('a[href*="/app/"]')];
+    for (const link of links) {
+      const id = (link.getAttribute('href') || '').match(/\/app\/(\d+)(?:\/|$|\?)/)?.[1];
+      if (id) ids.add(id);
+    }
+    return ids.size === 1 ? ids.values().next().value : null;
+  }
+
+  function initializeStoreSaleCountdown() {
+    if (location.hostname !== 'store.steampowered.com' || !GM_getValue('sse_wishlist_sale_enabled', true)) return;
 
     const log = diagnostics.scope('wishlist-sale');
     const scope = createFeatureScope('wishlist-sale');
@@ -78,20 +137,12 @@
     let flushTimer = null;
     const hydrationWaitStarted = Date.now();
 
-    if (!document.getElementById('sse-wishlist-sale-style')) {
+    if (!document.getElementById('sse-store-sale-style')) {
       const style = document.createElement('style');
-      style.id = 'sse-wishlist-sale-style';
-      style.textContent = '.sse-wishlist-sale-expiration{display:block;margin:5px 0 0;color:#9acb7a;font-size:11px;line-height:1.4;white-space:normal;pointer-events:none}.sse-wishlist-sale-expiration.sse-ending-soon{color:#e6a15a}.sse-wishlist-sale-expiration.sse-sale-ended{color:#e46767}';
+      style.id = 'sse-store-sale-style';
+      style.textContent = storeSaleCountdownStyle();
       document.head.appendChild(style);
       scope.own(() => style.remove());
-    }
-
-    function appIdFor(row) {
-      const draggableId = row.getAttribute('data-rfd-draggable-id') || '';
-      const match = draggableId.match(/^WishlistItem-(\d+)/);
-      if (match) return match[1];
-      const href = row.querySelector('a[href*="/app/"]')?.getAttribute('href') || '';
-      return href.match(/\/app\/(\d+)/)?.[1] || null;
     }
 
     function isDiscounted(row) {
@@ -108,19 +159,25 @@
         return;
       }
       for (const row of rows) {
-        if (!row.isConnected || appIdFor(row) !== appId || !isDiscounted(row)) continue;
-        const existing = row.querySelector('.sse-wishlist-sale-expiration');
-        if (existing && existing.dataset.endTime === String(endTime)) continue;
-        existing?.remove();
+        if (!isVisibleSaleRow(row) || storeSaleAppId(row) !== appId) continue;
         const price = findWishlistSalePrice(row);
         if (!price) continue;
+        const position = isWishlistPage()
+          ? { ...findWishlistSaleBadgePosition(row, price), className: '', compact: false }
+          : findStoreSaleBadgePosition(row);
+        if (!position?.container) continue;
+        const existing = row.querySelector('.sse-wishlist-sale-expiration');
+        if (existing && existing.dataset.endTime === String(endTime) && existing.parentElement === position.container) continue;
+        existing?.remove();
         const badge = document.createElement('span');
-        badge.className = 'sse-wishlist-sale-expiration';
+        badge.className = 'sse-wishlist-sale-expiration' + (position.className ? ' ' + position.className : '');
         badge.dataset.endTime = String(endTime);
+        if (position.anchor) {
+          if (getComputedStyle(position.container).position === 'static') position.container.style.position = 'relative';
+        }
         badges.add(badge);
-        // Mount below the price/action flex row so Steam's layout cannot squeeze it beside the price.
-        const position = findWishlistSaleBadgePosition(row, price);
-        if (position.container) position.container.insertBefore(badge, position.reference || null);
+        if (position.append) position.container.appendChild(badge);
+        else if (position.container) position.container.insertBefore(badge, position.reference || null);
         else price.after(badge);
       }
     }
@@ -134,24 +191,36 @@
         const remaining = endTime - now;
         const endDate = new Date(endTime);
         const dateText = Number.isFinite(endTime) ? `${endDate.getFullYear()}年${endDate.getMonth() + 1}月${endDate.getDate()}日 ${endDate.getHours().toString().padStart(2, '0')}:${endDate.getMinutes().toString().padStart(2, '0')}` : '';
+        const homeCompact = badge.classList.contains?.('sse-home-sale-expiration');
+        const searchCompact = badge.classList.contains?.('sse-search-sale-expiration');
+        const prefix = homeCompact || searchCompact ? '' : `折扣结束：${dateText} · `;
         if (remaining <= 0) {
-          const text = `折扣结束：${dateText} · 已结束`;
+          const text = `${prefix}${searchCompact ? `已结束 · ${dateText}` : '已结束'}`;
           if (badge.textContent !== text) badge.textContent = text;
           badge.classList.add('sse-sale-ended');
           badge.classList.remove('sse-ending-soon');
         } else {
-          const text = `折扣结束：${dateText} · 剩余 ${formatWishlistSaleCountdown(remaining)}`;
+          const text = `${prefix}剩余 ${formatWishlistSaleCountdown(remaining)}`;
           if (badge.textContent !== text) badge.textContent = text;
           badge.classList.toggle('sse-ending-soon', remaining <= 3600000);
           badge.classList.remove('sse-sale-ended');
         }
         badge.title = `折扣结束时间：${endDate.toLocaleString()}`;
+        if (searchCompact) {
+          const row = badge.closest('.search_result_row');
+          const price = row?.querySelector('.discount_block');
+          if (price) positionSearchSaleBadge(badge, row, price);
+        }
       }
+    }
+
+    function hasVisibleSaleRow(id) {
+      return [...(rowsByApp.get(id) || [])].some(row => isVisibleSaleRow(row) && storeSaleAppId(row) === id && isDiscounted(row));
     }
 
     function scheduleRetry() {
       cancelRetry?.();
-      const times = [...retryByApp].filter(([id, state]) => rowsByApp.has(id) && !pendingApps.has(id) && Number.isFinite(state.at)).map(([, state]) => state.at);
+      const times = [...retryByApp].filter(([id, state]) => !pendingApps.has(id) && Number.isFinite(state.at) && hasVisibleSaleRow(id)).map(([, state]) => state.at);
       if (!times.length) return;
       cancelRetry = scope.timeout(() => {
         cancelRetry = null;
@@ -167,8 +236,10 @@
       if (!scope.active || location.hostname !== 'store.steampowered.com' || location.pathname !== initialPath) return;
       for (let offset = 0; offset < appIds.length; offset += 100) {
         if (!scope.active) return;
-        const batch = appIds.slice(offset, offset + 100);
-        batch.forEach(id => pendingApps.add(id));
+        const claimed = appIds.slice(offset, offset + 100);
+        const batch = claimed.filter(hasVisibleSaleRow);
+        for (const id of claimed) if (!batch.includes(id)) pendingApps.delete(id);
+        if (!batch.length) continue;
         try {
           const session = readStoreSession(document, page);
           const payload = {
@@ -207,23 +278,28 @@
 
     function flushQueuedApps() {
       flushTimer = null;
-      const appIds = [...queuedApps].filter(id => !pendingApps.has(id) && rowsByApp.has(id) &&
+      const appIds = [...queuedApps].filter(id => !pendingApps.has(id) && hasVisibleSaleRow(id) &&
         (!retryByApp.has(id) || retryByApp.get(id).at <= Date.now()));
       queuedApps.clear();
       if (!appIds.length) return;
       // Claim all batches before awaiting, so a concurrent scan cannot enqueue them twice.
-      appIds.forEach(id => { pendingApps.add(id); if (retryByApp.has(id)) retryByApp.get(id).at = Infinity; });
+      appIds.forEach(id => pendingApps.add(id));
       fetchExpirations(appIds).catch(error => { if (scope.active) log.error('expiry.unexpected', '折扣处理异常', { error }); });
     }
 
     function scan(rows) {
-      if (page.SSR && !page.SSR.hydrated && Date.now() - hydrationWaitStarted < 15000) {
+      if (isWishlistPage() && page.SSR && !page.SSR.hydrated && Date.now() - hydrationWaitStarted < 15000) {
         if (!cancelHydration) cancelHydration = scope.timeout(() => { cancelHydration = null; scanner.scan(); }, 500);
         return;
       }
-      for (const row of rows) {
-        if (row.matches('div[data-index]') && row.querySelector('[data-rfd-draggable-id^="WishlistItem-"]')) continue;
-        const appId = appIdFor(row);
+      const candidates = new Set();
+      for (const node of rows) {
+        if (node.matches('div[data-index]') && node.querySelector('[data-rfd-draggable-id^="WishlistItem-"]')) continue;
+        candidates.add(normalizeStoreSaleRow(node));
+      }
+      for (const row of candidates) {
+        if (!isVisibleSaleRow(row)) continue;
+        const appId = storeSaleAppId(row);
         const previous = rowIds.get(row);
         if (previous && previous !== appId) {
           rowsByApp.get(previous)?.delete(row);
@@ -248,7 +324,7 @@
     }
     function pruneRows(removed = []) {
       for (const node of removed) {
-        const rows = [node, ...(node.querySelectorAll?.(PAGE_ADAPTERS.wishlist.rows) || [])];
+        const rows = [node, ...(node.querySelectorAll?.(PAGE_ADAPTERS.wishlist.rows + ',' + PAGE_ADAPTERS.storeSale.rows) || [])];
         for (const row of rows) {
           const id = rowIds.get(row);
           if (!id || row.isConnected) continue;
@@ -258,7 +334,7 @@
         }
       }
       for (const [appId, appRows] of rowsByApp) {
-        for (const row of appRows) if (appIdFor(row) !== appId || !isDiscounted(row)) {
+        for (const row of appRows) if (storeSaleAppId(row) !== appId || !isDiscounted(row)) {
           appRows.delete(row);
           row.querySelectorAll('.sse-wishlist-sale-expiration').forEach(badge => badges.delete(badge));
         }
@@ -269,13 +345,22 @@
       for (const badge of badges) if (!badge.isConnected) badges.delete(badge);
     }
 
-    const scanner = createDomScanner({ scope, selector: PAGE_ADAPTERS.wishlist.rows, process: scan,
+    const scanner = createDomScanner({ scope, selector: PAGE_ADAPTERS.wishlist.rows + ',' + PAGE_ADAPTERS.storeSale.rows, process: scan,
       attributes: ITEM_ATTRIBUTES, name: 'wishlist-sale', removed: pruneRows, delay: 300 });
+    const homeTabs = document.querySelector('#home_tabs_row');
+    if (homeTabs) {
+      // Steam switches tabs by changing the existing panels' inline display styles.
+      const observer = new MutationObserver(records => scanner.notify(records.filter(record => record.target.matches('.home_tab_content'))));
+      observer.observe(homeTabs, { subtree: true, attributes: true, attributeFilter: ['style', 'hidden'] });
+      scope.own(() => observer.disconnect());
+    }
     scope.interval(updateCountdowns, 1000);
     scope.interval(() => { if (!document.hidden) scan([...rowsByApp.values()].flatMap(rows => [...rows])); }, 60000);
     scope.listen(document, 'visibilitychange', () => { if (!document.hidden) { updateCountdowns(); scanner.scan(); } });
     scope.own(() => {
       badges.forEach(badge => badge.remove()); badges.clear(); rowsByApp.clear(); queuedApps.clear(); pendingApps.clear();
     });
-    log.info('initialize', '愿望单折扣结束时间和倒计时已启用');
+    log.info('initialize', '愿望单及商店列表折扣结束时间和倒计时已启用');
   }
+
+  function initializeWishlistSaleCountdown() { return initializeStoreSaleCountdown(); }

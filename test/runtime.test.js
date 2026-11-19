@@ -91,7 +91,7 @@ test('runtime handles SPA routing, feature switches, repeated startup and page t
     function initializeCartTools() { boot('cart'); }
     function initializeFriendTools() { boot('friends'); }
     function initializeRestrictionBadges() { boot('restrictions'); }
-    function initializeWishlistSaleCountdown() { boot('wishlist-sale'); }`, context);
+    function initializeStoreSaleCountdown() { boot('wishlist-sale'); }`, context);
   vm.runInContext(await readFile(new URL('../src/main.js', import.meta.url), 'utf8'), context);
   assert.equal(starts.get('wishlist-sale'), 1);
   await time.advance(2000);
@@ -101,7 +101,8 @@ test('runtime handles SPA routing, feature switches, repeated startup and page t
   assert.equal(vm.runInContext("featureScopes.has('cart')", context), false);
   context.location.pathname = '/app/10/';
   window.emit('popstate');
-  assert.equal(vm.runInContext("featureScopes.has('wishlist-sale')", context), false);
+  assert.equal(vm.runInContext("featureScopes.has('wishlist-sale')", context), true);
+  assert.ok(starts.get('wishlist-sale') >= 2);
   assert.equal(starts.get('friends'), undefined);
   vm.runInContext('startFeatureRuntime()', context);
   assert.equal(time.size, 1);

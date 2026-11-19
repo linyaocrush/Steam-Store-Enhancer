@@ -6,7 +6,7 @@
 
 让 Steam 商店、愿望单与购物车中的价格信息更直观。
 
-![Version](https://img.shields.io/badge/version-1.6.0-67c1f5?style=flat-square)
+![Version](https://img.shields.io/badge/version-1.7.4-67c1f5?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Tampermonkey-1b2838?style=flat-square)
 ![License](https://img.shields.io/badge/license-AGPL--3.0-green?style=flat-square)
 
@@ -60,6 +60,10 @@
 - **购物车管理**：提供购物车历史入口、刷新和清空购物车操作；清空前需确认。
 - **显示选项**：支持中文／英文工具文案，以及在页头显示账号地区。
 
+### ⏳ 折扣倒计时
+
+在愿望单及商店首页、搜索、推荐等列表中，为当前可见且正在打折的游戏显示折扣结束时间和剩余时间；通过游戏详情信息读取结束时间，不会为未打折商品或不在列表中的游戏添加倒计时。可在设置中关闭。
+
 ### 💬 好友批量留言
 
 在 Steam 好友列表中选择好友后，可向所选好友的个人主页逐个发送相同评论。发送前会确认目标人数，发送过程中每位好友之间间隔 4 秒，并显示成功或失败结果。
@@ -89,7 +93,7 @@
 
 ### ⚙️ 统一设置
 
-使用 Steam 风格的深色弹窗，集中管理地区价格、汇率转换、购物车工具和家庭库标记。四项功能可独立开关，地区价格与汇率转换可分别选择目标地区。
+使用 Steam 风格的深色弹窗，集中管理各项功能。功能可独立开关，地区价格与汇率转换可分别选择目标地区。
 
 ### 🚦 游戏受限状态
 
