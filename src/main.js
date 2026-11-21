@@ -43,7 +43,8 @@
       const changes = [];
       for (const feature of FEATURE_DEFINITIONS) {
         const enabled = !feature.key || settings[feature.key];
-        const active = feature.match() && enabled;
+        // Do not modify server HTML before Steam's React root has adopted it.
+        const active = feature.match() && enabled && isStorePageReady();
         // Family initialization also owns its management UI, so its switches restart it
         // without preventing initialization when marking is disabled.
         const familySettings = feature.name === 'family'

@@ -92,6 +92,13 @@ static readString(jsonString, cls) {
   }
   const countyInfos = Jsons.readJson(countyObjs, Array).sort((a, b) => a.name.localeCompare(b.name));
   const countyCode2Info = new Map(countyInfos.map((v) => [v.code, v]));
+  function sourceCountryInfo(code) {
+    const country = String(code || '').trim().toUpperCase();
+    const direct = countyCode2Info.get(country);
+    if (direct) return direct;
+    const region = REGIONS.find(region => region.ccCandidates.includes(country));
+    return region && countyInfos.find(info => info.currencyCode === region.currency);
+  }
   const { SettingManager, storage: GmUtils } = createConversionSettings({ Jsons, countyCode2Info });
   class Attrs {
     static STATUS_KEY = "data-spc-status";
@@ -479,14 +486,13 @@ targets = new Map([
     });
     const task = log.begin('initialize', undefined, 'info');
     try {
-      // SSR text must stay intact until React has adopted the server-rendered cart.
-      if (isCartPage() && _unsafeWindow.SSR) {
-        task.debug('hydrate.wait', '等待购物车页面接管服务端内容');
-        const deadline = Date.now() + 15000;
-        while (scope.active && !_unsafeWindow.SSR.hydrated && Date.now() < deadline) {
+      // A timeout is not proof that React has adopted the server-rendered text.
+      if (!isStorePageReady()) {
+        task.debug('hydrate.wait', '等待商店页面接管服务端内容');
+        while (scope.active && !isStorePageReady()) {
           if (!await scope.wait(100)) return;
         }
-        task.debug('hydrate.ready', '结束页面就绪等待', { hydrated: Boolean(_unsafeWindow.SSR.hydrated) });
+        task.debug('hydrate.ready', '页面已接管服务端内容');
       }
       await initContext();
       if (!scope.active) return;
@@ -538,7 +544,7 @@ targets = new Map([
     if (currCountyCode) {
       log.debug('context.country', '账号区域已就绪', { country: currCountyCode });
     }
-    let currCountInfo = countyCode2Info.get(currCountyCode);
+    let currCountInfo = sourceCountryInfo(currCountyCode);
     if (!currCountInfo) {
       log.warn('context.source-fallback', '当前区域缺少映射，使用美国', { country: currCountyCode });
       currCountInfo = countyCode2Info.get("US");

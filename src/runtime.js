@@ -1,6 +1,11 @@
   const featureScopes = new Map();
   const SCRIPT_OWNED_SELECTOR = '#sapx-ui-root, #sapx-cart-summary, #sse-cart-tools, .sse-cart-dialog, #sse-family-dialog, #sse-family-chart-tooltip, #sse-family-nav, #sse-cart-extract, #sse-friend-tools, .sapx-extra-price, .sapx-region-locked, .sse-family-badge, .sse-family-banner, .sse-quick-add, .sse-restriction-badge, .sse-wishlist-sale-expiration';
 
+  function isStorePageReady() {
+    const page = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
+    return location.hostname !== 'store.steampowered.com' || !page.SSR || Boolean(page.SSR.hydrated);
+  }
+
   function createFeatureScope(name) {
     featureScopes.get(name)?.dispose();
     const disposers = new Set();

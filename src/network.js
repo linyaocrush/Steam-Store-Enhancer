@@ -1,7 +1,34 @@
   function requestError(kind, message, status) { return Object.assign(new Error(message), { kind, ...(status == null ? {} : { status }) }); }
-  function gmRequest(url, { signal, timeout = 20000, probe = false, ...options } = {}) {
+  async function gmRequest(url, { signal, retries = 0, ...options } = {}) {
     const address = new URL(url);
     const task = diagnostics.scope('network').begin('request', { method: options.method || 'GET', endpoint: address.origin + address.pathname });
+    const retryLimit = (options.method || 'GET').toUpperCase() === 'GET' && Number.isInteger(retries) ? Math.max(0, Math.min(retries, 2)) : 0;
+    try {
+      for (let attempt = 0; ; attempt++) {
+        try {
+          const response = await gmRequestAttempt(url, { ...options, signal });
+          task.end('请求完成', { status: response.status });
+          return response;
+        } catch (error) {
+          const transient = error.kind === 'network' || error.kind === 'timeout' ||
+            (error.kind === 'http' && [408, 429, 500, 502, 503, 504].includes(error.status));
+          if (!transient || attempt >= retryLimit || signal?.aborted) throw error;
+          task.warn('retry', '读取暂时失败，稍后重试', { attempt: attempt + 1, kind: error.kind, status: error.status });
+          await new Promise((resolve, reject) => {
+            const abort = () => { clearTimeout(timer); signal?.removeEventListener('abort', abort); reject(requestError('aborted', '请求已取消')); };
+            const timer = setTimeout(() => { signal?.removeEventListener('abort', abort); resolve(); }, 1000 * 2 ** attempt);
+            signal?.addEventListener('abort', abort, { once: true });
+            if (signal?.aborted) abort();
+          });
+        }
+      }
+    } catch (error) {
+      if (error.kind === 'aborted') task.cancel();
+      else task.fail(error, { kind: error.kind, status: error.status });
+      throw error;
+    }
+  }
+  function gmRequestAttempt(url, { signal, timeout = 20000, probe = false, ...options } = {}) {
     return new Promise((resolve, reject) => {
       let handle;
       let settled = false;
@@ -9,8 +36,8 @@
         if (settled) return;
         settled = true;
         signal?.removeEventListener('abort', abort);
-        if (error) { task.fail(error); reject(error); }
-        else { task.end('请求完成', { status: value.status }); resolve(value); }
+        if (error) reject(error);
+        else resolve(value);
       };
       const abort = () => { finish(requestError('aborted', '请求已取消')); handle?.abort(); };
       if (signal?.aborted) { abort(); return; }

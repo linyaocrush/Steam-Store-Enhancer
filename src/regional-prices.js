@@ -52,7 +52,7 @@
   async function getAppPrice(appid, cc, currencyFallback) {
     const url = 'https://store.steampowered.com/api/appdetails?appids=' + appid + '&cc=' + cc + '&filters=price_overview,is_free';
     const signal = regionalScope?.signal;
-    const text = await requestQueue.enqueue(() => gmGet(url, { signal }), { signal });
+    const text = await requestQueue.enqueue(() => gmGet(url, { signal, retries: 2 }), { signal });
     const parsed = JSON.parse(text);
     const block = parsed && parsed[String(appid)];
     if (!block || !block.success) return null;
@@ -79,7 +79,7 @@
       };
       const url = 'https://api.steampowered.com/IStoreBrowseService/GetItems/v1/?input_json=' + encodeURIComponent(JSON.stringify(payload));
       const signal = regionalScope?.signal;
-      const text = await requestQueue.enqueue(() => gmGet(url, { signal }), { signal });
+      const text = await requestQueue.enqueue(() => gmGet(url, { signal, retries: 2 }), { signal });
       const parsed = JSON.parse(text);
       const items = validateStoreItems(parsed);
       if (items && items.length > 0) {
@@ -106,7 +106,7 @@
     try {
       const url = 'https://store.steampowered.com/api/packagedetails?packageids=' + packageid + '&cc=' + cc;
       const signal = regionalScope?.signal;
-      const text = await requestQueue.enqueue(() => gmGet(url, { signal }), { signal });
+      const text = await requestQueue.enqueue(() => gmGet(url, { signal, retries: 2 }), { signal });
       const parsed = JSON.parse(text);
       const block = parsed && parsed[String(packageid)];
       if (!block || !block.success) return null;
@@ -116,8 +116,8 @@
         currency: p.currency || currencyFallback,
         final: p.final,
         initial: p.initial,
-        finalFormatted: p.final_formatted,
-        initialFormatted: p.initial_formatted,
+        finalFormatted: p.final_formatted || formatMinorToCurrency(p.final, p.currency || currencyFallback),
+        initialFormatted: p.initial_formatted || formatMinorToCurrency(p.initial, p.currency || currencyFallback),
         discountPercent: p.discount_percent
       });
     } catch (e) {
@@ -140,7 +140,7 @@
     };
     const url = 'https://api.steampowered.com/IStoreBrowseService/GetItems/v1/?input_json=' + encodeURIComponent(JSON.stringify(payload));
     const signal = regionalScope?.signal;
-    const text = await requestQueue.enqueue(() => gmGet(url, { signal }), { signal });
+    const text = await requestQueue.enqueue(() => gmGet(url, { signal, retries: 2 }), { signal });
     const parsed = JSON.parse(text);
     const items = validateStoreItems(parsed);
     if (!items || !items.length) return null;
