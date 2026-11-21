@@ -258,18 +258,39 @@
     badge.setAttribute(MARK_ATTR, region.id);
   }
 
+  function inferCartItem(row) {
+    // The capsule links to the cart item. Other links can point to included apps
+    // or to a different edition suggested by Steam.
+    const capsule = row.querySelector(CART_ITEM_CAPSULE);
+    for (const [type, attr] of [['bundle', 'data-ds-bundleid'], ['package', 'data-ds-packageid']]) {
+      const ref = itemRef(type, row.getAttribute(attr)) || itemRef(type, capsule?.getAttribute(attr));
+      if (ref) return ref;
+    }
+    if (capsule) return itemFromLink(capsule.getAttribute('href'));
+    return itemRef('app', row.getAttribute('data-ds-appid')) ||
+      itemRef('app', row.getAttribute('data-app-id')) || inferItemFromScope(row);
+  }
+
+  function inferRegionalPriceItem(priceEl) {
+    if (isCartPage()) {
+      const row = priceEl.closest(CART_ITEM_ROW) || priceEl.closest(CART_ITEM_WRAPPER);
+      if (row) return inferCartItem(row);
+    }
+    return inferItemFromScope(priceEl);
+  }
+
   async function enhancePriceElement(priceEl, forceType = 'auto') {
     if (!priceEl || priceEl.nodeType !== 1 || priceEl.classList.contains(EXTRA_CLASS)) return;
     if (pendingElements.has(priceEl)) return;
     const txt = priceEl.textContent.trim();
     if (!txt || /^-\d+%$/.test(txt) || txt.length > 120) return;
     const region = getTargetRegion();
-    const item = inferItemFromScope(priceEl);
-    if (!item) return;
-    const identity = itemKey(item) + ':' + region.id;
+    const item = inferRegionalPriceItem(priceEl);
+    const identity = item ? itemKey(item) + ':' + region.id : null;
     if (enhancedItems.get(priceEl) !== identity) {
       priceEl.querySelectorAll('.' + EXTRA_CLASS + ', .sapx-region-locked').forEach(node => node.remove());
     }
+    if (!item) return;
     const exist = priceEl.querySelector('.' + EXTRA_CLASS);
     if (exist && exist.getAttribute(MARK_ATTR) === region.id) return;
 
@@ -283,7 +304,7 @@
     try { price = await getPriceForItem(item, region); }
     finally { pendingElements.delete(priceEl); }
     if (!priceEl.isConnected || scope?.active === false || getTargetRegion().id !== region.id) return;
-    const current = inferItemFromScope(priceEl);
+    const current = inferRegionalPriceItem(priceEl);
     if (!current || itemKey(current) !== itemKey(item)) { scheduleScan(); return; }
     enhancedItems.set(priceEl, identity);
     if (!price || !price.ok) {
@@ -300,41 +321,55 @@
     regionalLog.debug('render.price', '地区价格已显示', { item, region: region.id, kind: wantInitial ? 'initial' : 'final' });
   }
 
+  function getRegionalCartRows() {
+    // Steam's outer button also wraps skeletons and the empty-cart message.
+    // Count each real row once, with a fallback for the older cart markup.
+    return Array.from(document.querySelectorAll(PAGE_ADAPTERS.cart.rows)).filter(row =>
+      row.matches(CART_ITEM_ROW) || (!row.querySelector(CART_ITEM_ROW) &&
+        Boolean(row.querySelector(CART_ITEM_PRICES))));
+  }
+
   async function updateCartSummary() {
     if (!isCartPage()) return;
     const revision = ++summaryRevision;
     const scope = regionalScope;
     const path = location.pathname;
     const region = getTargetRegion();
-    const itemNodes = document.querySelectorAll('.i-xXuvHLioU-[role="button"]');
-    const items = itemNodes.length ? itemNodes : document.querySelectorAll('.bKkQiLkI-vk-');
+    const items = getRegionalCartRows();
     const totalValue = Array.from(document.querySelectorAll('.i1XZFikuzME- .n9HLAjXXhvI-'))
       .find(element => element.getClientRects().length > 0) || document.querySelector('.i1XZFikuzME- .n9HLAjXXhvI-');
     const totalRow = totalValue?.closest('._1mIUrXeHG3k-') || Array.from(document.querySelectorAll('.i1XZFikuzME- > div'))
       .find(row => /预计总额/.test(row.textContent));
     if (!items.length || !totalRow) {
+      document.getElementById(CART_SUMMARY_ID)?.remove();
       regionalLog.debug('summary.wait', '购物车汇总等待页面节点', { items: items.length, totalRow: Boolean(totalRow) });
-      scheduleCartSummaryRetry();
+      if (items.length) scheduleCartSummaryRetry();
       return;
     }
 
     let sumMinor = 0;
     let missingCount = 0;
 
-    const refs = Array.from(items, row => inferItemFromScope(row));
+    const refs = items.map(inferCartItem);
     const results = await Promise.all(refs.map(async item => {
-      if (!item) return { unknown: true };
+      if (!item) return {};
       try { return { price: await getPriceForItem(item, region) }; }
-      catch (_) { return { unknown: true }; }
+      catch (_) { return { failed: true }; }
     }));
     if (revision !== summaryRevision || scope?.active === false || location.pathname !== path ||
-        getTargetRegion().id !== region.id || !totalRow.isConnected ||
-        Array.from(items).some((row, i) => !row.isConnected || itemKey(inferItemFromScope(row) || {}) !== itemKey(refs[i] || {}))) return;
-    let unknownCount = 0;
+        getTargetRegion().id !== region.id || !totalRow.isConnected) return;
+    const currentRows = getRegionalCartRows();
+    if (currentRows.length !== items.length || currentRows.some((row, i) => row !== items[i] ||
+        itemKey(inferCartItem(row) || {}) !== itemKey(refs[i] || {}))) return;
+    const unidentified = refs.filter(item => !item).length;
+    let failed = 0;
+    let priced = 0;
     for (const result of results) {
-      if (result.unknown) unknownCount++;
-      else if (result.price?.ok && Number.isFinite(result.price.final)) sumMinor += result.price.final;
-      else missingCount++;
+      if (result.failed) failed++;
+      else if (result.price?.ok && Number.isFinite(result.price.final)) {
+        sumMinor += result.price.final;
+        priced++;
+      } else if (result.price === null) missingCount++;
     }
 
     let box = document.getElementById(CART_SUMMARY_ID);
@@ -344,8 +379,10 @@
       totalRow.after(box);
     }
 
-    const totalText = formatMinorToCurrency(sumMinor, region.currency);
-    const label = getShowRegionCode() ? '目标地区预计付款 (' + region.short + ')' : '目标地区预计付款';
+    const totalText = priced ? formatMinorToCurrency(sumMinor, region.currency) : '—';
+    const unknownCount = unidentified + failed;
+    const title = priced && priced < items.length ? '目标地区已确认小计' : '目标地区预计付款';
+    const label = getShowRegionCode() ? title + ' (' + region.short + ')' : title;
 
     let html = '<div class="sapx-row"><div class="sapx-label">' + label + '：</div><div class="sapx-value">' + totalText + '</div></div>';
     if (missingCount > 0) html += '<div class="sapx-warn">目标地区有 ' + missingCount + ' 款锁区游戏，未计入小计</div>';
@@ -355,6 +392,9 @@
       region: region.id,
       total: totalText,
       items: items.length,
+      priced,
+      unidentified,
+      failed,
       missing: missingCount
     });
   }
@@ -383,7 +423,7 @@
 
   function scanCartFallback(rows, enhance = enhancePriceElement) {
     rows.forEach(row => {
-      row.querySelectorAll('.StoreOriginalPrice, .j3jr1YqpBGk- > .-nS4ZC0Bruo-')
+      row.querySelectorAll(CART_ITEM_PRICES)
         .forEach(price => enhance(price));
     });
   }

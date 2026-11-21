@@ -5,7 +5,7 @@
 // @homepageURL  https://github.com/linyaocrush/Steam-Store-Enhancer
 // @downloadURL  https://raw.githubusercontent.com/linyaocrush/Steam-Store-Enhancer/main/Steam%20Store%20Enhancer.user.js
 // @updateURL    https://raw.githubusercontent.com/linyaocrush/Steam-Store-Enhancer/main/Steam%20Store%20Enhancer.user.js
-// @version      1.8.0
+// @version      1.8.5
 // @description  Steam 额外地区价格、汇率转换、快速加购、愿望单及商店列表折扣倒计时、购物车批量管理与家庭库游戏标记。
 // @author       linyaocrush, marioplus, Chr_, Cliencer Goge, Miku39
 // @license      AGPL-3.0
@@ -317,6 +317,11 @@
   const featureScopes = new Map();
   const SCRIPT_OWNED_SELECTOR = '#sapx-ui-root, #sapx-cart-summary, #sse-cart-tools, .sse-cart-dialog, #sse-family-dialog, #sse-family-chart-tooltip, #sse-family-nav, #sse-cart-extract, #sse-friend-tools, .sapx-extra-price, .sapx-region-locked, .sse-family-badge, .sse-family-banner, .sse-quick-add, .sse-restriction-badge, .sse-wishlist-sale-expiration';
 
+  function isStorePageReady() {
+    const page = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
+    return location.hostname !== 'store.steampowered.com' || !page.SSR || Boolean(page.SSR.hydrated);
+  }
+
   function createFeatureScope(name) {
     featureScopes.get(name)?.dispose();
     const disposers = new Set();
@@ -464,10 +469,14 @@
   }
 
   // ---- pages.js ----
+  const CART_ITEM_ROW = '.bKkQiLkI-vk-';
+  const CART_ITEM_WRAPPER = '.i-xXuvHLioU-[role="button"]';
+  const CART_ITEM_CAPSULE = 'a.wuZBJ1ixmBQ-[href], ._7RJqaqzA6VI- a[href]';
+  const CART_ITEM_PRICES = '.StoreOriginalPrice, .j3jr1YqpBGk- > .-nS4ZC0Bruo-';
   const PAGE_ADAPTERS = Object.freeze({
     wishlist: { rows: '.wishlist_row, .wishlistRowItem, [data-rfd-draggable-id^="WishlistItem-"], .Panel div[data-index]' },
     storeSale: { rows: 'a.search_result_row, a.tab_item, a.tab_row_item, a.recommendation_link, .store_main_capsule, .store_capsule, .small_cap, .large_cap, [data-ds-appid], [data-app-id]' },
-    cart: { rows: '.i-xXuvHLioU-[role="button"], .bKkQiLkI-vk-', total: '.i1XZFikuzME- .n9HLAjXXhvI-', anchors: '.i1XZFikuzME-, a[href*="checkout.steampowered.com/checkout"]' },
+    cart: { rows: CART_ITEM_ROW + ', ' + CART_ITEM_WRAPPER, total: '.i1XZFikuzME- .n9HLAjXXhvI-', anchors: '.i1XZFikuzME-, a[href*="checkout.steampowered.com/checkout"]' },
     quick: { rows: 'a.search_result_row, a.tab_item, a.recommendation_link, .wishlist_row, [data-rfd-draggable-id^="WishlistItem-"], .game_purchase_action' },
     family: { rows: 'a[href*="/app/"], [data-ds-appid], [data-app-id], [data-rfd-draggable-id^="WishlistItem-"]',
       anchors: '#wishlist_link, #store_nav_wishlist_link, a[href*="/wishlist"], .queue_and_playtime, #game_area_purchase, .game_area_purchase, #game_score' },
@@ -655,9 +664,36 @@
 
   // ---- network.js ----
   function requestError(kind, message, status) { return Object.assign(new Error(message), { kind, ...(status == null ? {} : { status }) }); }
-  function gmRequest(url, { signal, timeout = 20000, probe = false, ...options } = {}) {
+  async function gmRequest(url, { signal, retries = 0, ...options } = {}) {
     const address = new URL(url);
     const task = diagnostics.scope('network').begin('request', { method: options.method || 'GET', endpoint: address.origin + address.pathname });
+    const retryLimit = (options.method || 'GET').toUpperCase() === 'GET' && Number.isInteger(retries) ? Math.max(0, Math.min(retries, 2)) : 0;
+    try {
+      for (let attempt = 0; ; attempt++) {
+        try {
+          const response = await gmRequestAttempt(url, { ...options, signal });
+          task.end('请求完成', { status: response.status });
+          return response;
+        } catch (error) {
+          const transient = error.kind === 'network' || error.kind === 'timeout' ||
+            (error.kind === 'http' && [408, 429, 500, 502, 503, 504].includes(error.status));
+          if (!transient || attempt >= retryLimit || signal?.aborted) throw error;
+          task.warn('retry', '读取暂时失败，稍后重试', { attempt: attempt + 1, kind: error.kind, status: error.status });
+          await new Promise((resolve, reject) => {
+            const abort = () => { clearTimeout(timer); signal?.removeEventListener('abort', abort); reject(requestError('aborted', '请求已取消')); };
+            const timer = setTimeout(() => { signal?.removeEventListener('abort', abort); resolve(); }, 1000 * 2 ** attempt);
+            signal?.addEventListener('abort', abort, { once: true });
+            if (signal?.aborted) abort();
+          });
+        }
+      }
+    } catch (error) {
+      if (error.kind === 'aborted') task.cancel();
+      else task.fail(error, { kind: error.kind, status: error.status });
+      throw error;
+    }
+  }
+  function gmRequestAttempt(url, { signal, timeout = 20000, probe = false, ...options } = {}) {
     return new Promise((resolve, reject) => {
       let handle;
       let settled = false;
@@ -665,8 +701,8 @@
         if (settled) return;
         settled = true;
         signal?.removeEventListener('abort', abort);
-        if (error) { task.fail(error); reject(error); }
-        else { task.end('请求完成', { status: value.status }); resolve(value); }
+        if (error) reject(error);
+        else resolve(value);
       };
       const abort = () => { finish(requestError('aborted', '请求已取消')); handle?.abort(); };
       if (signal?.aborted) { abort(); return; }
@@ -1045,7 +1081,7 @@
   async function getAppPrice(appid, cc, currencyFallback) {
     const url = 'https://store.steampowered.com/api/appdetails?appids=' + appid + '&cc=' + cc + '&filters=price_overview,is_free';
     const signal = regionalScope?.signal;
-    const text = await requestQueue.enqueue(() => gmGet(url, { signal }), { signal });
+    const text = await requestQueue.enqueue(() => gmGet(url, { signal, retries: 2 }), { signal });
     const parsed = JSON.parse(text);
     const block = parsed && parsed[String(appid)];
     if (!block || !block.success) return null;
@@ -1072,7 +1108,7 @@
       };
       const url = 'https://api.steampowered.com/IStoreBrowseService/GetItems/v1/?input_json=' + encodeURIComponent(JSON.stringify(payload));
       const signal = regionalScope?.signal;
-      const text = await requestQueue.enqueue(() => gmGet(url, { signal }), { signal });
+      const text = await requestQueue.enqueue(() => gmGet(url, { signal, retries: 2 }), { signal });
       const parsed = JSON.parse(text);
       const items = validateStoreItems(parsed);
       if (items && items.length > 0) {
@@ -1099,7 +1135,7 @@
     try {
       const url = 'https://store.steampowered.com/api/packagedetails?packageids=' + packageid + '&cc=' + cc;
       const signal = regionalScope?.signal;
-      const text = await requestQueue.enqueue(() => gmGet(url, { signal }), { signal });
+      const text = await requestQueue.enqueue(() => gmGet(url, { signal, retries: 2 }), { signal });
       const parsed = JSON.parse(text);
       const block = parsed && parsed[String(packageid)];
       if (!block || !block.success) return null;
@@ -1109,8 +1145,8 @@
         currency: p.currency || currencyFallback,
         final: p.final,
         initial: p.initial,
-        finalFormatted: p.final_formatted,
-        initialFormatted: p.initial_formatted,
+        finalFormatted: p.final_formatted || formatMinorToCurrency(p.final, p.currency || currencyFallback),
+        initialFormatted: p.initial_formatted || formatMinorToCurrency(p.initial, p.currency || currencyFallback),
         discountPercent: p.discount_percent
       });
     } catch (e) {
@@ -1133,7 +1169,7 @@
     };
     const url = 'https://api.steampowered.com/IStoreBrowseService/GetItems/v1/?input_json=' + encodeURIComponent(JSON.stringify(payload));
     const signal = regionalScope?.signal;
-    const text = await requestQueue.enqueue(() => gmGet(url, { signal }), { signal });
+    const text = await requestQueue.enqueue(() => gmGet(url, { signal, retries: 2 }), { signal });
     const parsed = JSON.parse(text);
     const items = validateStoreItems(parsed);
     if (!items || !items.length) return null;
@@ -1251,18 +1287,39 @@
     badge.setAttribute(MARK_ATTR, region.id);
   }
 
+  function inferCartItem(row) {
+    // The capsule links to the cart item. Other links can point to included apps
+    // or to a different edition suggested by Steam.
+    const capsule = row.querySelector(CART_ITEM_CAPSULE);
+    for (const [type, attr] of [['bundle', 'data-ds-bundleid'], ['package', 'data-ds-packageid']]) {
+      const ref = itemRef(type, row.getAttribute(attr)) || itemRef(type, capsule?.getAttribute(attr));
+      if (ref) return ref;
+    }
+    if (capsule) return itemFromLink(capsule.getAttribute('href'));
+    return itemRef('app', row.getAttribute('data-ds-appid')) ||
+      itemRef('app', row.getAttribute('data-app-id')) || inferItemFromScope(row);
+  }
+
+  function inferRegionalPriceItem(priceEl) {
+    if (isCartPage()) {
+      const row = priceEl.closest(CART_ITEM_ROW) || priceEl.closest(CART_ITEM_WRAPPER);
+      if (row) return inferCartItem(row);
+    }
+    return inferItemFromScope(priceEl);
+  }
+
   async function enhancePriceElement(priceEl, forceType = 'auto') {
     if (!priceEl || priceEl.nodeType !== 1 || priceEl.classList.contains(EXTRA_CLASS)) return;
     if (pendingElements.has(priceEl)) return;
     const txt = priceEl.textContent.trim();
     if (!txt || /^-\d+%$/.test(txt) || txt.length > 120) return;
     const region = getTargetRegion();
-    const item = inferItemFromScope(priceEl);
-    if (!item) return;
-    const identity = itemKey(item) + ':' + region.id;
+    const item = inferRegionalPriceItem(priceEl);
+    const identity = item ? itemKey(item) + ':' + region.id : null;
     if (enhancedItems.get(priceEl) !== identity) {
       priceEl.querySelectorAll('.' + EXTRA_CLASS + ', .sapx-region-locked').forEach(node => node.remove());
     }
+    if (!item) return;
     const exist = priceEl.querySelector('.' + EXTRA_CLASS);
     if (exist && exist.getAttribute(MARK_ATTR) === region.id) return;
 
@@ -1276,7 +1333,7 @@
     try { price = await getPriceForItem(item, region); }
     finally { pendingElements.delete(priceEl); }
     if (!priceEl.isConnected || scope?.active === false || getTargetRegion().id !== region.id) return;
-    const current = inferItemFromScope(priceEl);
+    const current = inferRegionalPriceItem(priceEl);
     if (!current || itemKey(current) !== itemKey(item)) { scheduleScan(); return; }
     enhancedItems.set(priceEl, identity);
     if (!price || !price.ok) {
@@ -1293,41 +1350,55 @@
     regionalLog.debug('render.price', '地区价格已显示', { item, region: region.id, kind: wantInitial ? 'initial' : 'final' });
   }
 
+  function getRegionalCartRows() {
+    // Steam's outer button also wraps skeletons and the empty-cart message.
+    // Count each real row once, with a fallback for the older cart markup.
+    return Array.from(document.querySelectorAll(PAGE_ADAPTERS.cart.rows)).filter(row =>
+      row.matches(CART_ITEM_ROW) || (!row.querySelector(CART_ITEM_ROW) &&
+        Boolean(row.querySelector(CART_ITEM_PRICES))));
+  }
+
   async function updateCartSummary() {
     if (!isCartPage()) return;
     const revision = ++summaryRevision;
     const scope = regionalScope;
     const path = location.pathname;
     const region = getTargetRegion();
-    const itemNodes = document.querySelectorAll('.i-xXuvHLioU-[role="button"]');
-    const items = itemNodes.length ? itemNodes : document.querySelectorAll('.bKkQiLkI-vk-');
+    const items = getRegionalCartRows();
     const totalValue = Array.from(document.querySelectorAll('.i1XZFikuzME- .n9HLAjXXhvI-'))
       .find(element => element.getClientRects().length > 0) || document.querySelector('.i1XZFikuzME- .n9HLAjXXhvI-');
     const totalRow = totalValue?.closest('._1mIUrXeHG3k-') || Array.from(document.querySelectorAll('.i1XZFikuzME- > div'))
       .find(row => /预计总额/.test(row.textContent));
     if (!items.length || !totalRow) {
+      document.getElementById(CART_SUMMARY_ID)?.remove();
       regionalLog.debug('summary.wait', '购物车汇总等待页面节点', { items: items.length, totalRow: Boolean(totalRow) });
-      scheduleCartSummaryRetry();
+      if (items.length) scheduleCartSummaryRetry();
       return;
     }
 
     let sumMinor = 0;
     let missingCount = 0;
 
-    const refs = Array.from(items, row => inferItemFromScope(row));
+    const refs = items.map(inferCartItem);
     const results = await Promise.all(refs.map(async item => {
-      if (!item) return { unknown: true };
+      if (!item) return {};
       try { return { price: await getPriceForItem(item, region) }; }
-      catch (_) { return { unknown: true }; }
+      catch (_) { return { failed: true }; }
     }));
     if (revision !== summaryRevision || scope?.active === false || location.pathname !== path ||
-        getTargetRegion().id !== region.id || !totalRow.isConnected ||
-        Array.from(items).some((row, i) => !row.isConnected || itemKey(inferItemFromScope(row) || {}) !== itemKey(refs[i] || {}))) return;
-    let unknownCount = 0;
+        getTargetRegion().id !== region.id || !totalRow.isConnected) return;
+    const currentRows = getRegionalCartRows();
+    if (currentRows.length !== items.length || currentRows.some((row, i) => row !== items[i] ||
+        itemKey(inferCartItem(row) || {}) !== itemKey(refs[i] || {}))) return;
+    const unidentified = refs.filter(item => !item).length;
+    let failed = 0;
+    let priced = 0;
     for (const result of results) {
-      if (result.unknown) unknownCount++;
-      else if (result.price?.ok && Number.isFinite(result.price.final)) sumMinor += result.price.final;
-      else missingCount++;
+      if (result.failed) failed++;
+      else if (result.price?.ok && Number.isFinite(result.price.final)) {
+        sumMinor += result.price.final;
+        priced++;
+      } else if (result.price === null) missingCount++;
     }
 
     let box = document.getElementById(CART_SUMMARY_ID);
@@ -1337,8 +1408,10 @@
       totalRow.after(box);
     }
 
-    const totalText = formatMinorToCurrency(sumMinor, region.currency);
-    const label = getShowRegionCode() ? '目标地区预计付款 (' + region.short + ')' : '目标地区预计付款';
+    const totalText = priced ? formatMinorToCurrency(sumMinor, region.currency) : '—';
+    const unknownCount = unidentified + failed;
+    const title = priced && priced < items.length ? '目标地区已确认小计' : '目标地区预计付款';
+    const label = getShowRegionCode() ? title + ' (' + region.short + ')' : title;
 
     let html = '<div class="sapx-row"><div class="sapx-label">' + label + '：</div><div class="sapx-value">' + totalText + '</div></div>';
     if (missingCount > 0) html += '<div class="sapx-warn">目标地区有 ' + missingCount + ' 款锁区游戏，未计入小计</div>';
@@ -1348,6 +1421,9 @@
       region: region.id,
       total: totalText,
       items: items.length,
+      priced,
+      unidentified,
+      failed,
       missing: missingCount
     });
   }
@@ -1376,7 +1452,7 @@
 
   function scanCartFallback(rows, enhance = enhancePriceElement) {
     rows.forEach(row => {
-      row.querySelectorAll('.StoreOriginalPrice, .j3jr1YqpBGk- > .-nS4ZC0Bruo-')
+      row.querySelectorAll(CART_ITEM_PRICES)
         .forEach(price => enhance(price));
     });
   }
@@ -1814,6 +1890,13 @@ static readString(jsonString, cls) {
   }
   const countyInfos = Jsons.readJson(countyObjs, Array).sort((a, b) => a.name.localeCompare(b.name));
   const countyCode2Info = new Map(countyInfos.map((v) => [v.code, v]));
+  function sourceCountryInfo(code) {
+    const country = String(code || '').trim().toUpperCase();
+    const direct = countyCode2Info.get(country);
+    if (direct) return direct;
+    const region = REGIONS.find(region => region.ccCandidates.includes(country));
+    return region && countyInfos.find(info => info.currencyCode === region.currency);
+  }
   const { SettingManager, storage: GmUtils } = createConversionSettings({ Jsons, countyCode2Info });
   class Attrs {
     static STATUS_KEY = "data-spc-status";
@@ -2201,14 +2284,13 @@ targets = new Map([
     });
     const task = log.begin('initialize', undefined, 'info');
     try {
-      // SSR text must stay intact until React has adopted the server-rendered cart.
-      if (isCartPage() && _unsafeWindow.SSR) {
-        task.debug('hydrate.wait', '等待购物车页面接管服务端内容');
-        const deadline = Date.now() + 15000;
-        while (scope.active && !_unsafeWindow.SSR.hydrated && Date.now() < deadline) {
+      // A timeout is not proof that React has adopted the server-rendered text.
+      if (!isStorePageReady()) {
+        task.debug('hydrate.wait', '等待商店页面接管服务端内容');
+        while (scope.active && !isStorePageReady()) {
           if (!await scope.wait(100)) return;
         }
-        task.debug('hydrate.ready', '结束页面就绪等待', { hydrated: Boolean(_unsafeWindow.SSR.hydrated) });
+        task.debug('hydrate.ready', '页面已接管服务端内容');
       }
       await initContext();
       if (!scope.active) return;
@@ -2260,7 +2342,7 @@ targets = new Map([
     if (currCountyCode) {
       log.debug('context.country', '账号区域已就绪', { country: currCountyCode });
     }
-    let currCountInfo = countyCode2Info.get(currCountyCode);
+    let currCountInfo = sourceCountryInfo(currCountyCode);
     if (!currCountInfo) {
       log.warn('context.source-fallback', '当前区域缺少映射，使用美国', { country: currCountyCode });
       currCountInfo = countyCode2Info.get("US");
@@ -4315,7 +4397,8 @@ targets = new Map([
       const changes = [];
       for (const feature of FEATURE_DEFINITIONS) {
         const enabled = !feature.key || settings[feature.key];
-        const active = feature.match() && enabled;
+        // Do not modify server HTML before Steam's React root has adopted it.
+        const active = feature.match() && enabled && isStorePageReady();
         // Family initialization also owns its management UI, so its switches restart it
         // without preventing initialization when marking is disabled.
         const familySettings = feature.name === 'family'
