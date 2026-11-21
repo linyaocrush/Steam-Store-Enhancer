@@ -27,7 +27,7 @@ test('cart summary requests all items concurrently and discards obsolete results
   const totalRow = { isConnected: true, after() { inserted++; } };
   const total = { getClientRects: () => [1], closest: () => totalRow };
   const box = { isConnected: true, innerHTML: '' };
-  const { context, document } = await harness(['regional-prices.js'], {
+  const { context, document } = await harness(['bundle-prices.js', 'regional-prices.js'], {
     isCartPage: () => true, getTargetRegion: () => region, getShowRegionCode: () => true,
     CART_SUMMARY_ID: 'summary', EXTRA_CLASS: 'sapx-extra-price'
   });
@@ -62,7 +62,7 @@ test('cart summary and displayed prices use the cart capsule instead of unrelate
   const totalRow = { isConnected: true };
   const total = { getClientRects: () => [1], closest: () => totalRow };
   const box = { isConnected: true, innerHTML: '' };
-  const { context, document } = await harness(['regional-prices.js'], {
+  const { context, document } = await harness(['bundle-prices.js', 'regional-prices.js'], {
     isCartPage: () => true, getTargetRegion: () => region, getShowRegionCode: () => true,
     CART_SUMMARY_ID: 'summary'
   });
@@ -88,7 +88,7 @@ test('cart summary distinguishes unidentified rows, failed queries, and actual z
   const total = { getClientRects: () => [1], closest: () => totalRow };
   let removed = false;
   const box = { isConnected: true, innerHTML: '', remove() { removed = true; } };
-  const { context, document } = await harness(['regional-prices.js'], {
+  const { context, document } = await harness(['bundle-prices.js', 'regional-prices.js'], {
     isCartPage: () => true, getTargetRegion: () => ({ id: 'CNY', short: 'CN', currency: 'CNY' }),
     getShowRegionCode: () => false, CART_SUMMARY_ID: 'summary'
   });
@@ -117,7 +117,7 @@ test('cart summary distinguishes unidentified rows, failed queries, and actual z
 
 test('temporary regional network failure is not cached or labeled as confirmed unavailability', async () => {
   let calls = 0;
-  const { context } = await harness(['network.js', 'regional-prices.js']);
+  const { context } = await harness(['network.js', 'bundle-prices.js', 'regional-prices.js']);
   context.requestPrice = async () => { calls++; throw Error('offline'); };
   vm.runInContext('getAppPrice = requestPrice;', context);
   const item = { type: 'app', id: '10' }, region = { id: 'USD', currency: 'USD', ccCandidates: ['US'] };
@@ -139,7 +139,7 @@ test('extra cart price is rendered for an ambiguous bundle and follows a replace
     querySelectorAll: () => extra ? [extra] : [],
     appendChild(node) { extra = node; }
   };
-  const { context, document } = await harness(['regional-prices.js'], {
+  const { context, document } = await harness(['bundle-prices.js', 'regional-prices.js'], {
     isCartPage: () => true, getTargetRegion: () => ({ id: 'CNY', short: 'CN' }),
     getShowRegionCode: () => true, EXTRA_CLASS: 'sapx-extra-price', MARK_ATTR: 'data-region'
   });

@@ -160,18 +160,27 @@
     const initialMinor = parseInt(po.original_price_in_cents, 10);
     if (!Number.isFinite(finalMinor)) return null;
 
-    return normalizePrice({
+    const fullPrice = normalizePrice({
       currency: po.currency_code || currencyFallback,
-      final: finalMinor,
-      initial: Number.isFinite(initialMinor) ? initialMinor : finalMinor,
+      final: Math.round(finalMinor * Math.pow(10, getCurrencyFractionDigits(currencyFallback)) / 100),
+      initial: Math.round((Number.isFinite(initialMinor) ? initialMinor : finalMinor) * Math.pow(10, getCurrencyFractionDigits(currencyFallback)) / 100),
       finalFormatted: po.formatted_final_price,
       initialFormatted: po.formatted_original_price || po.formatted_final_price,
       discountPercent: po.discount_pct
     });
+    return personalizeRegionalBundle(bundleid, cc, currencyFallback, po, fullPrice);
+  }
+
+  let bundleCartRevision = 0;
+  function regionalPriceKey(item, region) {
+    const base = item.type + ':' + item.id + ':' + region.id;
+    if (item.type !== 'bundle') return base;
+    return base + ':' + (regionalBundleSession().steamid || 'anonymous') + ':' +
+      (isCartPage() ? 'cart:' + bundleCartRevision : 'store');
   }
 
   function getPriceForItem(item, region) {
-    const key = item.type + ':' + item.id + ':' + region.id;
+    const key = regionalPriceKey(item, region);
     if (pendingPrices.has(key)) { regionalLog.debug('price.join', '复用进行中的价格查询', { item: key }); return pendingPrices.get(key); }
     const pending = fetchPriceForItem(item, region).finally(() => { if (pendingPrices.get(key) === pending) pendingPrices.delete(key); });
     pendingPrices.set(key, pending);
@@ -179,7 +188,7 @@
   }
 
   async function fetchPriceForItem(item, region) {
-    const key = item.type + ':' + item.id + ':' + region.id;
+    const key = regionalPriceKey(item, region);
     const cached = cacheGet(key);
     if (cached !== undefined) { regionalLog.debug('cache.hit', '命中价格缓存', { item: key }); return cached; }
     const task = regionalLog.begin('price.fetch', { item: key });
@@ -230,9 +239,10 @@
     return false;
   }
 
-  function upsertExtraInside(priceEl, region, formatted) {
+  function upsertExtraInside(priceEl, region, formatted, price) {
     let span = priceEl.querySelector('.' + EXTRA_CLASS);
-    const text = getShowRegionCode() ? '(' + region.short + ' ' + formatted + ')' : '(' + formatted + ')';
+    const kind = price?.completion ? '预计补齐 ' : price?.fullBundle ? '整包 ' : '';
+    const text = '(' + (getShowRegionCode() ? region.short + ' ' : '') + kind + formatted + ')';
     if (!span) {
       span = document.createElement('span');
       span.className = EXTRA_CLASS;
@@ -286,7 +296,7 @@
     if (!txt || /^-\d+%$/.test(txt) || txt.length > 120) return;
     const region = getTargetRegion();
     const item = inferRegionalPriceItem(priceEl);
-    const identity = item ? itemKey(item) + ':' + region.id : null;
+    const identity = item ? regionalPriceKey(item, region) : null;
     if (enhancedItems.get(priceEl) !== identity) {
       priceEl.querySelectorAll('.' + EXTRA_CLASS + ', .sapx-region-locked').forEach(node => node.remove());
     }
@@ -305,7 +315,7 @@
     finally { pendingElements.delete(priceEl); }
     if (!priceEl.isConnected || scope?.active === false || getTargetRegion().id !== region.id) return;
     const current = inferRegionalPriceItem(priceEl);
-    if (!current || itemKey(current) !== itemKey(item)) { scheduleScan(); return; }
+    if (!current || regionalPriceKey(current, region) !== identity) { scheduleScan(); return; }
     enhancedItems.set(priceEl, identity);
     if (!price || !price.ok) {
       markRegionLocked(priceEl, region);
@@ -317,7 +327,7 @@
     const formatted = wantInitial ? (price.initialFormatted || price.finalFormatted) : price.finalFormatted;
     if (!formatted) return;
 
-    upsertExtraInside(priceEl, region, formatted);
+    upsertExtraInside(priceEl, region, formatted, price);
     regionalLog.debug('render.price', '地区价格已显示', { item, region: region.id, kind: wantInitial ? 'initial' : 'final' });
   }
 
@@ -364,11 +374,15 @@
     const unidentified = refs.filter(item => !item).length;
     let failed = 0;
     let priced = 0;
+    let completionCount = 0;
+    let fullBundleCount = 0;
     for (const result of results) {
       if (result.failed) failed++;
       else if (result.price?.ok && Number.isFinite(result.price.final)) {
         sumMinor += result.price.final;
         priced++;
+        if (result.price.completion) completionCount++;
+        if (result.price.fullBundle) fullBundleCount++;
       } else if (result.price === null) missingCount++;
     }
 
@@ -387,12 +401,15 @@
     let html = '<div class="sapx-row"><div class="sapx-label">' + label + '：</div><div class="sapx-value">' + totalText + '</div></div>';
     if (missingCount > 0) html += '<div class="sapx-warn">目标地区有 ' + missingCount + ' 款锁区游戏，未计入小计</div>';
     if (unknownCount > 0) html += '<div class="sapx-warn">有 ' + unknownCount + ' 项价格暂时无法确认，未计入小计</div>';
+    if (completionCount > 0) html += '<div class="sapx-warn">含 ' + completionCount + ' 项按当前账号已拥有内容计算的预计补齐价，以 Steam 结算为准</div>';
+    if (fullBundleCount > 0) html += '<div class="sapx-warn">含 ' + fullBundleCount + ' 项礼物捆绑包整包价，未按收礼人计算补齐</div>';
     if (box.innerHTML !== html) box.innerHTML = html;
     regionalLog.debug('summary.complete', '购物车额外地区汇总完成', {
       region: region.id,
       total: totalText,
       items: items.length,
       priced,
+      completion: completionCount,
       unidentified,
       failed,
       missing: missingCount
@@ -477,6 +494,9 @@
     scope.own(() => {
       summaryRevision++;
       pendingPrices.clear();
+      bundleCartCache.clear();
+      bundleOwnershipCache.clear();
+      bundleDetailsCache.clear();
       regionalScanner = null;
       cartSummaryRetry = null;
       document.querySelectorAll('.' + EXTRA_CLASS + ', .sapx-region-locked, #' + CART_SUMMARY_ID).forEach(node => node.remove());
@@ -493,6 +513,11 @@
       },
       changed: () => {
         summaryRevision++;
+        if (isCartPage()) {
+          bundleCartRevision++;
+          bundleCartCache.clear();
+          for (const key of priceCache.keys()) if (key.startsWith('bundle:')) priceCache.delete(key);
+        }
         if (isCartPage()) updateCartSummary().catch(error => regionalLog.debug('summary.failed', '汇总暂不可用', { error }));
       }
     });

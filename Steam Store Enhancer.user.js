@@ -5,7 +5,7 @@
 // @homepageURL  https://github.com/linyaocrush/Steam-Store-Enhancer
 // @downloadURL  https://raw.githubusercontent.com/linyaocrush/Steam-Store-Enhancer/main/Steam%20Store%20Enhancer.user.js
 // @updateURL    https://raw.githubusercontent.com/linyaocrush/Steam-Store-Enhancer/main/Steam%20Store%20Enhancer.user.js
-// @version      1.8.5
+// @version      1.9.1
 // @description  Steam 额外地区价格、汇率转换、快速加购、愿望单及商店列表折扣倒计时、购物车批量管理与家庭库游戏标记。
 // @author       linyaocrush, marioplus, Chr_, Cliencer Goge, Miku39
 // @license      AGPL-3.0
@@ -1026,6 +1026,174 @@
     select.focus();
   }
 
+  // ---- bundle-prices.js ----
+  function regionalBundleSession() {
+    const page = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
+    return readStoreSession(document, page);
+  }
+
+  function readBundleOwnedIds(data, key, optional = false) {
+    const value = data?.[key];
+    // Steam's subscription/auto-grant fields are optional. PHP-backed
+    // responses can also encode an empty collection as {} instead of [].
+    if (optional && value == null) return new Set();
+    const validId = id => (key === 'rgOwnedPackages' && (id === 0 || id === '0')) || Boolean(itemRef('app', id));
+    const fail = reason => {
+      regionalLog.debug('bundle.ownership.invalid', '所有权字段无法识别', {
+        field: key, reason, format: value == null ? String(value) : Array.isArray(value) ? 'array' : typeof value,
+        count: value && typeof value === 'object' ? Object.keys(value).length : undefined,
+        invalidEntryType: Array.isArray(value) ? typeof value.find(id => !validId(id)) : undefined
+      });
+      throw invalidResponse('已拥有游戏数据不完整：' + key + ' (' + reason + ')');
+    };
+    let ids;
+    if (Array.isArray(value)) ids = value;
+    else if (Object.prototype.toString.call(value) === '[object Object]') {
+      const entries = Object.entries(value);
+      if (entries.some(([id, owned]) => !validId(id) || ![true, false, 1, 0].includes(owned))) fail('ID 映射无效');
+      ids = entries.filter(([, owned]) => owned === true || owned === 1).map(([id]) => id);
+    }
+    if (!ids) fail('缺少列表');
+    if (ids.some(id => !validId(id))) fail('列表中存在无效 ID');
+    // Package 0 is a system subscription, not a purchasable bundle component.
+    // Keep real package IDs strict without rejecting the entire library.
+    return new Set(ids.filter(id => id !== 0 && id !== '0').map(id => itemRef('app', id).id));
+  }
+
+  const bundleOwnershipCache = createAsyncCache({ ttl: 300000, retryDelay: 10000, maxEntries: 4,
+    load: async (steamid, signal) => {
+      const accountid = BigInt(steamid) - 76561197960265728n;
+      if (accountid <= 0n || accountid > 4294967295n) throw invalidResponse('无法确认当前账号');
+      const { data } = await fetchJson('https://store.steampowered.com/dynamicstore/userdata/?id=' + accountid,
+        { credentials: 'include', signal });
+      const sets = { packagesKnown: data?.rgOwnedPackages != null };
+      for (const key of ['rgOwnedApps', 'rgOwnedPackages', 'rgMasterSubApps', 'rgAutoGrantApps']) {
+        sets[key] = readBundleOwnedIds(data, key, key !== 'rgOwnedApps');
+      }
+      return sets;
+    }
+  });
+
+  const bundleCartCache = createAsyncCache({ ttl: 5000, retryDelay: 1000, maxEntries: 4,
+    load: async (steamid, session, signal) => {
+      if (!session.token) throw invalidResponse('无法确认购物车捆绑包的购买用途');
+      const url = new URL('https://api.steampowered.com/IAccountCartService/GetCart/v1/');
+      url.searchParams.set('access_token', session.token);
+      const { data, headers } = await fetchJson(url.href, { signal });
+      const result = headers?.get('x-eresult');
+      if ((result && result !== '1') || (data?.response?.result != null && data.response.result !== 1)) {
+        throw invalidResponse('无法读取购物车购买用途');
+      }
+      return validateCartResponse(data, 'GetCart').cart.line_items;
+    }
+  });
+
+  async function bundlePurchaseMode(bundleid, session, signal) {
+    if (!isCartPage()) return 'self';
+    // Cart capsules have no line-item ID. When the same bundle is both a gift
+    // and a self purchase, do not guess which recipient belongs to a row.
+    const lines = (await bundleCartCache.get(session.steamid, session, signal))
+      .filter(line => String(line.bundleid) === String(bundleid));
+    if (!lines.length) throw invalidResponse('购物车捆绑包已变更');
+    const gifts = lines.filter(line => line.flags?.is_gift === true);
+    if (gifts.length && gifts.length !== lines.length) throw invalidResponse('同一捆绑包有不同收礼人，无法确认补齐价');
+    return gifts.length ? 'gift' : 'self';
+  }
+
+  async function readRegionalBundleDetails(bundleid, cc, signal) {
+    // An anonymous request keeps account-country cookies from overriding cc.
+    const html = await requestQueue.enqueue(() => gmGet('https://store.steampowered.com/bundle/' + bundleid + '/?cc=' + cc + '&l=english',
+      { signal, anonymous: true, retries: 2 }), { signal });
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    if (readStoreSession(doc).country !== cc) throw invalidResponse('捆绑包页面返回的地区不符');
+    const holder = doc.querySelector('[data-ds-bundleid="' + bundleid + '"][data-ds-bundle-data]');
+    let data;
+    try { data = JSON.parse(holder?.getAttribute('data-ds-bundle-data') || 'null'); }
+    catch (_) { throw invalidResponse('捆绑包组成数据不可解析'); }
+    const increment = Number(html.match(/SetCurrencyMinPriceIncrement\(\s*(\d+)\s*\)/)?.[1]);
+    if (!data || !Number.isSafeInteger(increment) || increment < 1) throw invalidResponse('缺少捆绑包组成或币种舍入规则');
+    return { data, increment };
+  }
+
+  const bundleDetailsCache = createAsyncCache({ ttl: 300000, retryDelay: 10000, maxEntries: 100,
+    load: (key, bundleid, cc, signal) => readRegionalBundleDetails(bundleid, cc, signal)
+  });
+
+  function selectBundleCompletionItems(details, ownership) {
+    const { data, increment } = details;
+    if (![false, 0].includes(data.m_bMustPurchaseAsSet) || data.m_bIsCommercial ||
+        !Array.isArray(data.m_rgItems) || !data.m_rgItems.length ||
+        !Number.isSafeInteger(increment) || increment < 1) throw invalidResponse('无法确认捆绑包补齐规则');
+    const remaining = [];
+    const seen = new Set();
+    for (const item of data.m_rgItems) {
+      const ref = itemRef('package', item.m_nPackageID);
+      const apps = item.m_rgIncludedAppIDs;
+      if (!ref || seen.has(ref.id) || !Array.isArray(apps) || apps.some(id => !itemRef('app', id))) {
+        throw invalidResponse('捆绑包套餐组成不完整');
+      }
+      seen.add(ref.id);
+      const owned = ownership.rgOwnedPackages.has(ref.id) || (apps.length > 0 && apps.every(id =>
+        ownership.rgOwnedApps.has(String(id)) && !ownership.rgMasterSubApps.has(String(id)) &&
+        !ownership.rgAutoGrantApps?.has(String(id))));
+      if (owned) continue;
+      if (!apps.length && ownership.packagesKnown === false) throw invalidResponse('该套餐缺少游戏列表，无法确认所有权');
+      remaining.push(item);
+    }
+    return remaining;
+  }
+
+  function calculateBundleCompletion(details, ownership, currency) {
+    const { data, increment } = details;
+    const remaining = selectBundleCompletionItems(details, ownership);
+    let initialCents = 0, finalCents = 0;
+    for (const item of remaining) {
+      // Steam supplies each package's bundle-discounted amount. Reusing it
+      // preserves package discounts and per-package rounding.
+      const base = item.m_nBasePriceInCents;
+      const final = item.m_nFinalPriceWithBundleDiscount;
+      if (!Number.isSafeInteger(base) || base < 0 || !Number.isSafeInteger(final) || final < 0 || final > base) {
+        throw invalidResponse('缺少未拥有套餐的地区价格');
+      }
+      initialCents += base;
+      finalCents += final;
+      if (!Number.isSafeInteger(initialCents) || !Number.isSafeInteger(finalCents)) throw invalidResponse('捆绑包价格超出有效范围');
+    }
+    finalCents = Math.round(finalCents / increment) * increment;
+    // Steam's *_in_cents uses hundredths even for JPY/KRW. Regional prices
+    // and the cart summary use the currency's actual minor-unit scale.
+    const scale = Math.pow(10, getCurrencyFractionDigits(currency)) / 100;
+    const initial = Math.round(initialCents * scale), final = Math.round(finalCents * scale);
+    return { ...normalizePrice({ currency, initial, final,
+      initialFormatted: formatMinorToCurrency(initial, currency), finalFormatted: formatMinorToCurrency(final, currency) }),
+      completion: true, excluded: data.m_rgItems.length - remaining.length, remaining: remaining.length };
+  }
+
+  async function personalizeRegionalBundle(bundleid, cc, currency, option, fullPrice) {
+    if (option.must_purchase_as_set === true) return fullPrice;
+    const session = regionalBundleSession();
+    if (!session.steamid || session.steamid === '0') return fullPrice;
+    if (option.must_purchase_as_set !== false) throw invalidResponse('捆绑包未返回补齐类型');
+    const signal = regionalScope?.signal;
+    if (await bundlePurchaseMode(bundleid, session, signal) === 'gift') {
+      // A recipient's library is not the buyer's library.
+      return { ...fullPrice, fullBundle: true };
+    }
+    const [details, ownership] = await Promise.all([
+      bundleDetailsCache.get(bundleid + ':' + cc, bundleid, cc, signal), bundleOwnershipCache.get(session.steamid, signal)
+    ]);
+    if (regionalBundleSession().steamid !== session.steamid) throw invalidResponse('计算期间账号已变更');
+    if (selectBundleCompletionItems(details, ownership).length === details.data.m_rgItems.length) {
+      regionalLog.debug('bundle.full', '无已拥有套餐，使用接口整包价格', { bundleid, cc });
+      return fullPrice;
+    }
+    const price = calculateBundleCompletion(details, ownership, currency);
+    regionalLog.debug('bundle.completion', '目标地区补齐价格已计算', {
+      bundleid, cc, excluded: price.excluded, remaining: price.remaining, final: price.finalFormatted
+    });
+    return price;
+  }
+
   // ---- regional-prices.js ----
   const regionalLog = diagnostics.scope('regional-prices');
   const currencyDigitsCache = new Map();
@@ -1189,18 +1357,27 @@
     const initialMinor = parseInt(po.original_price_in_cents, 10);
     if (!Number.isFinite(finalMinor)) return null;
 
-    return normalizePrice({
+    const fullPrice = normalizePrice({
       currency: po.currency_code || currencyFallback,
-      final: finalMinor,
-      initial: Number.isFinite(initialMinor) ? initialMinor : finalMinor,
+      final: Math.round(finalMinor * Math.pow(10, getCurrencyFractionDigits(currencyFallback)) / 100),
+      initial: Math.round((Number.isFinite(initialMinor) ? initialMinor : finalMinor) * Math.pow(10, getCurrencyFractionDigits(currencyFallback)) / 100),
       finalFormatted: po.formatted_final_price,
       initialFormatted: po.formatted_original_price || po.formatted_final_price,
       discountPercent: po.discount_pct
     });
+    return personalizeRegionalBundle(bundleid, cc, currencyFallback, po, fullPrice);
+  }
+
+  let bundleCartRevision = 0;
+  function regionalPriceKey(item, region) {
+    const base = item.type + ':' + item.id + ':' + region.id;
+    if (item.type !== 'bundle') return base;
+    return base + ':' + (regionalBundleSession().steamid || 'anonymous') + ':' +
+      (isCartPage() ? 'cart:' + bundleCartRevision : 'store');
   }
 
   function getPriceForItem(item, region) {
-    const key = item.type + ':' + item.id + ':' + region.id;
+    const key = regionalPriceKey(item, region);
     if (pendingPrices.has(key)) { regionalLog.debug('price.join', '复用进行中的价格查询', { item: key }); return pendingPrices.get(key); }
     const pending = fetchPriceForItem(item, region).finally(() => { if (pendingPrices.get(key) === pending) pendingPrices.delete(key); });
     pendingPrices.set(key, pending);
@@ -1208,7 +1385,7 @@
   }
 
   async function fetchPriceForItem(item, region) {
-    const key = item.type + ':' + item.id + ':' + region.id;
+    const key = regionalPriceKey(item, region);
     const cached = cacheGet(key);
     if (cached !== undefined) { regionalLog.debug('cache.hit', '命中价格缓存', { item: key }); return cached; }
     const task = regionalLog.begin('price.fetch', { item: key });
@@ -1259,9 +1436,10 @@
     return false;
   }
 
-  function upsertExtraInside(priceEl, region, formatted) {
+  function upsertExtraInside(priceEl, region, formatted, price) {
     let span = priceEl.querySelector('.' + EXTRA_CLASS);
-    const text = getShowRegionCode() ? '(' + region.short + ' ' + formatted + ')' : '(' + formatted + ')';
+    const kind = price?.completion ? '预计补齐 ' : price?.fullBundle ? '整包 ' : '';
+    const text = '(' + (getShowRegionCode() ? region.short + ' ' : '') + kind + formatted + ')';
     if (!span) {
       span = document.createElement('span');
       span.className = EXTRA_CLASS;
@@ -1315,7 +1493,7 @@
     if (!txt || /^-\d+%$/.test(txt) || txt.length > 120) return;
     const region = getTargetRegion();
     const item = inferRegionalPriceItem(priceEl);
-    const identity = item ? itemKey(item) + ':' + region.id : null;
+    const identity = item ? regionalPriceKey(item, region) : null;
     if (enhancedItems.get(priceEl) !== identity) {
       priceEl.querySelectorAll('.' + EXTRA_CLASS + ', .sapx-region-locked').forEach(node => node.remove());
     }
@@ -1334,7 +1512,7 @@
     finally { pendingElements.delete(priceEl); }
     if (!priceEl.isConnected || scope?.active === false || getTargetRegion().id !== region.id) return;
     const current = inferRegionalPriceItem(priceEl);
-    if (!current || itemKey(current) !== itemKey(item)) { scheduleScan(); return; }
+    if (!current || regionalPriceKey(current, region) !== identity) { scheduleScan(); return; }
     enhancedItems.set(priceEl, identity);
     if (!price || !price.ok) {
       markRegionLocked(priceEl, region);
@@ -1346,7 +1524,7 @@
     const formatted = wantInitial ? (price.initialFormatted || price.finalFormatted) : price.finalFormatted;
     if (!formatted) return;
 
-    upsertExtraInside(priceEl, region, formatted);
+    upsertExtraInside(priceEl, region, formatted, price);
     regionalLog.debug('render.price', '地区价格已显示', { item, region: region.id, kind: wantInitial ? 'initial' : 'final' });
   }
 
@@ -1393,11 +1571,15 @@
     const unidentified = refs.filter(item => !item).length;
     let failed = 0;
     let priced = 0;
+    let completionCount = 0;
+    let fullBundleCount = 0;
     for (const result of results) {
       if (result.failed) failed++;
       else if (result.price?.ok && Number.isFinite(result.price.final)) {
         sumMinor += result.price.final;
         priced++;
+        if (result.price.completion) completionCount++;
+        if (result.price.fullBundle) fullBundleCount++;
       } else if (result.price === null) missingCount++;
     }
 
@@ -1416,12 +1598,15 @@
     let html = '<div class="sapx-row"><div class="sapx-label">' + label + '：</div><div class="sapx-value">' + totalText + '</div></div>';
     if (missingCount > 0) html += '<div class="sapx-warn">目标地区有 ' + missingCount + ' 款锁区游戏，未计入小计</div>';
     if (unknownCount > 0) html += '<div class="sapx-warn">有 ' + unknownCount + ' 项价格暂时无法确认，未计入小计</div>';
+    if (completionCount > 0) html += '<div class="sapx-warn">含 ' + completionCount + ' 项按当前账号已拥有内容计算的预计补齐价，以 Steam 结算为准</div>';
+    if (fullBundleCount > 0) html += '<div class="sapx-warn">含 ' + fullBundleCount + ' 项礼物捆绑包整包价，未按收礼人计算补齐</div>';
     if (box.innerHTML !== html) box.innerHTML = html;
     regionalLog.debug('summary.complete', '购物车额外地区汇总完成', {
       region: region.id,
       total: totalText,
       items: items.length,
       priced,
+      completion: completionCount,
       unidentified,
       failed,
       missing: missingCount
@@ -1506,6 +1691,9 @@
     scope.own(() => {
       summaryRevision++;
       pendingPrices.clear();
+      bundleCartCache.clear();
+      bundleOwnershipCache.clear();
+      bundleDetailsCache.clear();
       regionalScanner = null;
       cartSummaryRetry = null;
       document.querySelectorAll('.' + EXTRA_CLASS + ', .sapx-region-locked, #' + CART_SUMMARY_ID).forEach(node => node.remove());
@@ -1522,6 +1710,11 @@
       },
       changed: () => {
         summaryRevision++;
+        if (isCartPage()) {
+          bundleCartRevision++;
+          bundleCartCache.clear();
+          for (const key of priceCache.keys()) if (key.startsWith('bundle:')) priceCache.delete(key);
+        }
         if (isCartPage()) updateCartSummary().catch(error => regionalLog.debug('summary.failed', '汇总暂不可用', { error }));
       }
     });

@@ -6,7 +6,7 @@
 
 让 Steam 商店、愿望单与购物车中的价格信息更直观。
 
-![Version](https://img.shields.io/badge/version-1.8.0-67c1f5?style=flat-square)
+![Version](https://img.shields.io/badge/version-1.9.1-67c1f5?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Tampermonkey-1b2838?style=flat-square)
 ![License](https://img.shields.io/badge/license-AGPL--3.0-green?style=flat-square)
 
@@ -31,6 +31,8 @@
 ### 🛒 购物车地区合计
 
 在购物车中显示「目标地区预计付款」，便于查看所选地区的商品总价。未能获取目标地区价格的商品会从合计中剔除，并显示数量提示。
+
+登录后，支持补齐的捆绑包在需要扣除已拥有项目时显示「预计补齐」价格：按目标地区的套餐价格及捆绑折扣，剔除当前账号已拥有的套餐或其中游戏已全部拥有的项目，并计入购物车地区合计。没有可扣除的已拥有项目时，直接显示接口整包价格，不计算补齐价，也不添加「预计补齐」标注。套餐中仅部分游戏已拥有时仍按整个套餐计价，订阅提供的游戏不作为永久拥有内容扣除。仅支持整套购买的捆绑包保留整包价格；礼物捆绑包标注整包价，不使用购买者的游戏库计算收礼人的补齐价。数据不足时不计入小计，估算结果以 Steam 结算为准。
 
 > 合计仅供参考。价格获取失败可能与地区限制、网络或接口状态有关，实际可购买情况和付款金额以 Steam 结算页面为准。
 

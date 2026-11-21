@@ -16,6 +16,7 @@ export const sources = [
   'cache.js',
   'styles.js',
   'settings.js',
+  'bundle-prices.js',
   'regional-prices.js',
   'conversion/settings.js',
   'conversion/rates.js',
