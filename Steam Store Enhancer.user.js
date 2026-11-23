@@ -4612,12 +4612,31 @@ targets = new Map([
   // ---- game-hover.js ----
   const GAME_HOVER_ROWS = '.search_result_row, .tab_item, .tab_row_item, .recommendation_link, .store_main_capsule, .store_capsule, .small_cap, .large_cap, .wishlist_row, .wishlistRowItem, [data-rfd-draggable-id^="WishlistItem-"]';
   const GAME_HOVER_ITEMS = `${GAME_HOVER_ROWS}, a[href*="/app/"], [data-ds-appid], [data-app-id], #appHubAppName`;
+  const GAME_HOVER_APP_PATH = /^\/app\/(\d+)(?:\/|$)/;
+  const GAME_HOVER_NON_APP = '[data-ds-bundleid], [data-ds-packageid]';
+  const GAME_HOVER_GAP = 8;
+  const GAME_HOVER_MARGIN = 8;
 
+  /**
+   * @typedef {Object} GameHoverDetails
+   * @property {string} name
+   * @property {string} publishers
+   * @property {string} developers
+   * @property {string} [franchises]
+   * @property {boolean | null} earlyAccess
+   * @property {string[][] | null} [languages]
+   * @property {string} [languageSummary]
+   * @property {string[]} tags
+   * @property {string} [description]
+   * @property {string | null} [reviews]
+   */
+
+  /** @returns {{row: Element, id: string} | null} */
   function findGameHoverItem(target) {
     const closest = target?.closest?.(GAME_HOVER_ITEMS);
     if (!closest) return null;
     if (closest.id === 'appHubAppName') {
-      const id = /^\/app\/(\d+)(?:\/|$)/.exec(location.pathname)?.[1];
+      const id = GAME_HOVER_APP_PATH.exec(location.pathname)?.[1];
       return id ? { row: closest, id } : null;
     }
     const row = closest.closest(GAME_HOVER_ROWS);
@@ -4626,18 +4645,19 @@ targets = new Map([
     if (link) {
       const url = new URL(link.href, location.href);
       if (url.origin !== location.origin || /^\/(sub|bundle)\//.test(url.pathname)) return null;
-      linkId = /^\/app\/(\d+)(?:\/|$)/.exec(url.pathname)?.[1];
+      linkId = GAME_HOVER_APP_PATH.exec(url.pathname)?.[1];
     }
-    if (row && !row.matches('[data-ds-bundleid], [data-ds-packageid]')) {
+    if (row && !row.matches(GAME_HOVER_NON_APP)) {
       const id = itemRef('app', row === link ? linkId : storeSaleAppId(row))?.id;
       if (id && (!linkId || id === linkId)) return { row, id };
     }
     if (linkId) return { row: link, id: linkId };
-    if (row || closest.matches('[data-ds-bundleid], [data-ds-packageid]')) return null;
+    if (row || closest.matches(GAME_HOVER_NON_APP)) return null;
     const id = itemRef('app', storeSaleAppId(closest))?.id;
     return id ? { row: closest, id } : null;
   }
 
+  /** @returns {GameHoverDetails | null} */
   function parseGameHoverPage(doc, id) {
     const canonical = doc.querySelector('link[rel="canonical"]')?.getAttribute('href');
     const name = doc.querySelector('#appHubAppName, .apphub_AppName')?.textContent.trim() ||
@@ -4645,43 +4665,70 @@ targets = new Map([
     if (!name || (canonical && itemFromLink(canonical)?.id !== id)) return null;
     if (!doc.querySelector('.game_description_snippet, #appHubAppName, .apphub_AppName')) return null;
 
-    const texts = selector => [...new Set([...doc.querySelectorAll(selector)].map(node => node.textContent.trim()).filter(Boolean))];
-    const company = type => texts(`#${type}_row .summary a, .dev_row .summary a[href*="/${type}/"], .dev_row .summary a[href*="?${type}="], .dev_row .summary a[href*="&${type}="]`).join('、');
-    const languages = [[], [], []];
-    const languageRows = doc.querySelectorAll('table.game_language_options tr');
-    for (const row of languageRows) {
-      const cells = row.querySelectorAll('td');
-      if (cells.length < 4) continue;
-      const name = cells[0].textContent.trim();
-      if (!name) continue;
-      languages.forEach((list, index) => {
-        if (cells[index + 1].querySelector('.checkmark') || /[✔✓]/.test(cells[index + 1].textContent)) list.push(name);
-      });
+    function uniqueTexts(selector) {
+      const texts = Array.from(doc.querySelectorAll(selector), node => node.textContent.trim());
+      return [...new Set(texts.filter(Boolean))];
     }
+
+    function companyNames(type) {
+      const selectors = [
+        `#${type}_row .summary a`,
+        `.dev_row .summary a[href*="/${type}/"]`,
+        `.dev_row .summary a[href*="?${type}="]`,
+        `.dev_row .summary a[href*="&${type}="]`
+      ];
+      return uniqueTexts(selectors.join(', ')).join('、');
+    }
+
     return {
       name,
-      publishers: company('publisher'),
-      developers: company('developer') || texts('#developers_list a').join('、'),
-      franchises: company('franchise'),
+      publishers: companyNames('publisher'),
+      developers: companyNames('developer') || uniqueTexts('#developers_list a').join('、'),
+      franchises: companyNames('franchise'),
       earlyAccess: Boolean(doc.querySelector('.early_access_header, .early_access_banner, #earlyAccessHeader')),
-      languages: languageRows.length ? languages : null,
-      tags: texts('.glance_tags a.app_tag').slice(0, 5),
+      languages: parseGameHoverLanguages(doc),
+      tags: uniqueTexts('.glance_tags a.app_tag').slice(0, 5),
       description: doc.querySelector('.game_description_snippet')?.textContent.trim(),
       reviews: parseGameHoverStoreReviews(doc)
     };
   }
 
+  /** @returns {string[][] | null} */
+  function parseGameHoverLanguages(doc) {
+    const rows = doc.querySelectorAll('table.game_language_options tr');
+    if (!rows.length) return null;
+
+    const languages = [[], [], []];
+    for (const row of rows) {
+      const cells = row.querySelectorAll('td');
+      if (cells.length < 4) continue;
+      const language = cells[0].textContent.trim();
+      if (!language) continue;
+
+      for (const [index, supportedLanguages] of languages.entries()) {
+        const supportCell = cells[index + 1];
+        if (supportCell.querySelector('.checkmark') || /[✔✓]/.test(supportCell.textContent)) {
+          supportedLanguages.push(language);
+        }
+      }
+    }
+    return languages;
+  }
+
+  /** @returns {string} */
   function formatGameHoverReviews(percent, total) {
     if (!total) return '暂无评测（0 条）';
     return `${percent}% 好评（${total.toLocaleString('zh-CN')} 条）`;
   }
 
+  /** @returns {string | null} */
   function gameHoverReviews(data) {
     const { total_positive: positive, total_reviews: total } = (data?.response || data)?.query_summary || {};
     if (data?.success === 0 || !Number.isSafeInteger(total) || !Number.isSafeInteger(positive) || positive < 0 || total < positive) return null;
     return formatGameHoverReviews(total ? Math.round(positive * 100 / total) : 0, total);
   }
 
+  /** @returns {string | null} */
   function parseGameHoverStoreReviews(doc) {
     const row = doc.querySelector('#userReviews [itemprop="aggregateRating"]') ||
       doc.querySelector('#userReviews [data-tooltip-html].user_reviews_summary_row:last-child, #userReviews [data-store-tooltip].user_reviews_summary_row:last-child');
@@ -4695,23 +4742,61 @@ targets = new Map([
     return Number.isSafeInteger(total) && total > 0 ? `${formatGameHoverReviews(Number(percent), total)} · 商店摘要` : null;
   }
 
+  /** @returns {GameHoverDetails | null} */
   function gameHoverAppDetails(data, id) {
     const entry = data?.[id];
     const app = entry?.data;
     if (!entry?.success || String(app?.steam_appid) !== id || typeof app.name !== 'string') return null;
-    const list = value => Array.isArray(value) ? value.filter(name => typeof name === 'string').join('、') : '';
-    const text = value => {
-      const template = document.createElement('template');
-      template.innerHTML = typeof value === 'string' ? value : '';
-      return template.content.textContent.trim();
-    };
+    function names(value) {
+      return Array.isArray(value) ? value.filter(name => typeof name === 'string').join('、') : '';
+    }
+    function plainText(value) {
+      return parseGameHoverHtml(typeof value === 'string' ? value : '').textContent.trim();
+    }
     return {
-      name: app.name, publishers: list(app.publishers), developers: list(app.developers),
+      name: app.name,
+      publishers: names(app.publishers),
+      developers: names(app.developers),
       earlyAccess: Array.isArray(app.genres) ? app.genres.some(genre => Number(genre?.id) === 70) : null,
-      languageSummary: text(app.supported_languages), tags: [], description: text(app.short_description)
+      languageSummary: plainText(app.supported_languages),
+      tags: [],
+      description: plainText(app.short_description)
     };
   }
 
+  /** @returns {DocumentFragment} */
+  function parseGameHoverHtml(html) {
+    // Template contents stay inert, including images and inline handlers from Steam's HTML.
+    const template = document.createElement('template');
+    template.innerHTML = html;
+    return template.content;
+  }
+
+  /** @returns {Promise<GameHoverDetails | null>} */
+  async function loadGameHoverDetails(id, language, options) {
+    if (itemFromLink(location.pathname)?.id === id && location.pathname.startsWith('/app/')) {
+      const details = parseGameHoverPage(document, id);
+      if (details) return details;
+    }
+
+    const storePage = new URL(`/app/${id}/`, location.origin);
+    storePage.searchParams.set('l', language);
+    try {
+      const html = await gmGet(storePage.href, options);
+      const details = parseGameHoverPage(parseGameHoverHtml(html), id);
+      if (details) return details;
+    } catch (error) {
+      if (options.signal.aborted || error.status === 429) throw error;
+    }
+
+    const fallback = new URL('/api/appdetails', location.origin);
+    fallback.searchParams.set('appids', id);
+    fallback.searchParams.set('l', language);
+    const json = await gmGet(fallback.href, options);
+    return gameHoverAppDetails(JSON.parse(json), id);
+  }
+
+  /** @returns {Promise<string | null>} */
   async function loadGameHoverReviews(id, options) {
     const url = new URL('https://api.steampowered.com/IUserReviewsService/GetAppReviews/v1/');
     url.searchParams.set('input_json', JSON.stringify({
@@ -4720,10 +4805,11 @@ targets = new Map([
     return gameHoverReviews(JSON.parse(await gmGet(url.href, { ...options, anonymous: true })));
   }
 
+  /** @returns {{side: 'left' | 'above' | 'below' | 'overlay', width: number, left: number, maxHeight: number}} */
   function gameHoverPlacement(rect, viewport) {
     const preferredWidth = 324;
-    const gap = 8;
-    const margin = 8;
+    const gap = GAME_HOVER_GAP;
+    const margin = GAME_HOVER_MARGIN;
     const leftSpace = rect.left - gap - margin;
     if (leftSpace >= 216) {
       const width = Math.min(preferredWidth, leftSpace);
@@ -4733,11 +4819,13 @@ targets = new Map([
     const above = Math.max(0, rect.top - gap - margin);
     const below = Math.max(0, viewport.height - rect.bottom - gap - margin);
     const width = Math.min(preferredWidth, viewport.width - 2 * margin);
-    const x = Math.max(margin, Math.min(rect.left, viewport.width - margin - width));
-    if (Math.max(above, below) < 96) return { side: 'overlay', width, left: x, maxHeight: viewport.height - 2 * margin };
-    return { side: above > below ? 'above' : 'below', width, left: x, maxHeight: Math.max(above, below) };
+    const left = Math.max(margin, Math.min(rect.left, viewport.width - margin - width));
+    const verticalSpace = Math.max(above, below);
+    if (verticalSpace < 96) return { side: 'overlay', width, left, maxHeight: viewport.height - 2 * margin };
+    return { side: above > below ? 'above' : 'below', width, left, maxHeight: verticalSpace };
   }
 
+  /** @returns {void} */
   function initializeGameHover() {
     const scope = createFeatureScope('game-hover');
     const log = diagnostics.scope('game-hover');
@@ -4745,32 +4833,14 @@ targets = new Map([
     const { language } = readStoreSession(document, page);
     const options = { signal: scope.signal, timeout: 8000 };
     const queue = new RequestQueue(2);
-    const reviewCache = createAsyncCache({ ttl: 10 * 60000, load: async id => {
-      return queue.enqueue(() => loadGameHoverReviews(id, options), options);
-    } });
-    const detailsCache = createAsyncCache({ ttl: 30 * 60000, load: async id => {
-      return queue.enqueue(async () => {
-        if (itemFromLink(location.pathname)?.id === id && location.pathname.startsWith('/app/')) {
-          const details = parseGameHoverPage(document, id);
-          if (details) return details;
-        }
-        const url = new URL(`/app/${id}/`, location.origin);
-        url.searchParams.set('l', language);
-        try {
-          // Template contents stay inert, including images and inline handlers from Steam's HTML.
-          const template = document.createElement('template');
-          template.innerHTML = await gmGet(url.href, options);
-          const details = parseGameHoverPage(template.content, id);
-          if (details) return details;
-        } catch (error) {
-          if (scope.signal.aborted || error.status === 429) throw error;
-        }
-        const fallback = new URL('/api/appdetails', location.origin);
-        fallback.searchParams.set('appids', id);
-        fallback.searchParams.set('l', language);
-        return gameHoverAppDetails(JSON.parse(await gmGet(fallback.href, options)), id);
-      }, options);
-    } });
+    const reviewCache = createAsyncCache({
+      ttl: 10 * 60000,
+      async load(id) { return queue.enqueue(() => loadGameHoverReviews(id, options), options); }
+    });
+    const detailsCache = createAsyncCache({
+      ttl: 30 * 60000,
+      async load(id) { return queue.enqueue(() => loadGameHoverDetails(id, language, options), options); }
+    });
     log.info('initialize', '游戏悬停详情已启用');
 
     const tooltip = createElement('div');
@@ -4781,14 +4851,18 @@ targets = new Map([
     tooltip.appendChild(body);
     document.body.appendChild(tooltip);
 
-    let current, cancelOpen, cancelClose;
-    const hide = () => {
+    let current;
+    let cancelOpen;
+    let cancelClose;
+
+    function hide() {
       cancelOpen?.();
       cancelClose?.();
-      cancelOpen = cancelClose = null;
+      cancelOpen = null;
+      cancelClose = null;
       current = null;
       tooltip.hidden = true;
-    };
+    }
     scope.own(hide);
     scope.own(() => tooltip.remove());
 
@@ -4805,43 +4879,59 @@ targets = new Map([
       tooltip.style.width = `${placement.width}px`;
       body.style.maxHeight = `${placement.maxHeight}px`;
       const height = tooltip.offsetHeight;
-      const top = placement.side === 'above' ? rect.top - 8 - height : placement.side === 'below' ? rect.bottom + 8 : rect.top;
-      const y = Math.max(8, Math.min(top, viewport.height - height - 8));
+      let top = rect.top;
+      if (placement.side === 'above') top = rect.top - GAME_HOVER_GAP - height;
+      else if (placement.side === 'below') top = rect.bottom + GAME_HOVER_GAP;
+      const margin = GAME_HOVER_MARGIN;
+      const y = Math.max(margin, Math.min(top, viewport.height - height - margin));
       tooltip.style.top = `${y}px`;
-      tooltip.style.setProperty('--sse-game-hover-arrow', `${Math.max(12, Math.min(rect.top + rect.height / 2 - y, height - 12))}px`);
+      const rowCenter = rect.top + rect.height / 2;
+      const arrowOffset = Math.max(12, Math.min(rowCenter - y, height - 12));
+      tooltip.style.setProperty('--sse-game-hover-arrow', `${arrowOffset}px`);
+    }
+
+    function appendField(label, value) {
+      const line = createElement('div');
+      line.append(createElement('strong', `${label} · `), value || '—');
+      body.appendChild(line);
     }
 
     function render(item) {
       if (current !== item || !scope.active) return;
       const { details, reviews } = item;
-      const field = (label, value) => {
-        const line = createElement('div');
-        line.append(createElement('strong', `${label} · `), value || '—');
-        body.appendChild(line);
-      };
       body.replaceChildren();
       if (details?.name) body.appendChild(createElement('div', details.name, 'sse-game-hover-title'));
       if (details) {
-        field('发行商', details.publishers);
-        field('开发者', details.developers);
-        field('系列', details.franchises);
+        appendField('发行商', details.publishers);
+        appendField('开发者', details.developers);
+        appendField('系列', details.franchises);
       }
-      field('评测', reviews || details?.reviews || (reviews === undefined || details === undefined ? '正在读取…' : '暂不可用'));
+      const loadingReviews = reviews === undefined || details === undefined;
+      appendField('评测', reviews || details?.reviews || (loadingReviews ? '正在读取…' : '暂不可用'));
       if (details) {
-        field('抢先体验', details.earlyAccess == null ? '暂不可用' : details.earlyAccess ? '是' : '否');
+        let earlyAccess = '暂不可用';
+        if (details.earlyAccess != null) earlyAccess = details.earlyAccess ? '是' : '否';
+        appendField('抢先体验', earlyAccess);
         if (details.languages) {
-          ['界面', '完整音频', '字幕'].forEach((label, index) => field(label, details.languages[index].join('、')));
-        } else field('语言支持', details.languageSummary || '暂不可用');
+          ['界面', '完整音频', '字幕'].forEach((label, index) => appendField(label, details.languages[index].join('、')));
+        } else appendField('语言支持', details.languageSummary || '暂不可用');
         if (details.tags.length) {
           const tags = createElement('div', undefined, 'sse-game-hover-tags');
           tags.append(...details.tags.map(tag => createElement('span', tag)));
           body.append(createElement('strong', '标签'), tags);
-        } else field('标签', '');
-        field('简介', details.description);
+        } else appendField('标签', '');
+        appendField('简介', details.description);
       } else {
         body.appendChild(createElement('div', details === undefined ? '正在读取游戏详情…' : '商店详情暂不可用。'));
       }
       place();
+    }
+
+    function renderWhenLoaded(item, field, cache) {
+      cache.get(item.id).then(
+        value => { item[field] = value; },
+        () => { item[field] = null; }
+      ).then(() => render(item));
     }
 
     function open(item) {
@@ -4849,8 +4939,8 @@ targets = new Map([
       body.scrollTop = 0;
       render(item);
       if (current !== item) return;
-      detailsCache.get(item.id).then(details => { item.details = details; }, () => { item.details = null; }).then(() => render(item));
-      reviewCache.get(item.id).then(reviews => { item.reviews = reviews; }, () => { item.reviews = null; }).then(() => render(item));
+      renderWhenLoaded(item, 'details', detailsCache);
+      renderWhenLoaded(item, 'reviews', reviewCache);
     }
 
     function closeSoon() {
