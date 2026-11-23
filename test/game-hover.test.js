@@ -137,6 +137,38 @@ test('friend activity loads both the game page and its fallback from the Steam s
   ]);
 });
 
+test('hover fills localized tags and reads only explicit Steam franchises when the store HTML is unavailable', async () => {
+  const calls = [];
+  const { context } = await harness(['game-hover.js'], {
+    gmGet: async address => {
+      const url = new URL(address);
+      calls.push(url);
+      if (url.pathname.includes('GetTagList')) {
+        return JSON.stringify({ response: { tags: [{ tagid: 1695, name: '开放世界' }, { tagid: 4115, name: '赛博朋克' }] } });
+      }
+      const [{ appid }] = JSON.parse(url.searchParams.get('input_json')).ids;
+      const basic_info = appid === 620 ? { franchises: [{ name: 'Portal' }] } : { publishers: [{ name: 'CD PROJEKT RED' }] };
+      return JSON.stringify({ response: { store_items: [{ appid, basic_info, tags: [{ tagid: 4115 }, { tagid: 1695 }] }] } });
+    }
+  });
+  const session = { language: 'schinese', country: 'CN' };
+  const options = { signal: new AbortController().signal };
+  const tagNames = await context.loadGameHoverTagNames(session.language, options);
+  const cache = { get: async () => tagNames };
+  const cyberpunk = await context.fillGameHoverMetadata({ tags: [] }, '1091500', session, options, cache);
+  assert.deepEqual(Array.from(cyberpunk.tags), ['赛博朋克', '开放世界']);
+  assert.equal(cyberpunk.franchises, '');
+  const portal = await context.fillGameHoverMetadata({ tags: [] }, '620', session, options, cache);
+  assert.equal(portal.franchises, 'Portal');
+  const withoutNames = await context.fillGameHoverMetadata({ tags: ['原标签'] }, '620', session, options, {
+    get: async () => { throw new Error('标签列表不可用'); }
+  });
+  assert.deepEqual(withoutNames.tags, ['原标签']);
+  assert.equal(withoutNames.franchises, 'Portal');
+  assert.equal(calls[0].searchParams.get('language'), 'schinese');
+  assert.equal(JSON.parse(calls[1].searchParams.get('input_json')).data_request.include_tag_count, 5);
+});
+
 test('hover reviews use the current Steamworks endpoint and request all languages', async () => {
   const calls = [];
   const { context } = await harness(['game-hover.js'], {

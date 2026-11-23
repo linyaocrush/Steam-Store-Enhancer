@@ -91,7 +91,7 @@
       name,
       publishers: companyNames('publisher'),
       developers: companyNames('developer') || uniqueTexts('#developers_list a').join('、'),
-      franchises: companyNames('franchise'),
+      franchises: uniqueTexts('#franchise_row a').join('、') || companyNames('franchise'),
       earlyAccess: Boolean(doc.querySelector('.early_access_header, .early_access_banner, #earlyAccessHeader')),
       languages: parseGameHoverLanguages(doc),
       tags: uniqueTexts('.glance_tags a.app_tag').slice(0, 5),
@@ -203,6 +203,52 @@
     return gameHoverAppDetails(JSON.parse(json), id);
   }
 
+  async function loadGameHoverTagNames(language, options) {
+    const url = new URL('https://api.steampowered.com/IStoreService/GetTagList/v1/');
+    url.searchParams.set('language', language);
+    const { response } = JSON.parse(await gmGet(url.href, { ...options, anonymous: true }));
+    if (!Array.isArray(response?.tags)) throw invalidResponse('缺少 Steam 标签名称列表');
+    const names = new Map();
+    for (const tag of response.tags) {
+      if (typeof tag?.name === 'string' && tag.name.trim()) names.set(tag.tagid, tag.name.trim());
+    }
+    return names;
+  }
+
+  async function fillGameHoverMetadata(details, id, session, options, tagNames) {
+    if (!details || (details.franchises && details.tags.length >= 5)) return details;
+
+    const url = new URL('https://api.steampowered.com/IStoreBrowseService/GetItems/v1/');
+    url.searchParams.set('input_json', JSON.stringify({
+      ids: [{ appid: Number(id) }],
+      context: { language: session.language, country_code: session.country || 'US', steam_realm: 1 },
+      data_request: { include_basic_info: true, include_tag_count: 5 }
+    }));
+    const { response } = JSON.parse(await gmGet(url.href, { ...options, anonymous: true }));
+    if (!Array.isArray(response?.store_items)) throw invalidResponse('缺少 Steam 商品列表');
+    const item = response.store_items.find(entry => String(entry?.appid) === id);
+    if (!item) return details;
+
+    const enriched = { ...details };
+    if (!enriched.franchises && item.basic_info) {
+      const franchises = item.basic_info.franchises;
+      if (franchises == null || Array.isArray(franchises)) {
+        const names = (franchises || []).map(entry => entry?.name).filter(name => typeof name === 'string');
+        enriched.franchises = [...new Set(names.map(name => name.trim()).filter(Boolean))].join('、');
+      }
+    }
+    if (enriched.tags.length < 5 && Array.isArray(item.tags) && item.tags.length) {
+      try {
+        const names = await tagNames.get(session.language);
+        const tags = item.tags.slice(0, 5).map(tag => names.get(tag?.tagid)).filter(Boolean);
+        if (tags.length > enriched.tags.length) enriched.tags = tags;
+      } catch (error) {
+        if (!options.signal.aborted) diagnostics.scope('game-hover').debug('tags.unavailable', 'Steam 标签名称暂不可用', { id, error });
+      }
+    }
+    return enriched;
+  }
+
   /** @returns {Promise<string | null>} */
   async function loadGameHoverReviews(id, options) {
     const url = new URL('https://api.steampowered.com/IUserReviewsService/GetAppReviews/v1/');
@@ -237,16 +283,17 @@
     const scope = createFeatureScope('game-hover');
     const log = diagnostics.scope('game-hover');
     const page = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
-    const { language } = readStoreSession(document, page);
+    const session = readStoreSession(document, page);
     const options = { signal: scope.signal, timeout: 8000 };
     const queue = new RequestQueue(2);
+    const tagNames = createAsyncCache({ ttl: 24 * 3600000, load: language => loadGameHoverTagNames(language, options) });
     const reviewCache = createAsyncCache({
       ttl: 10 * 60000,
       async load(id) { return queue.enqueue(() => loadGameHoverReviews(id, options), options); }
     });
     const detailsCache = createAsyncCache({
       ttl: 30 * 60000,
-      async load(id) { return queue.enqueue(() => loadGameHoverDetails(id, language, options), options); }
+      async load(id) { return queue.enqueue(() => loadGameHoverDetails(id, session.language, options), options); }
     });
     log.info('initialize', '游戏悬停详情已启用');
 
@@ -311,7 +358,12 @@
       if (details) {
         appendField('发行商', details.publishers);
         appendField('开发者', details.developers);
-        appendField('系列', details.franchises);
+        let series = details.franchises;
+        if (!series) {
+          if (item.metadataPending) series = '正在读取…';
+          else series = details.franchises === '' ? 'Steam 未列出' : '暂不可用';
+        }
+        appendField('系列', series);
       }
       const loadingReviews = reviews === undefined || details === undefined;
       appendField('评测', reviews || details?.reviews || (loadingReviews ? '正在读取…' : '暂不可用'));
@@ -326,7 +378,7 @@
           const tags = createElement('div', undefined, 'sse-game-hover-tags');
           tags.append(...details.tags.map(tag => createElement('span', tag)));
           body.append(createElement('strong', '标签'), tags);
-        } else appendField('标签', '');
+        } else appendField('标签', item.metadataPending ? '正在读取…' : '暂不可用');
         appendField('简介', details.description);
       } else {
         body.appendChild(createElement('div', details === undefined ? '正在读取游戏详情…' : '商店详情暂不可用。'));
@@ -341,12 +393,33 @@
       ).then(() => render(item));
     }
 
+    const metadataCache = createAsyncCache({
+      ttl: 30 * 60000,
+      load: (id, details) => queue.enqueue(() => fillGameHoverMetadata(details, id, session, options, tagNames), options)
+    });
+
+    async function renderDetails(item) {
+      item.details = await detailsCache.get(item.id).catch(() => null);
+      if (current !== item || !scope.active) return;
+      if (item.details && (!item.details.franchises || item.details.tags.length < 5)) {
+        item.metadataPending = true;
+        render(item);
+        try {
+          item.details = await metadataCache.get(item.id, item.details);
+        } catch (error) {
+          if (scope.active) log.debug('metadata.unavailable', 'Steam 系列及标签暂不可用', { id: item.id, error });
+        }
+        item.metadataPending = false;
+      }
+      render(item);
+    }
+
     function open(item) {
       tooltip.hidden = false;
       body.scrollTop = 0;
       render(item);
       if (current !== item) return;
-      renderWhenLoaded(item, 'details', detailsCache);
+      renderDetails(item);
       renderWhenLoaded(item, 'reviews', reviewCache);
     }
 
