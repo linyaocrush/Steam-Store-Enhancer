@@ -14,7 +14,15 @@
         '#sapx-cart-summary .sapx-warn{margin-top:4px;color:#e46767;font-size:10px;opacity:0.9}' +
         '.game_purchase_action_bg .discount_prices .discount_original_price{text-decoration:none!important}' +
         '.game_purchase_action_bg .discount_prices .discount_original_price::before,.game_purchase_action_bg .discount_prices .discount_original_price::after{content:none!important;display:none!important}' +
-        '.game_purchase_action_bg .discount_prices .discount_original_price .sapx-extra-price{text-decoration:none!important}';
+        '.game_purchase_action_bg .discount_prices .discount_original_price .sapx-extra-price{text-decoration:none!important}' +
+        '#sse-game-hover{position:fixed;z-index:1200;box-sizing:border-box;margin:0;color:#20354a;background:#dce6ed;border-radius:6px;box-shadow:0 5px 22px #0009;font:13px/1.45 Arial,sans-serif;white-space:normal;overflow-wrap:anywhere}' +
+        '#sse-game-hover[hidden]{display:none}' +
+        '#sse-game-hover .sse-game-hover-body{box-sizing:border-box;overflow:auto;overscroll-behavior:contain;padding:12px 14px;border-radius:inherit}' +
+        '#sse-game-hover .sse-game-hover-body>div+div{margin-top:5px}' +
+        '#sse-game-hover .sse-game-hover-title{margin-bottom:8px;color:#132839;font-size:15px;font-weight:700}' +
+        '#sse-game-hover .sse-game-hover-tags{display:flex;flex-wrap:wrap;gap:4px;margin:4px 0 8px}' +
+        '#sse-game-hover .sse-game-hover-tags span{padding:1px 5px;border-radius:3px;background:#b9cfdf;color:#20354a;font-size:12px}' +
+        '#sse-game-hover[data-side="left"]::after{content:"";position:absolute;left:calc(100% - 6px);top:var(--sse-game-hover-arrow);width:12px;height:12px;background:inherit;transform:translateY(-50%) rotate(45deg);pointer-events:none}';
       document.head.appendChild(style);
     }
     if (!document.getElementById(UI_STYLE_ID)) {

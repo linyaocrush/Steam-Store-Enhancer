@@ -29,6 +29,7 @@ export const sources = [
   'restrictions/steam.js',
   'restrictions/index.js',
   'wishlist-sale.js',
+  'game-hover.js',
   'main.js'
 ];
 
@@ -36,9 +37,9 @@ export async function build() {
   const metadata = await readFile(new URL('src/metadata.txt', root), 'utf8');
   const modules = await Promise.all(sources.map(async name => {
     const content = await readFile(new URL('src/' + name, root), 'utf8');
-    return `  // ---- ${name} ----\n` + content.trimEnd();
+    return `  // ---- ${name} ----\n` + content.replace(/\r\n/g, '\n').trimEnd();
   }));
-  return metadata.trimEnd() + "\n\n(function () {\n  'use strict';\n\n" + modules.join('\n\n') + '\n})();\n';
+  return metadata.replace(/\r\n/g, '\n').trimEnd() + "\n\n(function () {\n  'use strict';\n\n" + modules.join('\n\n') + '\n})();\n';
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

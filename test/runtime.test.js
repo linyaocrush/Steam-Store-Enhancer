@@ -106,14 +106,18 @@ test('runtime handles SPA routing, feature switches, repeated startup and page t
     function initializeCartTools() { boot('cart'); }
     function initializeFriendTools() { boot('friends'); }
     function initializeRestrictionBadges() { boot('restrictions'); }
-    function initializeStoreSaleCountdown() { boot('wishlist-sale'); }`, context);
+     function initializeStoreSaleCountdown() { boot('wishlist-sale'); }
+     function initializeGameHover() { boot('game-hover'); }`, context);
   vm.runInContext(await readFile(new URL('../src/main.js', import.meta.url), 'utf8'), context);
   assert.equal(starts.get('wishlist-sale'), 1);
+  assert.equal(starts.get('game-hover'), 1);
   await time.advance(2000);
   assert.equal(starts.get('wishlist-sale'), 1);
   store.set('sse_cart_enabled', false);
+  store.set('sse_game_hover_enabled', false);
   await time.advance(1000);
   assert.equal(vm.runInContext("featureScopes.has('cart')", context), false);
+  assert.equal(vm.runInContext("featureScopes.has('game-hover')", context), false);
   assert.equal(starts.get('wishlist-sale'), 1, 'unrelated feature should not restart when cart setting changes');
   context.location.pathname = '/app/10/';
   window.emit('popstate');
