@@ -6,7 +6,7 @@
 
 让 Steam 商店、愿望单与购物车中的价格信息更直观。
 
-![Version](https://img.shields.io/badge/version-1.11.2-67c1f5?style=flat-square)
+![Version](https://img.shields.io/badge/version-1.12.0-67c1f5?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Tampermonkey-1b2838?style=flat-square)
 ![License](https://img.shields.io/badge/license-AGPL--3.0-green?style=flat-square)
 
@@ -70,6 +70,8 @@
 ### 游戏悬停详情
 
 在商店首页、搜索结果、推荐列表和愿望单中，鼠标停在游戏条目上时，详情卡从条目左侧弹出。左侧空间不足时，卡片会移到视窗内的上方或下方。卡片显示发行商、开发者、系列、好评率和评测总数、抢先体验状态、界面／完整音频／字幕支持、前五个用户标签及简要介绍。可将鼠标移到卡片上滚动查看，也可在设置中关闭此功能。
+
+鼠标停在 Steam 好友动态中的游戏名称链接上，也会显示详情卡。
 
 ### 💬 好友批量留言
 

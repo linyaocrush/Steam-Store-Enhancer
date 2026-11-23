@@ -5,7 +5,7 @@
 // @homepageURL  https://github.com/linyaocrush/Steam-Store-Enhancer
 // @downloadURL  https://raw.githubusercontent.com/linyaocrush/Steam-Store-Enhancer/main/Steam%20Store%20Enhancer.user.js
 // @updateURL    https://raw.githubusercontent.com/linyaocrush/Steam-Store-Enhancer/main/Steam%20Store%20Enhancer.user.js
-// @version      1.11.2
+// @version      1.12.0
 // @description  Steam 额外地区价格、汇率转换、悬停游戏详情、快速加购、愿望单及商店列表折扣倒计时、购物车批量管理与家庭库游戏标记。
 // @author       linyaocrush, marioplus, Chr_, Cliencer Goge, Miku39
 // @license      AGPL-3.0
@@ -4613,6 +4613,8 @@ targets = new Map([
   const GAME_HOVER_ROWS = '.search_result_row, .tab_item, .tab_row_item, .recommendation_link, .store_main_capsule, .store_capsule, .small_cap, .large_cap, .wishlist_row, .wishlistRowItem, [data-rfd-draggable-id^="WishlistItem-"]';
   const GAME_HOVER_ITEMS = `${GAME_HOVER_ROWS}, a[href*="/app/"], [data-ds-appid], [data-app-id], #appHubAppName`;
   const GAME_HOVER_APP_PATH = /^\/app\/(\d+)(?:\/|$)/;
+  const GAME_HOVER_STORE_ORIGIN = 'https://store.steampowered.com';
+  const GAME_HOVER_ACTIVITY = '#blotter_content, .blotter_block';
   const GAME_HOVER_NON_APP = '[data-ds-bundleid], [data-ds-packageid]';
   const GAME_HOVER_GAP = 8;
   const GAME_HOVER_MARGIN = 8;
@@ -4631,8 +4633,25 @@ targets = new Map([
    * @property {string | null} [reviews]
    */
 
+  function isGameHoverPage() {
+    return location.hostname === 'store.steampowered.com' ||
+      (location.hostname === 'steamcommunity.com' && /^\/(?:my|(?:id|profiles)\/[^/]+)\/home\/?$/i.test(location.pathname));
+  }
+
+  /** @returns {{row: Element, id: string} | null} */
+  function findActivityGameHoverItem(target) {
+    const link = target?.closest?.('a[href]');
+    if (!link?.textContent.trim() || !link.closest(GAME_HOVER_ACTIVITY)) return null;
+
+    const url = new URL(link.href, location.href);
+    if (url.origin !== GAME_HOVER_STORE_ORIGIN && url.origin !== 'https://steamcommunity.com') return null;
+    const id = itemRef('app', GAME_HOVER_APP_PATH.exec(url.pathname)?.[1])?.id;
+    return id ? { row: link, id } : null;
+  }
+
   /** @returns {{row: Element, id: string} | null} */
   function findGameHoverItem(target) {
+    if (location.hostname === 'steamcommunity.com') return findActivityGameHoverItem(target);
     const closest = target?.closest?.(GAME_HOVER_ITEMS);
     if (!closest) return null;
     if (closest.id === 'appHubAppName') {
@@ -4774,12 +4793,12 @@ targets = new Map([
 
   /** @returns {Promise<GameHoverDetails | null>} */
   async function loadGameHoverDetails(id, language, options) {
-    if (itemFromLink(location.pathname)?.id === id && location.pathname.startsWith('/app/')) {
+    if (location.origin === GAME_HOVER_STORE_ORIGIN && GAME_HOVER_APP_PATH.exec(location.pathname)?.[1] === id) {
       const details = parseGameHoverPage(document, id);
       if (details) return details;
     }
 
-    const storePage = new URL(`/app/${id}/`, location.origin);
+    const storePage = new URL(`/app/${id}/`, GAME_HOVER_STORE_ORIGIN);
     storePage.searchParams.set('l', language);
     try {
       const html = await gmGet(storePage.href, options);
@@ -4789,7 +4808,7 @@ targets = new Map([
       if (options.signal.aborted || error.status === 429) throw error;
     }
 
-    const fallback = new URL('/api/appdetails', location.origin);
+    const fallback = new URL('/api/appdetails', GAME_HOVER_STORE_ORIGIN);
     fallback.searchParams.set('appids', id);
     fallback.searchParams.set('l', language);
     const json = await gmGet(fallback.href, options);
@@ -5002,7 +5021,7 @@ targets = new Map([
     { name: 'friends', match: () => location.hostname === 'steamcommunity.com' && /\/friends\/?$/i.test(location.pathname), start: initializeFriendTools },
     { name: 'restrictions', key: 'sse_restrictions_enabled', match: () => /^(store\.steampowered\.com|steamcommunity\.com)$/.test(location.hostname), start: initializeRestrictionBadges },
     { name: 'wishlist-sale', key: 'sse_wishlist_sale_enabled', match: () => location.hostname === 'store.steampowered.com', start: initializeStoreSaleCountdown },
-    { name: 'game-hover', key: 'sse_game_hover_enabled', match: () => location.hostname === 'store.steampowered.com', start: initializeGameHover }
+    { name: 'game-hover', key: 'sse_game_hover_enabled', match: () => isGameHoverPage(), start: initializeGameHover }
   ];
   function startFeatureRuntime() {
     const runtime = createFeatureScope('runtime');

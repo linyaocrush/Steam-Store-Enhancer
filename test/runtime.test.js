@@ -107,6 +107,7 @@ test('runtime handles SPA routing, feature switches, repeated startup and page t
     function initializeFriendTools() { boot('friends'); }
     function initializeRestrictionBadges() { boot('restrictions'); }
      function initializeStoreSaleCountdown() { boot('wishlist-sale'); }
+     function isGameHoverPage() { return location.hostname === 'store.steampowered.com'; }
      function initializeGameHover() { boot('game-hover'); }`, context);
   vm.runInContext(await readFile(new URL('../src/main.js', import.meta.url), 'utf8'), context);
   assert.equal(starts.get('wishlist-sale'), 1);

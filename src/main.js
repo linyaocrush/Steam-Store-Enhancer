@@ -19,7 +19,7 @@
     { name: 'friends', match: () => location.hostname === 'steamcommunity.com' && /\/friends\/?$/i.test(location.pathname), start: initializeFriendTools },
     { name: 'restrictions', key: 'sse_restrictions_enabled', match: () => /^(store\.steampowered\.com|steamcommunity\.com)$/.test(location.hostname), start: initializeRestrictionBadges },
     { name: 'wishlist-sale', key: 'sse_wishlist_sale_enabled', match: () => location.hostname === 'store.steampowered.com', start: initializeStoreSaleCountdown },
-    { name: 'game-hover', key: 'sse_game_hover_enabled', match: () => location.hostname === 'store.steampowered.com', start: initializeGameHover }
+    { name: 'game-hover', key: 'sse_game_hover_enabled', match: () => isGameHoverPage(), start: initializeGameHover }
   ];
   function startFeatureRuntime() {
     const runtime = createFeatureScope('runtime');

@@ -1,6 +1,8 @@
   const GAME_HOVER_ROWS = '.search_result_row, .tab_item, .tab_row_item, .recommendation_link, .store_main_capsule, .store_capsule, .small_cap, .large_cap, .wishlist_row, .wishlistRowItem, [data-rfd-draggable-id^="WishlistItem-"]';
   const GAME_HOVER_ITEMS = `${GAME_HOVER_ROWS}, a[href*="/app/"], [data-ds-appid], [data-app-id], #appHubAppName`;
   const GAME_HOVER_APP_PATH = /^\/app\/(\d+)(?:\/|$)/;
+  const GAME_HOVER_STORE_ORIGIN = 'https://store.steampowered.com';
+  const GAME_HOVER_ACTIVITY = '#blotter_content, .blotter_block';
   const GAME_HOVER_NON_APP = '[data-ds-bundleid], [data-ds-packageid]';
   const GAME_HOVER_GAP = 8;
   const GAME_HOVER_MARGIN = 8;
@@ -19,8 +21,25 @@
    * @property {string | null} [reviews]
    */
 
+  function isGameHoverPage() {
+    return location.hostname === 'store.steampowered.com' ||
+      (location.hostname === 'steamcommunity.com' && /^\/(?:my|(?:id|profiles)\/[^/]+)\/home\/?$/i.test(location.pathname));
+  }
+
+  /** @returns {{row: Element, id: string} | null} */
+  function findActivityGameHoverItem(target) {
+    const link = target?.closest?.('a[href]');
+    if (!link?.textContent.trim() || !link.closest(GAME_HOVER_ACTIVITY)) return null;
+
+    const url = new URL(link.href, location.href);
+    if (url.origin !== GAME_HOVER_STORE_ORIGIN && url.origin !== 'https://steamcommunity.com') return null;
+    const id = itemRef('app', GAME_HOVER_APP_PATH.exec(url.pathname)?.[1])?.id;
+    return id ? { row: link, id } : null;
+  }
+
   /** @returns {{row: Element, id: string} | null} */
   function findGameHoverItem(target) {
+    if (location.hostname === 'steamcommunity.com') return findActivityGameHoverItem(target);
     const closest = target?.closest?.(GAME_HOVER_ITEMS);
     if (!closest) return null;
     if (closest.id === 'appHubAppName') {
@@ -162,12 +181,12 @@
 
   /** @returns {Promise<GameHoverDetails | null>} */
   async function loadGameHoverDetails(id, language, options) {
-    if (itemFromLink(location.pathname)?.id === id && location.pathname.startsWith('/app/')) {
+    if (location.origin === GAME_HOVER_STORE_ORIGIN && GAME_HOVER_APP_PATH.exec(location.pathname)?.[1] === id) {
       const details = parseGameHoverPage(document, id);
       if (details) return details;
     }
 
-    const storePage = new URL(`/app/${id}/`, location.origin);
+    const storePage = new URL(`/app/${id}/`, GAME_HOVER_STORE_ORIGIN);
     storePage.searchParams.set('l', language);
     try {
       const html = await gmGet(storePage.href, options);
@@ -177,7 +196,7 @@
       if (options.signal.aborted || error.status === 429) throw error;
     }
 
-    const fallback = new URL('/api/appdetails', location.origin);
+    const fallback = new URL('/api/appdetails', GAME_HOVER_STORE_ORIGIN);
     fallback.searchParams.set('appids', id);
     fallback.searchParams.set('l', language);
     const json = await gmGet(fallback.href, options);

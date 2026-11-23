@@ -96,6 +96,47 @@ test('hover review fallback uses the overall store summary and preserves its sou
   assert.equal(context.parseGameHoverStoreReviews({ querySelector: () => null }), null);
 });
 
+test('friend activity recognizes game names from store and community links inside the feed', async () => {
+  const { context } = await harness(['game-hover.js']);
+  Object.assign(context.location, {
+    hostname: 'steamcommunity.com', origin: 'https://steamcommunity.com', href: 'https://steamcommunity.com/id/player/home/'
+  });
+  for (const path of ['/my/home', '/id/player/home/', '/profiles/76561198000000000/home']) {
+    context.location.pathname = path;
+    assert.equal(context.isGameHoverPage(), true);
+  }
+  context.location.pathname = '/id/player/friends/';
+  assert.equal(context.isGameHoverPage(), false);
+
+  function hoverLink(href, textContent = 'Game name', inFeed = true) {
+    const link = { href, textContent, closest: () => inFeed ? {} : null };
+    return { link, result: context.findGameHoverItem({ closest: () => link }) };
+  }
+  for (const href of ['https://store.steampowered.com/app/42/Game/', 'https://steamcommunity.com/app/42/']) {
+    const { link, result } = hoverLink(href);
+    assert.equal(result.row, link);
+    assert.equal(result.id, '42');
+  }
+  assert.equal(hoverLink('https://example.com/app/42/').result, null);
+  assert.equal(hoverLink('https://steamcommunity.com/id/player/').result, null);
+  assert.equal(hoverLink('https://steamcommunity.com/app/42/', ' ').result, null);
+  assert.equal(hoverLink('https://steamcommunity.com/app/42/', 'Game name', false).result, null);
+});
+
+test('friend activity loads both the game page and its fallback from the Steam store', async () => {
+  const requests = [];
+  const { context, document } = await harness(['game-hover.js'], {
+    gmGet: async url => { requests.push(url); return '{}'; }
+  });
+  Object.assign(context.location, { origin: 'https://steamcommunity.com', pathname: '/my/home/' });
+  document.createElement = () => ({ content: { querySelector: () => null } });
+  await context.loadGameHoverDetails('42', 'schinese', { signal: new AbortController().signal });
+  assert.deepEqual(requests, [
+    'https://store.steampowered.com/app/42/?l=schinese',
+    'https://store.steampowered.com/api/appdetails?appids=42&l=schinese'
+  ]);
+});
+
 test('hover reviews use the current Steamworks endpoint and request all languages', async () => {
   const calls = [];
   const { context } = await harness(['game-hover.js'], {
