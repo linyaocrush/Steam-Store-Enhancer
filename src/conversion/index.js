@@ -166,7 +166,7 @@ static readString(jsonString, cls) {
       return this.request(cls, details);
     }
     static request(cls, details) {
-      return gmRequest(details.url, { ...details, signal: conversionScope?.signal }).then(response => {
+      return gmRequest(details.url, { signal: conversionScope?.signal, ...details }).then(response => {
         if (cls === String) return response.responseText;
         try { return Jsons.readJson(JSON.parse(response.responseText), cls); }
         catch (_) { throw invalidResponse('转换接口返回了无效 JSON'); }
@@ -276,8 +276,12 @@ static readString(jsonString, cls) {
     }
   }
   const RateManager = { instance: createRateService({ storage: GmUtils,
+    getSetting: () => SettingManager.instance.setting,
     getContext: () => SpcContext.getContext(),
-    fetchRates: from => Http.get(Map, `https://api.augmentedsteam.com/rates/v1?to=${from}`)
+    fetchRates: from => {
+      const url = `https://api.augmentedsteam.com/rates/v1?to=${encodeURIComponent(from)}`;
+      return Http.get(Map, url, { url, signal: featureScopes.get('runtime')?.signal });
+    }
   }) };
   class SpcManager {
     static instance = new SpcManager();
@@ -474,7 +478,7 @@ targets = new Map([
   async function initializeConversion() {
     if (!GM_getValue("sse_convert_enabled", true)) { log.debug('initialize.skip', '价格转换已关闭'); return; }
     const scope = conversionScope = createFeatureScope('conversion');
-    RateManager.instance.resetPending();
+    RateManager.instance.resetBreaker();
     scope.own(() => {
       const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
       while (walker.nextNode()) {
@@ -585,6 +589,7 @@ targets = new Map([
   return {
     get setting() { return SettingManager.instance.setting; },
     countries: countyInfos,
+    getRate: (source, target) => RateManager.instance.getRate(source, target),
     save: setting => SettingManager.instance.saveSetting(setting),
     start: initializeConversion
   };

@@ -5,7 +5,7 @@
 // @homepageURL  https://github.com/linyaocrush/Steam-Store-Enhancer
 // @downloadURL  https://raw.githubusercontent.com/linyaocrush/Steam-Store-Enhancer/main/Steam%20Store%20Enhancer.user.js
 // @updateURL    https://raw.githubusercontent.com/linyaocrush/Steam-Store-Enhancer/main/Steam%20Store%20Enhancer.user.js
-// @version      1.9.1
+// @version      1.10.0
 // @description  Steam 额外地区价格、汇率转换、快速加购、愿望单及商店列表折扣倒计时、购物车批量管理与家庭库游戏标记。
 // @author       linyaocrush, marioplus, Chr_, Cliencer Goge, Miku39
 // @license      AGPL-3.0
@@ -877,6 +877,7 @@
       '<div class="sapx-label">额外显示的地区</div>' +
       '<select class="sapx-select" id="sapx-region-select"></select>' +
       '</div>' +
+      '<div class="sapx-field"><label class="sapx-label" for="sse-extra-currency">额外地区价格显示货币</label><select class="sapx-select" id="sse-extra-currency"></select></div>' +
       
       '<div class="sapx-field"><label class="sapx-check"><input class="sapx-checkbox" id="sse-extra-enabled" type="checkbox" />启用额外地区价格</label></div>' +
       '<div class="sapx-field"><label class="sapx-check"><input class="sapx-checkbox" id="sse-convert-enabled" type="checkbox" />启用价格转换</label></div>' +
@@ -954,6 +955,17 @@
     showCode.checked = getShowRegionCode();
     const field = id => root.querySelector('#sse-' + id);
     const settings = conversion.setting;
+    const originalCurrency = document.createElement('option');
+    originalCurrency.value = '';
+    originalCurrency.textContent = '使用地区原币';
+    const currencyOptions = [...new Set(conversion.countries.map(country => country.currencyCode))].sort();
+    field('extra-currency').replaceChildren(originalCurrency, ...currencyOptions.map(currency => {
+      const option = document.createElement('option');
+      option.value = currency;
+      option.textContent = currency;
+      return option;
+    }));
+    field('extra-currency').value = currencyOptions.includes(settings.regionalDisplayCurrency) ? settings.regionalDisplayCurrency : '';
     field('extra-enabled').checked = GM_getValue('sse_extra_enabled', true);
     field('convert-enabled').checked = GM_getValue('sse_convert_enabled', true);
     field('cart-enabled').checked = GM_getValue('sse_cart_enabled', true);
@@ -995,6 +1007,7 @@
         diagnostics.setLevel(logLevel);
         conversion.save({ ...settings,
           countyCode: field('convert-region').value,
+          regionalDisplayCurrency: field('extra-currency').value,
           currencySymbol: field('symbol').value,
           currencySymbolBeforeValue: field('position').value === 'before',
           rateCacheExpired: hours * 3600000,
@@ -1212,6 +1225,26 @@
     try { return new Intl.NumberFormat(undefined, { style: 'currency', currency }).format(major); } catch (e) { return String(major.toFixed(fd)) + ' ' + currency; }
   }
 
+  function steamCentsToMinor(cents, currency) {
+    // Steam returns hundredths even for currencies such as JPY.
+    if (!Number.isSafeInteger(cents) || cents < 0) throw invalidResponse('地区价格金额无效');
+    return Math.round(cents * Math.pow(10, getCurrencyFractionDigits(currency)) / 100);
+  }
+
+  async function formatRegionalDisplayPrice(minor, source, original) {
+    const target = conversion.setting.regionalDisplayCurrency;
+    if (!target || source === target) return original;
+    try {
+      const rate = minor === 0 ? 1 : await conversion.getRate(source, target);
+      const amount = minor / Math.pow(10, getCurrencyFractionDigits(source)) / rate;
+      if (!(rate > 0) || !Number.isFinite(amount)) throw new Error('换算金额无效');
+      return '≈ ' + new Intl.NumberFormat(undefined, { style: 'currency', currency: target, currencyDisplay: 'code' }).format(amount);
+    } catch (error) {
+      regionalLog.debug('conversion.fallback', '额外地区汇率不可用，显示原币价格', { source, target, error });
+      return original;
+    }
+  }
+
   const priceCache = new Map();
   const pendingPrices = new Map();
   const pendingElements = new WeakSet();
@@ -1254,13 +1287,13 @@
     const block = parsed && parsed[String(appid)];
     if (!block || !block.success) return null;
     const data = block.data || {};
-    if (data.is_free) return normalizePrice({ currency: currencyFallback, final: 0, initial: 0, finalFormatted: 'Free', initialFormatted: 'Free' });
+    if (data.is_free) return { ...normalizePrice({ currency: currencyFallback, final: 0, initial: 0, finalFormatted: 'Free', initialFormatted: 'Free' }), free: true };
     const po = data.price_overview;
     if (!po) return null;
     return normalizePrice({
       currency: po.currency,
-      final: po.final,
-      initial: po.initial,
+      final: steamCentsToMinor(po.final, po.currency),
+      initial: steamCentsToMinor(po.initial, po.currency),
       finalFormatted: po.final_formatted,
       initialFormatted: po.initial_formatted || po.final_formatted,
       discountPercent: po.discount_percent
@@ -1287,10 +1320,12 @@
         }
         if (po && po.final_price_in_cents !== undefined) {
           if (!po.currency_code || po.currency_code === currencyFallback) {
+            const final = parseInt(po.final_price_in_cents, 10);
+            const initial = parseInt(po.original_price_in_cents || po.final_price_in_cents, 10);
             return normalizePrice({
               currency: po.currency_code || currencyFallback,
-              final: parseInt(po.final_price_in_cents, 10),
-              initial: po.original_price_in_cents ? parseInt(po.original_price_in_cents, 10) : parseInt(po.final_price_in_cents, 10),
+              final: steamCentsToMinor(final, currencyFallback),
+              initial: steamCentsToMinor(initial, currencyFallback),
               finalFormatted: po.formatted_final_price,
               initialFormatted: po.formatted_original_price || po.formatted_final_price,
               discountPercent: po.discount_pct
@@ -1309,12 +1344,15 @@
       if (!block || !block.success) return null;
       const p = (block.data && (block.data.price || block.data.price_overview)) || null;
       if (!p) return null;
+      const currency = p.currency || currencyFallback;
+      const final = steamCentsToMinor(p.final, currency);
+      const initial = steamCentsToMinor(p.initial, currency);
       return normalizePrice({
-        currency: p.currency || currencyFallback,
-        final: p.final,
-        initial: p.initial,
-        finalFormatted: p.final_formatted || formatMinorToCurrency(p.final, p.currency || currencyFallback),
-        initialFormatted: p.initial_formatted || formatMinorToCurrency(p.initial, p.currency || currencyFallback),
+        currency,
+        final,
+        initial,
+        finalFormatted: p.final_formatted || formatMinorToCurrency(final, currency),
+        initialFormatted: p.initial_formatted || formatMinorToCurrency(initial, currency),
         discountPercent: p.discount_percent
       });
     } catch (e) {
@@ -1359,8 +1397,8 @@
 
     const fullPrice = normalizePrice({
       currency: po.currency_code || currencyFallback,
-      final: Math.round(finalMinor * Math.pow(10, getCurrencyFractionDigits(currencyFallback)) / 100),
-      initial: Math.round((Number.isFinite(initialMinor) ? initialMinor : finalMinor) * Math.pow(10, getCurrencyFractionDigits(currencyFallback)) / 100),
+      final: steamCentsToMinor(finalMinor, currencyFallback),
+      initial: steamCentsToMinor(Number.isFinite(initialMinor) ? initialMinor : finalMinor, currencyFallback),
       finalFormatted: po.formatted_final_price,
       initialFormatted: po.formatted_original_price || po.formatted_final_price,
       discountPercent: po.discount_pct
@@ -1507,8 +1545,17 @@
     pendingElements.add(priceEl);
     const scope = regionalScope;
     const wantInitial = forceType === 'initial' || (forceType === 'auto' && isOriginalPriceElement(priceEl));
-    let price;
-    try { price = await getPriceForItem(item, region); }
+    let price, formatted;
+    try {
+      price = await getPriceForItem(item, region);
+      if (!priceEl.isConnected || scope?.active === false) return;
+      if (price?.ok) {
+        formatted = wantInitial ? (price.initialFormatted || price.finalFormatted) : price.finalFormatted;
+        if (formatted && !price.free) {
+          formatted = await formatRegionalDisplayPrice(wantInitial ? price.initial : price.final, price.currency, formatted);
+        }
+      }
+    }
     finally { pendingElements.delete(priceEl); }
     if (!priceEl.isConnected || scope?.active === false || getTargetRegion().id !== region.id) return;
     const current = inferRegionalPriceItem(priceEl);
@@ -1521,7 +1568,6 @@
     }
     priceEl.querySelector('.sapx-region-locked')?.remove();
 
-    const formatted = wantInitial ? (price.initialFormatted || price.finalFormatted) : price.finalFormatted;
     if (!formatted) return;
 
     upsertExtraInside(priceEl, region, formatted, price);
@@ -1565,9 +1611,6 @@
     }));
     if (revision !== summaryRevision || scope?.active === false || location.pathname !== path ||
         getTargetRegion().id !== region.id || !totalRow.isConnected) return;
-    const currentRows = getRegionalCartRows();
-    if (currentRows.length !== items.length || currentRows.some((row, i) => row !== items[i] ||
-        itemKey(inferCartItem(row) || {}) !== itemKey(refs[i] || {}))) return;
     const unidentified = refs.filter(item => !item).length;
     let failed = 0;
     let priced = 0;
@@ -1583,6 +1626,13 @@
       } else if (result.price === null) missingCount++;
     }
 
+    const totalText = priced ? await formatRegionalDisplayPrice(sumMinor, region.currency, formatMinorToCurrency(sumMinor, region.currency)) : '—';
+    if (revision !== summaryRevision || scope?.active === false || location.pathname !== path ||
+        getTargetRegion().id !== region.id || !totalRow.isConnected) return;
+    const currentRows = getRegionalCartRows();
+    if (currentRows.length !== items.length || currentRows.some((row, i) => row !== items[i] ||
+        itemKey(inferCartItem(row) || {}) !== itemKey(refs[i] || {}))) return;
+
     let box = document.getElementById(CART_SUMMARY_ID);
     if (!box || !box.isConnected) {
       box = document.createElement('div');
@@ -1590,7 +1640,6 @@
       totalRow.after(box);
     }
 
-    const totalText = priced ? formatMinorToCurrency(sumMinor, region.currency) : '—';
     const unknownCount = unidentified + failed;
     const title = priced && priced < items.length ? '目标地区已确认小计' : '目标地区预计付款';
     const label = getShowRegionCode() ? title + ' (' + region.short + ')' : title;
@@ -1727,6 +1776,7 @@
     const STORAGE_KEY_SETTING = 'Storage:Setting';
     class Setting {
       countyCode = 'CN';
+      regionalDisplayCurrency = '';
       currencySymbol = '￥';
       currencySymbolBeforeValue = true;
       rateCacheExpired = 3600000;
@@ -1783,7 +1833,7 @@
   }
 
   // ---- conversion/rates.js ----
-  function createRateService({ storage, getContext, fetchRates }) {
+  function createRateService({ storage, getSetting, getContext, fetchRates }) {
     const log = diagnostics.scope('conversion.rates');
     const cacheKey = 'Storage:RateCache';
     class RateCaches {
@@ -1794,7 +1844,7 @@
     class RateManager {
       memoryCache = null;
       pendingRequests = new Map();
-      isBroken = false;
+      brokenPairs = new Set();
       async getRate4Remote(from, to) {
         const task = log.begin('fetch', { from, to });
         try {
@@ -1806,11 +1856,10 @@
         } catch (error) { task.fail(error); throw error; }
       }
       async getRate(source, target) {
-        if (this.isBroken) throw new Error('汇率服务已熔断，停止请求');
-        const context = getContext();
-        const from = source || context.currentCountyInfo.currencyCode;
-        const to = target || context.targetCountyInfo.currencyCode;
+        const from = source || getContext().currentCountyInfo.currencyCode;
+        const to = target || getContext().targetCountyInfo.currencyCode;
         const key = `${from}:${to}`;
+        if (this.brokenPairs.has(key)) throw new Error('该币种对的汇率请求已熔断');
         if (this.pendingRequests.has(key)) {
           log.debug('join', '复用进行中的汇率查询', { from, to });
           return this.pendingRequests.get(key);
@@ -1822,7 +1871,7 @@
           }
           let cache = this.memoryCache.getCache(from, to);
           const now = Date.now();
-          if (!cache?.rate || now > cache.createdAt + context.setting.rateCacheExpired) {
+          if (!cache?.rate || now > cache.createdAt + getSetting().rateCacheExpired) {
             log.debug('cache.miss', '汇率缓存缺失或过期', { from, to });
             try {
               const rate = await this.getRate4Remote(from, to);
@@ -1835,8 +1884,8 @@
                 log.warn('cache.stale', '远程刷新失败，使用旧汇率缓存', { from, to, error });
                 return cache.rate;
               }
-              this.isBroken = true;
-              log.error('breaker', '汇率不可用，停止后续远程请求', { from, to, error });
+              this.brokenPairs.add(key);
+              log.error('breaker', '汇率不可用，停止请求该币种对', { from, to, error });
               throw error;
             }
           } else log.debug('cache.hit', '命中汇率缓存', { from, to });
@@ -1847,7 +1896,7 @@
         finally { if (this.pendingRequests.get(key) === request) this.pendingRequests.delete(key); }
       }
       loadRateCache() {
-        const setting = getContext().setting;
+        const setting = getSetting();
         if (setting.oldVersion !== setting.currVersion) {
           log.debug('cache.invalidate', '版本变化，刷新汇率缓存');
           this.clear();
@@ -1865,7 +1914,7 @@
         storage.deleteValue(cacheKey);
         log.info('cache.clear', '汇率缓存已清除');
       }
-      resetPending() { this.pendingRequests.clear(); this.isBroken = false; }
+      resetBreaker() { this.brokenPairs.clear(); }
     }
     return new RateManager();
   }
@@ -2157,7 +2206,7 @@ static readString(jsonString, cls) {
       return this.request(cls, details);
     }
     static request(cls, details) {
-      return gmRequest(details.url, { ...details, signal: conversionScope?.signal }).then(response => {
+      return gmRequest(details.url, { signal: conversionScope?.signal, ...details }).then(response => {
         if (cls === String) return response.responseText;
         try { return Jsons.readJson(JSON.parse(response.responseText), cls); }
         catch (_) { throw invalidResponse('转换接口返回了无效 JSON'); }
@@ -2267,8 +2316,12 @@ static readString(jsonString, cls) {
     }
   }
   const RateManager = { instance: createRateService({ storage: GmUtils,
+    getSetting: () => SettingManager.instance.setting,
     getContext: () => SpcContext.getContext(),
-    fetchRates: from => Http.get(Map, `https://api.augmentedsteam.com/rates/v1?to=${from}`)
+    fetchRates: from => {
+      const url = `https://api.augmentedsteam.com/rates/v1?to=${encodeURIComponent(from)}`;
+      return Http.get(Map, url, { url, signal: featureScopes.get('runtime')?.signal });
+    }
   }) };
   class SpcManager {
     static instance = new SpcManager();
@@ -2465,7 +2518,7 @@ targets = new Map([
   async function initializeConversion() {
     if (!GM_getValue("sse_convert_enabled", true)) { log.debug('initialize.skip', '价格转换已关闭'); return; }
     const scope = conversionScope = createFeatureScope('conversion');
-    RateManager.instance.resetPending();
+    RateManager.instance.resetBreaker();
     scope.own(() => {
       const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
       while (walker.nextNode()) {
@@ -2576,6 +2629,7 @@ targets = new Map([
   return {
     get setting() { return SettingManager.instance.setting; },
     countries: countyInfos,
+    getRate: (source, target) => RateManager.instance.getRate(source, target),
     save: setting => SettingManager.instance.saveSetting(setting),
     start: initializeConversion
   };

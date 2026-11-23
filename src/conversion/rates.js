@@ -1,4 +1,4 @@
-  function createRateService({ storage, getContext, fetchRates }) {
+  function createRateService({ storage, getSetting, getContext, fetchRates }) {
     const log = diagnostics.scope('conversion.rates');
     const cacheKey = 'Storage:RateCache';
     class RateCaches {
@@ -9,7 +9,7 @@
     class RateManager {
       memoryCache = null;
       pendingRequests = new Map();
-      isBroken = false;
+      brokenPairs = new Set();
       async getRate4Remote(from, to) {
         const task = log.begin('fetch', { from, to });
         try {
@@ -21,11 +21,10 @@
         } catch (error) { task.fail(error); throw error; }
       }
       async getRate(source, target) {
-        if (this.isBroken) throw new Error('汇率服务已熔断，停止请求');
-        const context = getContext();
-        const from = source || context.currentCountyInfo.currencyCode;
-        const to = target || context.targetCountyInfo.currencyCode;
+        const from = source || getContext().currentCountyInfo.currencyCode;
+        const to = target || getContext().targetCountyInfo.currencyCode;
         const key = `${from}:${to}`;
+        if (this.brokenPairs.has(key)) throw new Error('该币种对的汇率请求已熔断');
         if (this.pendingRequests.has(key)) {
           log.debug('join', '复用进行中的汇率查询', { from, to });
           return this.pendingRequests.get(key);
@@ -37,7 +36,7 @@
           }
           let cache = this.memoryCache.getCache(from, to);
           const now = Date.now();
-          if (!cache?.rate || now > cache.createdAt + context.setting.rateCacheExpired) {
+          if (!cache?.rate || now > cache.createdAt + getSetting().rateCacheExpired) {
             log.debug('cache.miss', '汇率缓存缺失或过期', { from, to });
             try {
               const rate = await this.getRate4Remote(from, to);
@@ -50,8 +49,8 @@
                 log.warn('cache.stale', '远程刷新失败，使用旧汇率缓存', { from, to, error });
                 return cache.rate;
               }
-              this.isBroken = true;
-              log.error('breaker', '汇率不可用，停止后续远程请求', { from, to, error });
+              this.brokenPairs.add(key);
+              log.error('breaker', '汇率不可用，停止请求该币种对', { from, to, error });
               throw error;
             }
           } else log.debug('cache.hit', '命中汇率缓存', { from, to });
@@ -62,7 +61,7 @@
         finally { if (this.pendingRequests.get(key) === request) this.pendingRequests.delete(key); }
       }
       loadRateCache() {
-        const setting = getContext().setting;
+        const setting = getSetting();
         if (setting.oldVersion !== setting.currVersion) {
           log.debug('cache.invalidate', '版本变化，刷新汇率缓存');
           this.clear();
@@ -80,7 +79,7 @@
         storage.deleteValue(cacheKey);
         log.info('cache.clear', '汇率缓存已清除');
       }
-      resetPending() { this.pendingRequests.clear(); this.isBroken = false; }
+      resetBreaker() { this.brokenPairs.clear(); }
     }
     return new RateManager();
   }

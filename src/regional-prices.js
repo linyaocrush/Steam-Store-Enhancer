@@ -15,6 +15,26 @@
     try { return new Intl.NumberFormat(undefined, { style: 'currency', currency }).format(major); } catch (e) { return String(major.toFixed(fd)) + ' ' + currency; }
   }
 
+  function steamCentsToMinor(cents, currency) {
+    // Steam returns hundredths even for currencies such as JPY.
+    if (!Number.isSafeInteger(cents) || cents < 0) throw invalidResponse('地区价格金额无效');
+    return Math.round(cents * Math.pow(10, getCurrencyFractionDigits(currency)) / 100);
+  }
+
+  async function formatRegionalDisplayPrice(minor, source, original) {
+    const target = conversion.setting.regionalDisplayCurrency;
+    if (!target || source === target) return original;
+    try {
+      const rate = minor === 0 ? 1 : await conversion.getRate(source, target);
+      const amount = minor / Math.pow(10, getCurrencyFractionDigits(source)) / rate;
+      if (!(rate > 0) || !Number.isFinite(amount)) throw new Error('换算金额无效');
+      return '≈ ' + new Intl.NumberFormat(undefined, { style: 'currency', currency: target, currencyDisplay: 'code' }).format(amount);
+    } catch (error) {
+      regionalLog.debug('conversion.fallback', '额外地区汇率不可用，显示原币价格', { source, target, error });
+      return original;
+    }
+  }
+
   const priceCache = new Map();
   const pendingPrices = new Map();
   const pendingElements = new WeakSet();
@@ -57,13 +77,13 @@
     const block = parsed && parsed[String(appid)];
     if (!block || !block.success) return null;
     const data = block.data || {};
-    if (data.is_free) return normalizePrice({ currency: currencyFallback, final: 0, initial: 0, finalFormatted: 'Free', initialFormatted: 'Free' });
+    if (data.is_free) return { ...normalizePrice({ currency: currencyFallback, final: 0, initial: 0, finalFormatted: 'Free', initialFormatted: 'Free' }), free: true };
     const po = data.price_overview;
     if (!po) return null;
     return normalizePrice({
       currency: po.currency,
-      final: po.final,
-      initial: po.initial,
+      final: steamCentsToMinor(po.final, po.currency),
+      initial: steamCentsToMinor(po.initial, po.currency),
       finalFormatted: po.final_formatted,
       initialFormatted: po.initial_formatted || po.final_formatted,
       discountPercent: po.discount_percent
@@ -90,10 +110,12 @@
         }
         if (po && po.final_price_in_cents !== undefined) {
           if (!po.currency_code || po.currency_code === currencyFallback) {
+            const final = parseInt(po.final_price_in_cents, 10);
+            const initial = parseInt(po.original_price_in_cents || po.final_price_in_cents, 10);
             return normalizePrice({
               currency: po.currency_code || currencyFallback,
-              final: parseInt(po.final_price_in_cents, 10),
-              initial: po.original_price_in_cents ? parseInt(po.original_price_in_cents, 10) : parseInt(po.final_price_in_cents, 10),
+              final: steamCentsToMinor(final, currencyFallback),
+              initial: steamCentsToMinor(initial, currencyFallback),
               finalFormatted: po.formatted_final_price,
               initialFormatted: po.formatted_original_price || po.formatted_final_price,
               discountPercent: po.discount_pct
@@ -112,12 +134,15 @@
       if (!block || !block.success) return null;
       const p = (block.data && (block.data.price || block.data.price_overview)) || null;
       if (!p) return null;
+      const currency = p.currency || currencyFallback;
+      const final = steamCentsToMinor(p.final, currency);
+      const initial = steamCentsToMinor(p.initial, currency);
       return normalizePrice({
-        currency: p.currency || currencyFallback,
-        final: p.final,
-        initial: p.initial,
-        finalFormatted: p.final_formatted || formatMinorToCurrency(p.final, p.currency || currencyFallback),
-        initialFormatted: p.initial_formatted || formatMinorToCurrency(p.initial, p.currency || currencyFallback),
+        currency,
+        final,
+        initial,
+        finalFormatted: p.final_formatted || formatMinorToCurrency(final, currency),
+        initialFormatted: p.initial_formatted || formatMinorToCurrency(initial, currency),
         discountPercent: p.discount_percent
       });
     } catch (e) {
@@ -162,8 +187,8 @@
 
     const fullPrice = normalizePrice({
       currency: po.currency_code || currencyFallback,
-      final: Math.round(finalMinor * Math.pow(10, getCurrencyFractionDigits(currencyFallback)) / 100),
-      initial: Math.round((Number.isFinite(initialMinor) ? initialMinor : finalMinor) * Math.pow(10, getCurrencyFractionDigits(currencyFallback)) / 100),
+      final: steamCentsToMinor(finalMinor, currencyFallback),
+      initial: steamCentsToMinor(Number.isFinite(initialMinor) ? initialMinor : finalMinor, currencyFallback),
       finalFormatted: po.formatted_final_price,
       initialFormatted: po.formatted_original_price || po.formatted_final_price,
       discountPercent: po.discount_pct
@@ -310,8 +335,17 @@
     pendingElements.add(priceEl);
     const scope = regionalScope;
     const wantInitial = forceType === 'initial' || (forceType === 'auto' && isOriginalPriceElement(priceEl));
-    let price;
-    try { price = await getPriceForItem(item, region); }
+    let price, formatted;
+    try {
+      price = await getPriceForItem(item, region);
+      if (!priceEl.isConnected || scope?.active === false) return;
+      if (price?.ok) {
+        formatted = wantInitial ? (price.initialFormatted || price.finalFormatted) : price.finalFormatted;
+        if (formatted && !price.free) {
+          formatted = await formatRegionalDisplayPrice(wantInitial ? price.initial : price.final, price.currency, formatted);
+        }
+      }
+    }
     finally { pendingElements.delete(priceEl); }
     if (!priceEl.isConnected || scope?.active === false || getTargetRegion().id !== region.id) return;
     const current = inferRegionalPriceItem(priceEl);
@@ -324,7 +358,6 @@
     }
     priceEl.querySelector('.sapx-region-locked')?.remove();
 
-    const formatted = wantInitial ? (price.initialFormatted || price.finalFormatted) : price.finalFormatted;
     if (!formatted) return;
 
     upsertExtraInside(priceEl, region, formatted, price);
@@ -368,9 +401,6 @@
     }));
     if (revision !== summaryRevision || scope?.active === false || location.pathname !== path ||
         getTargetRegion().id !== region.id || !totalRow.isConnected) return;
-    const currentRows = getRegionalCartRows();
-    if (currentRows.length !== items.length || currentRows.some((row, i) => row !== items[i] ||
-        itemKey(inferCartItem(row) || {}) !== itemKey(refs[i] || {}))) return;
     const unidentified = refs.filter(item => !item).length;
     let failed = 0;
     let priced = 0;
@@ -386,6 +416,13 @@
       } else if (result.price === null) missingCount++;
     }
 
+    const totalText = priced ? await formatRegionalDisplayPrice(sumMinor, region.currency, formatMinorToCurrency(sumMinor, region.currency)) : '—';
+    if (revision !== summaryRevision || scope?.active === false || location.pathname !== path ||
+        getTargetRegion().id !== region.id || !totalRow.isConnected) return;
+    const currentRows = getRegionalCartRows();
+    if (currentRows.length !== items.length || currentRows.some((row, i) => row !== items[i] ||
+        itemKey(inferCartItem(row) || {}) !== itemKey(refs[i] || {}))) return;
+
     let box = document.getElementById(CART_SUMMARY_ID);
     if (!box || !box.isConnected) {
       box = document.createElement('div');
@@ -393,7 +430,6 @@
       totalRow.after(box);
     }
 
-    const totalText = priced ? formatMinorToCurrency(sumMinor, region.currency) : '—';
     const unknownCount = unidentified + failed;
     const title = priced && priced < items.length ? '目标地区已确认小计' : '目标地区预计付款';
     const label = getShowRegionCode() ? title + ' (' + region.short + ')' : title;

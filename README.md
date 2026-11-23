@@ -6,7 +6,7 @@
 
 让 Steam 商店、愿望单与购物车中的价格信息更直观。
 
-![Version](https://img.shields.io/badge/version-1.9.1-67c1f5?style=flat-square)
+![Version](https://img.shields.io/badge/version-1.10.0-67c1f5?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Tampermonkey-1b2838?style=flat-square)
 ![License](https://img.shields.io/badge/license-AGPL--3.0-green?style=flat-square)
 
@@ -27,6 +27,7 @@
 - 支持原价与折后价分别显示。
 - 提供中国、美国、日本、乌克兰、南亚美元等多个地区选项。
 - 可选择是否显示 `CN`、`US` 等地区代码。
+- 可指定额外地区价格的显示货币。币种不同时，原价、折后价和购物车地区合计使用自动汇率换算，并以 `≈` 标记。汇率不可用时显示地区原币。
 
 ### 🛒 购物车地区合计
 
@@ -161,6 +162,7 @@ npm test
 | 选项 | 作用 | 默认值 |
 | :--- | :--- | :--- |
 | 额外显示的地区 | 追加该地区的实际 Steam 售价 | 中国人民币 |
+| 额外地区价格显示货币 | 选择额外地区价格及地区合计的显示货币 | 使用地区原币 |
 | 启用额外地区价格 | 控制地区价格及购物车地区合计 | 开启 |
 | 启用价格转换 | 控制价格汇率换算 | 开启 |
 | 启用快速加购与购物车管理 | 控制加购按钮、列表提取和购物车工具面板 | 开启 |

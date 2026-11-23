@@ -60,6 +60,7 @@ export async function harness(files = [], extra = {}) {
     AbortController, URL, URLSearchParams, TextEncoder, Intl, console: { log() {}, info() {}, warn() {}, error() {} }, ...time,
     window, document, location: { href: 'https://store.steampowered.com/wishlist/', hostname: 'store.steampowered.com', pathname: '/wishlist/', search: '' },
     GM_getValue: (_, fallback) => fallback, GM_setValue() {}, GM_deleteValue() {},
+    conversion: { setting: { regionalDisplayCurrency: '' } },
     MutationObserver: class {
       constructor(callback) { this.callback = callback; this.disconnected = false; observers.push(this); }
       observe() {}

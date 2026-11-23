@@ -3,6 +3,7 @@
     const STORAGE_KEY_SETTING = 'Storage:Setting';
     class Setting {
       countyCode = 'CN';
+      regionalDisplayCurrency = '';
       currencySymbol = '￥';
       currencySymbolBeforeValue = true;
       rateCacheExpired = 3600000;

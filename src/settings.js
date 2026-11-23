@@ -15,6 +15,7 @@
       '<div class="sapx-label">额外显示的地区</div>' +
       '<select class="sapx-select" id="sapx-region-select"></select>' +
       '</div>' +
+      '<div class="sapx-field"><label class="sapx-label" for="sse-extra-currency">额外地区价格显示货币</label><select class="sapx-select" id="sse-extra-currency"></select></div>' +
       
       '<div class="sapx-field"><label class="sapx-check"><input class="sapx-checkbox" id="sse-extra-enabled" type="checkbox" />启用额外地区价格</label></div>' +
       '<div class="sapx-field"><label class="sapx-check"><input class="sapx-checkbox" id="sse-convert-enabled" type="checkbox" />启用价格转换</label></div>' +
@@ -92,6 +93,17 @@
     showCode.checked = getShowRegionCode();
     const field = id => root.querySelector('#sse-' + id);
     const settings = conversion.setting;
+    const originalCurrency = document.createElement('option');
+    originalCurrency.value = '';
+    originalCurrency.textContent = '使用地区原币';
+    const currencyOptions = [...new Set(conversion.countries.map(country => country.currencyCode))].sort();
+    field('extra-currency').replaceChildren(originalCurrency, ...currencyOptions.map(currency => {
+      const option = document.createElement('option');
+      option.value = currency;
+      option.textContent = currency;
+      return option;
+    }));
+    field('extra-currency').value = currencyOptions.includes(settings.regionalDisplayCurrency) ? settings.regionalDisplayCurrency : '';
     field('extra-enabled').checked = GM_getValue('sse_extra_enabled', true);
     field('convert-enabled').checked = GM_getValue('sse_convert_enabled', true);
     field('cart-enabled').checked = GM_getValue('sse_cart_enabled', true);
@@ -133,6 +145,7 @@
         diagnostics.setLevel(logLevel);
         conversion.save({ ...settings,
           countyCode: field('convert-region').value,
+          regionalDisplayCurrency: field('extra-currency').value,
           currencySymbol: field('symbol').value,
           currencySymbolBeforeValue: field('position').value === 'before',
           rateCacheExpired: hours * 3600000,

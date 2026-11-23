@@ -29,7 +29,8 @@ test('cart summary requests all items concurrently and discards obsolete results
   const box = { isConnected: true, innerHTML: '' };
   const { context, document } = await harness(['bundle-prices.js', 'regional-prices.js'], {
     isCartPage: () => true, getTargetRegion: () => region, getShowRegionCode: () => true,
-    CART_SUMMARY_ID: 'summary', EXTRA_CLASS: 'sapx-extra-price'
+    CART_SUMMARY_ID: 'summary', EXTRA_CLASS: 'sapx-extra-price',
+    conversion: { setting: { regionalDisplayCurrency: 'CNY' }, getRate: async () => 0.125 }
   });
   document.querySelectorAll = selector => selector.includes('role="button"') ? rows : selector.includes('n9HLAj') ? [total] : [];
   document.querySelector = () => total;
@@ -42,16 +43,16 @@ test('cart summary requests all items concurrently and discards obsolete results
   assert.equal(requests.length, 6);
   requests.slice(3).forEach(resolve => resolve({ ok: true, final: 200 }));
   await second;
-  assert.ok(box.innerHTML.includes('6.00'));
+  assert.match(box.innerHTML, /≈ CNY\s+48\.00/);
   requests.slice(0, 3).forEach(resolve => resolve({ ok: true, final: 999 }));
   await first;
-  assert.ok(box.innerHTML.includes('6.00'));
+  assert.match(box.innerHTML, /≈ CNY\s+48\.00/);
   assert.equal(inserted, 0);
   const third = context.updateCartSummary();
   rows[0] = cartRow('/sub/40');
   requests.slice(6).forEach(resolve => resolve({ ok: true, final: 500 }));
   await third;
-  assert.ok(box.innerHTML.includes('6.00'));
+  assert.match(box.innerHTML, /≈ CNY\s+48\.00/);
 });
 
 test('cart summary and displayed prices use the cart capsule instead of unrelated links', async () => {
@@ -162,4 +163,43 @@ test('extra cart price is rendered for an ambiguous bundle and follows a replace
   await context.enhancePriceElement(priceEl, 'final');
   assert.equal(extra.textContent, '(CN ¥30.00)');
   assert.deepEqual(calls, ['bundle:42', 'package:123']);
+});
+
+test('JPY Steam prices are converted into the selected currency without initializing account conversion', async () => {
+  const requests = [];
+  const { context } = await harness([
+    'config.js', 'network.js', 'regional-prices.js', 'conversion/settings.js',
+    'conversion/rates.js', 'conversion/price-processor.js', 'conversion/index.js'
+  ], {
+    GM_info: { script: { version: '1.10.0' } },
+    GM_xmlhttpRequest({ url, onload }) {
+      if (url.includes('/appdetails')) {
+        onload({ status: 200, responseText: JSON.stringify({ 10: { success: true, data: { price_overview: {
+          currency: 'JPY', initial: 150000, final: 75000, initial_formatted: '¥1,500', final_formatted: '¥750'
+        } } } }) });
+      } else {
+        requests.push(url);
+        onload({ status: 200, responseText: JSON.stringify({ USD: { JPY: 150 } }) });
+      }
+    }
+  });
+  const price = await context.getAppPrice('10', 'JP', 'JPY');
+  assert.deepEqual([price.initial, price.final], [1500, 750]);
+  const settings = vm.runInContext('conversion.setting', context);
+  const formatFinal = () => context.formatRegionalDisplayPrice(price.final, price.currency, price.finalFormatted);
+  assert.equal(await formatFinal(), '¥750');
+  settings.regionalDisplayCurrency = 'JPY';
+  assert.equal(await formatFinal(), '¥750');
+  assert.equal(requests.length, 0);
+  settings.regionalDisplayCurrency = 'USD';
+  const expected = amount => '≈ ' + new Intl.NumberFormat(undefined, {
+    style: 'currency', currency: 'USD', currencyDisplay: 'code'
+  }).format(amount);
+  assert.deepEqual(await Promise.all([
+    context.formatRegionalDisplayPrice(price.initial, price.currency, price.initialFormatted), formatFinal()
+  ]), [expected(10), expected(5)]);
+  assert.equal(await formatFinal(), expected(5));
+  assert.deepEqual(requests, ['https://api.augmentedsteam.com/rates/v1?to=JPY']);
+  settings.regionalDisplayCurrency = 'EUR';
+  assert.equal(await formatFinal(), '¥750');
 });

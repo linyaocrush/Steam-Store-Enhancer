@@ -21,7 +21,8 @@ async function harness({ cache, fetchRates } = {}) {
     const settings = createConversionSettings({Jsons, countyCode2Info: new Map()});
     if (cache) GM_setValue('Storage:RateCache', cache);
     const service = createRateService({storage: settings.storage, fetchRates,
-      getContext: () => ({setting: {oldVersion: '1.3.1', currVersion: '1.3.1', rateCacheExpired: 3600000},
+      getSetting: () => ({oldVersion: '1.3.1', currVersion: '1.3.1', rateCacheExpired: 3600000}),
+      getContext: () => ({
         currentCountyInfo: {currencyCode: 'USD'}, targetCountyInfo: {currencyCode: 'CNY'}})});
   `, context);
   return vm.runInContext('service', context);
@@ -41,14 +42,19 @@ test('concurrent currency queries merge into one request and then use memory cac
   assert.equal(calls, 1);
 });
 
-test('rate refresh failures fall back to stale cache, and missing rates trip the circuit breaker', async () => {
+test('rate refresh failures fall back to stale cache, and missing rates only block the affected pair', async () => {
   const stale = await harness({ cache: { from: 'USD', to: 'CNY', rate: 0.125, createdAt: 1 },
     fetchRates: async () => { throw Error('offline'); } });
   assert.equal(await stale.getRate(), 0.125);
-  assert.equal(stale.isBroken, false);
+  assert.equal(stale.brokenPairs.size, 0);
   let calls = 0;
-  const empty = await harness({ fetchRates: async () => { calls++; throw Error('offline'); } });
+  const empty = await harness({ fetchRates: async from => {
+    calls++;
+    if (from === 'JPY') return new Map([['USD', { JPY: 150 }]]);
+    throw Error('offline');
+  } });
   await assert.rejects(empty.getRate(), /offline/);
   await assert.rejects(empty.getRate(), /熔断/);
   assert.equal(calls, 1);
+  assert.equal(await empty.getRate('JPY', 'USD'), 150);
 });
