@@ -154,8 +154,26 @@ test('scanners share one body observer and only buffer relevant mutations', asyn
 test('runtime handles SPA routing, feature switches, repeated startup and page teardown', async () => {
   const store = new Map();
   const starts = new Map();
+  let user = '1';
+  let accountReads = 0;
+  const setLocation = path => {
+    const url = new URL(path, context.location.href);
+    Object.assign(context.location, { href: url.href, pathname: url.pathname, search: url.search, hash: url.hash });
+  };
+  const historyPrototype = {
+    pushState(state, title, url) {
+      assert.equal(this, page.history);
+      assert.equal(title, '');
+      if (url === 'invalid') throw new TypeError('invalid URL');
+      setLocation(url);
+      return state;
+    },
+    replaceState(state, title, url) { return historyPrototype.pushState.call(this, state, title, url); }
+  };
+  const page = { history: Object.create(historyPrototype), get UserConfig() { accountReads++; return { steamid: user }; } };
   const { readFile } = await import('node:fs/promises');
   const { context, time, window } = await harness([], {
+    unsafeWindow: page,
     GM_getValue: (key, fallback) => store.get(key) ?? fallback,
     GM_registerMenuCommand() {}, addStyle() {}, openSettingsUI() {}, clearScriptCaches() {},
     isWishlistPage: () => context.location.pathname.startsWith('/wishlist'),
@@ -176,20 +194,59 @@ test('runtime handles SPA routing, feature switches, repeated startup and page t
   assert.equal(starts.get('game-hover'), 1);
   await time.advance(2000);
   assert.equal(starts.get('wishlist-sale'), 1);
+  assert.equal(accountReads, 1);
+  assert.throws(() => page.history.pushState(null, '', 'invalid'), /invalid URL/);
+  page.history.replaceState(null, '', '/wishlist/');
+  await settle();
+  assert.equal(accountReads, 1);
   store.set('sse_cart_enabled', false);
   store.set('sse_game_hover_enabled', false);
   await time.advance(1000);
+  assert.equal(vm.runInContext("featureScopes.has('cart')", context), true);
+  await time.advance(2000);
   assert.equal(vm.runInContext("featureScopes.has('cart')", context), false);
   assert.equal(vm.runInContext("featureScopes.has('game-hover')", context), false);
   assert.equal(starts.get('wishlist-sale'), 1, 'unrelated feature should not restart when cart setting changes');
-  context.location.pathname = '/app/10/';
+  const state = {};
+  assert.equal(page.history.pushState(state, '', '/app/10/'), state);
+  page.history.replaceState(null, '', '?sort=1');
+  await settle();
+  assert.equal(starts.get('wishlist-sale'), 2);
+  setLocation('#details');
+  window.emit('hashchange');
+  await settle();
+  assert.equal(starts.get('wishlist-sale'), 3);
+  setLocation('/wishlist/');
   window.emit('popstate');
+  await settle();
   assert.equal(vm.runInContext("featureScopes.has('wishlist-sale')", context), true);
-  assert.ok(starts.get('wishlist-sale') >= 2);
+  assert.equal(starts.get('wishlist-sale'), 4);
+  page.history.replaceState(null, '', '?sort=2');
+  await settle();
+  assert.equal(starts.get('wishlist-sale'), 5);
+  user = '2';
+  await time.advance(5000);
+  assert.equal(starts.get('wishlist-sale'), 6);
+  page.SSR = { hydrated: false };
+  page.history.pushState(null, '', '/search/');
+  await settle();
+  assert.equal(vm.runInContext("featureScopes.has('wishlist-sale')", context), false);
+  page.SSR.hydrated = true;
+  await time.advance(5000);
+  assert.equal(starts.get('wishlist-sale'), 7);
+  historyPrototype.pushState.call(page.history, null, '', '/app/20/');
+  await time.advance(5000);
+  assert.equal(starts.get('wishlist-sale'), 8);
   assert.equal(starts.get('friends'), undefined);
   vm.runInContext('startFeatureRuntime()', context);
   assert.equal(time.size, 1);
+  window.emit('pagehide', { persisted: true });
+  assert.notEqual(page.history.pushState, historyPrototype.pushState);
+  window.emit('pageshow', { persisted: true });
   window.emit('pagehide', { persisted: false });
+  assert.equal(page.history.pushState, historyPrototype.pushState);
+  assert.equal(page.history.replaceState, historyPrototype.replaceState);
+  assert.equal(Object.hasOwn(page.history, 'pushState'), false);
   assert.equal(time.size, 0);
   assert.equal(vm.runInContext('featureScopes.size', context), 0);
   assert.equal(window.count(), 0);
