@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b1420">
+  <meta name="description" content="查看 Steam Store Enhancer 的跨区价格、实时汇率、购物车地区预估和折扣倒计时。">
+  <title>跨区价格与折扣 · Steam Store Enhancer</title>
+  <link rel="icon" href="./favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="./styles.css">
+  <script type="module" src="./main.js"></script>
+</head>
+<body class="subpage page-prices" data-page="prices">
+  <a class="skip" href="#main">跳到正文</a>
+  <header class="header"><div class="frame header-inner">
+    <a class="wordmark" href="./index.html"><span class="mark" aria-hidden="true">↗</span><span>Steam Store <strong>Enhancer</strong></span></a>
+    <nav aria-label="主导航"><a href="./prices.html" aria-current="page">价格与折扣</a><a href="./cart.html">购物车</a><a href="./social.html">好友工具</a><a href="./family.html">家庭库</a><a href="./install.html">安装</a></nav>
+  </div></header>
+  <main id="main">
+    <section class="sub-hero"><div class="frame sub-hero-inner">
+      <div class="sub-copy"><a class="back-link" href="./index.html">← 返回功能总览</a><p class="eyebrow">PRICE INTELLIGENCE · 01 / 05</p><h1>买之前，<br><em>先看看世界各地的价格。</em></h1><p>不必切换商店地区。原始价格、地区售价、汇率换算和购物车小计，各自标注，一目了然。</p><div class="actions"><a class="button primary" href="#regions">探索价格工具 <span aria-hidden="true">↓</span></a><a class="button secondary" href="https://greasyfork.org/zh-CN/scripts/605911-steam-store-enhancer">安装脚本 <span aria-hidden="true">↗</span></a></div></div>
+      <figure class="hero-visual page-visual price-scene" aria-label="地区比价示例">
+        <div class="price-scene-fallback" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
+        <figcaption class="visual-caption"><span>地区价格与折扣示意</span><span>ILLUSTRATIVE PRICES</span></figcaption>
+        <div class="quote quote-us"><span><i></i> US <small>美国</small></span><strong>$10.00</strong></div>
+        <div class="quote quote-cn"><span><i></i> CN <small>中国</small></span><strong>¥32.00</strong></div>
+        <button class="motion-toggle" type="button" hidden>暂停动画</button>
+      </figure>
+    </div></section>
+    <section class="frame feature-page section" aria-label="价格与折扣功能">
+      <div class="page-lead"><p class="eyebrow">当前售价之外，还能看到什么？</p><h2>让每一笔价格，都有来处。</h2><p>每种信息各司其职：Steam 地区定价回答「当地卖多少」，汇率换算回答「折合多少」，促销倒计时回答「还剩多久」。</p></div>
+      <article class="feature" id="regions" aria-labelledby="regions-title"><div class="feature-copy"><p class="eyebrow">商店 · 愿望单 · 购物车</p><h3 id="regions-title">额外地区价格</h3><p>在当前标价旁查看其他地区的 Steam 实际售价。支持游戏、套餐和捆绑包，也支持愿望单中的未折扣商品。</p><ul><li>可选中国、美国、日本、乌克兰、南亚美元等地区；分别显示原价、折后价，也可显示 CN、US 等地区代码。</li><li>可单独选择价格显示币种。原币和折后价均可换算，换算结果以 <code>≈</code> 标记；汇率暂不可用时显示地区原币。</li><li>地区价格是 Steam 的实际地区标价。Steam 确认该地区无可用售价时会显示「锁区」；临时网络或接口异常也可能造成价格暂缺。</li></ul></div><div class="preview animated-prices" aria-label="每个地区的游戏售价"><div class="preview-heading">星际探索 · 各区售价</div><div class="price-ticker" aria-live="off"><div class="price-track"><div class="price-chip"><span>US <small>美国</small></span><strong>$ 19.99</strong></div><div class="price-chip"><span>CN <small>中国</small></span><strong>¥ 68.00</strong></div><div class="price-chip"><span>JP <small>日本</small></span><strong>¥ 3,400</strong></div><div class="price-chip"><span>UA <small>乌克兰</small></span><strong>₴ 499</strong></div><div class="price-chip"><span>IN <small>南亚美元</small></span><strong>$ 14.99</strong></div><div class="price-chip"><span>US <small>美国</small></span><strong>$ 19.99</strong></div><div class="price-chip"><span>CN <small>中国</small></span><strong>¥ 68.00</strong></div><div class="price-chip"><span>JP <small>日本</small></span><strong>¥ 3,400</strong></div><div class="price-chip"><span>UA <small>乌克兰</small></span><strong>₴ 499</strong></div><div class="price-chip"><span>IN <small>南亚美元</small></span><strong>$ 14.99</strong></div></div></div><div class="preview-note">动画仅用于说明价格呈现方式，非实时商品数据。</div></div></article>
+      <article class="feature" id="exchange" aria-labelledby="exchange-title"><div class="feature-copy"><p class="eyebrow">商店 · 社区市场 · 购物车 · 结算</p><h3 id="exchange-title">价格汇率转换</h3><p>在 Steam 原始价格旁补充目标币种，原价保留，方便对照。支持自动汇率和自定义汇率，可单独设置目标地区、币种符号及其位置。</p><ul><li>自动汇率来自 Augmented Steam 服务，可设定汇率缓存时长；社区市场首页可以独立禁用转换。</li><li>购物车对商品单独扫描，即使账号币种与目标币种相同，也会识别购物车中的其他币种。无法获取账号地区时，会尝试根据币种符号识别来源货币。</li><li>购物车旁可显示目标地区已取得价格的商品小计，并统计无法获取地区价格的锁区商品。兑换结果以 <code>≈</code> 标记，汇率暂不可用时不影响原价。</li><li>自定义汇率填写「1 单位目标货币可换算的原货币数量」。例如美元转人民币、1 元人民币约换 0.125 美元时，<code>$10 ÷ 0.125 = ￥80</code>。</li></ul></div><div class="preview rate-preview"><div class="preview-heading">原价保留，换算另列</div><div class="rate-line"><span>Steam 标价</span><strong class="rate-original">$ 10.00</strong></div><div class="rate-line rate-formula"><span aria-hidden="true">↘</span><span>÷ 0.125 <small>手动汇率</small></span></div><div class="rate-line rate-result"><span>人民币换算</span><strong>≈ ￥ 80.00</strong></div><div class="preview-note">¥32.00 中国区售价，与汇率换算分开显示。</div></div></article>
+      <article class="feature" id="totals" aria-labelledby="totals-title"><div class="feature-copy"><p class="eyebrow">登录后可用 · Steam 购物车</p><h3 id="totals-title">购物车地区合计</h3><p>在购物车显示目标地区的预计付款与可计价商品的小计，无法取得目标地区价格的商品不会悄悄混入合计，并会单独提示数量。</p><ul><li>支持补齐的捆绑包按目标地区套餐价和捆绑折扣估算：账号拥有整个套餐，或拥有套餐内全部游戏时，才扣除已拥有部分。</li><li>套餐内仅部分游戏已拥有，仍按整个套餐计价；订阅提供的游戏不视作永久拥有，不作扣除。</li><li>没有可扣除项目或仅支持整套购买时保留整包价。礼物捆绑包始终标注整包价，不用购买者游戏库估算收礼人的价格。</li><li>数据不足的商品不计入小计。所有地区合计均为估算，实际购买资格与应付金额以 Steam 结算页面为准。</li></ul></div><div class="preview cart-total-preview"><div class="preview-heading">目标地区 · 购物车</div><div class="cart-total-lines"><div class="total-item"><span>深空旅人<span class="total-origin">CN ¥32.00</span></span><strong>¥32.00</strong></div><div class="total-item"><span>探索者组合<span class="total-origin">预计补齐</span></span><strong>¥18.00</strong></div><div class="total-item"><span>星海配乐<span class="total-origin">US $4.99</span></span><strong>≈ ¥35.00</strong></div><div class="total-divider"></div><div class="total-item total-sum"><span>目标地区预计付款</span><strong>¥85.00</strong></div></div><div class="total-notice"><span>●</span> 1 项无法获取地区价格，未计入小计</div><div class="preview-note">币种展示为演示数据，实际金额由 Steam 定价与可用汇率决定。</div></div></article>
+      <article class="feature" id="countdown" aria-labelledby="countdown-title"><div class="feature-copy"><p class="eyebrow">商店首页 · 搜索 · 推荐 · 愿望单</p><h3 id="countdown-title">折扣倒计时</h3><p>除了显示当前折扣，还可一眼看到促销什么时候结束。倒计时从游戏详情读取结束时间，显示在支持的可见游戏条目旁。</p><ul><li>用于首页、愿望单、搜索结果和商店推荐列表中的可见打折游戏。未参加折扣的商品不会显示倒计时。</li><li>配合地区比价，比较售价时也能留意优惠剩余时间。进入脚本「设置」可单独关闭这项功能。</li></ul></div><div class="preview discount-preview"><div class="preview-heading">每日特惠 · 演示</div><div class="discount-art" aria-hidden="true"><span class="discount-orbit"></span><span class="discount-sphere"></span><span class="discount-rays"></span></div><div class="discount-deal"><span class="discount-badge">−60%</span><span>促销剩余时间</span><strong class="discount-clock" data-countdown>1 天 08:42:00</strong></div><div class="preview-note">动态倒计时为演示动画，实际结束时间依游戏详情而定。</div></div></article>
+      <nav class="next-page" aria-label="下一专题"><span><small>NEXT · 02 / 05</small><strong>商店浏览与购物车 →</strong></span><a href="./cart.html" aria-label="继续了解商店浏览与购物车">→</a></nav>
+    </section>
+  </main>
+  <footer class="footer"><div class="frame footer-inner"><div><a class="wordmark" href="./index.html"><span class="mark" aria-hidden="true">↗</span><span>Steam Store <strong>Enhancer</strong></span></a><p>独立维护的社区脚本，与 Valve 无隶属关系。</p></div><div class="footer-links"><a href="./cart.html">商店与购物车 ↗</a><a href="https://github.com/linyaocrush/Steam-Store-Enhancer#许可证与致谢">许可证与致谢 ↗</a></div></div></footer>
+</body></html>

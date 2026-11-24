@@ -163,6 +163,19 @@ npm run check
 npm test
 ```
 
+## 项目展示站
+
+[Steam Store Enhancer 展示站](https://linyaocrush.github.io/Steam-Store-Enhancer/)由首页和五个专题页面组成：价格与折扣、商店与购物车、好友工具、家庭库、安装与设置。每页可直接访问，提供不同的 Three.js 场景和功能示例；无 WebGL 时仍可阅读。网站源码在 [`site/`](./site/) 中，版本号在构建时从 `src/metadata.txt` 读取。
+
+在项目根目录运行以下命令进行本地预览：
+
+```sh
+npm --prefix site ci
+npm --prefix site run dev
+```
+
+首次发布时，在仓库 **Settings → Pages → Build and deployment** 将 **Source** 设为 **GitHub Actions**。网站或脚本版本变更进入 `main` 后，[发布工作流](./.github/workflows/pages.yml)会构建并部署，也可在 Actions 中手动触发。生产构建命令为 `npm --prefix site run build`，输出至 `site/dist/`。
+
 ## 设置说明
 
 | 选项 | 作用 | 默认值 |

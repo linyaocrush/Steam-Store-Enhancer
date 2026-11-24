@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b1420">
+  <meta name="description" content="Steam Store Enhancer 油猴脚本：跨区比价、汇率换算、快速加购、好友工具和家庭库标记。">
+  <title>Steam Store Enhancer · Steam 商店增强脚本</title>
+  <link rel="icon" href="./favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="./styles.css">
+  <script type="module" src="./main.js"></script>
+</head>
+<body data-page="home">
+  <a class="skip" href="#main">跳到正文</a>
+  <header class="header" id="top"><div class="frame header-inner">
+    <a class="wordmark" href="./index.html" aria-current="page"><span class="mark" aria-hidden="true">↗</span><span>Steam Store <strong>Enhancer</strong></span></a>
+    <nav aria-label="主导航"><a href="./prices.html">价格与折扣</a><a href="./cart.html">购物车</a><a href="./social.html">好友工具</a><a href="./family.html">家庭库</a><a href="./install.html">安装</a></nav>
+  </div></header>
+  <main id="main">
+    <section class="hero" aria-labelledby="title"><div class="frame hero-inner">
+      <div class="hero-copy">
+        <p class="eyebrow hero-version"><span></span> TAMPERMONKEY <span class="version">v%USERSCRIPT_VERSION%</span></p>
+        <h1 id="title">Steam Store<br><em>Enhancer</em></h1>
+        <p class="hero-description">在 Steam 上直接比较不同地区的实际售价、查看折扣剩余时间、批量管理购物车，顺手确认家庭库里有没有这款游戏。</p>
+        <div class="actions"><a class="button primary" href="./install.html">安装指南 <span aria-hidden="true">↗</span></a><a class="button secondary" href="#features">探索功能 <span aria-hidden="true">↓</span></a></div>
+      </div>
+      <figure class="hero-visual" aria-label="3D 地球与示例地区价格">
+        <div class="globe-stage" aria-hidden="true"><div class="globe-fallback"><i></i><b></b></div><div id="globe" class="globe"></div></div>
+        <figcaption class="visual-caption"><span>地区价格示例</span><span>REGION PRICES</span></figcaption>
+        <div class="quote quote-us"><span><i></i> US <small>美国</small></span><strong>$10.00</strong></div>
+        <div class="quote quote-cn"><span><i></i> CN <small>中国</small></span><strong>¥32.00</strong></div>
+        <button class="motion-toggle" type="button" hidden>暂停动画</button>
+      </figure>
+    </div></section>
+    <div class="platform-bar"><div class="frame platform-inner"><span class="platform-label">适用页面</span><span>Steam 商店</span><span>愿望单</span><span>购物车</span><span>Steam 社区与市场</span><span>Steam 结算</span><span>其乐</span></div></div>
+    <section class="frame section" id="features" aria-labelledby="features-title">
+      <h2 id="features-title">功能专题</h2>
+      <div class="topic-grid">
+        <a class="topic topic-prices" href="./prices.html"><span class="topic-icon" aria-hidden="true">◎</span><small>01 · PRICES</small><h3>价格与折扣</h3><p>跨区定价、汇率换算、购物车地区合计和促销倒计时。</p><span class="topic-arrow" aria-hidden="true">→</span></a>
+        <a class="topic topic-cart" href="./cart.html"><span class="topic-icon" aria-hidden="true">▤</span><small>02 · STORE</small><h3>商店与购物车</h3><p>快速加购、批量导入导出、悬停详情和个人资料功能状态。</p><span class="topic-arrow" aria-hidden="true">→</span></a>
+        <a class="topic topic-social" href="./social.html"><span class="topic-icon" aria-hidden="true">◉</span><small>03 · SOCIAL</small><h3>好友工具</h3><p>使用 Steam 好友卡片批量留言、整理本地分组和查看统计。</p><span class="topic-arrow" aria-hidden="true">→</span></a>
+        <a class="topic topic-family" href="./family.html"><span class="topic-icon" aria-hidden="true">◈</span><small>04 · LIBRARY</small><h3>家庭库</h3><p>浏览时标记可共享游戏，查看成员贡献和最近购入。</p><span class="topic-arrow" aria-hidden="true">→</span></a>
+        <a class="topic topic-install" href="./install.html"><span class="topic-icon" aria-hidden="true">⚙</span><small>05 · SETUP</small><h3>安装与设置</h3><p>安装步骤、功能开关、缓存管理与诊断日志。</p><span class="topic-arrow" aria-hidden="true">→</span></a>
+      </div>
+    </section>
+  </main>
+  <footer class="footer"><div class="frame footer-inner"><div><a class="wordmark" href="#top"><span class="mark" aria-hidden="true">↗</span><span>Steam Store <strong>Enhancer</strong></span></a><p>独立维护的社区脚本，与 Valve 无隶属关系。</p></div><div class="footer-links"><a href="https://github.com/linyaocrush/Steam-Store-Enhancer">源代码 ↗</a><a href="https://github.com/linyaocrush/Steam-Store-Enhancer#许可证与致谢">脚本许可证与致谢 ↗</a><a href="./third-party-licenses.txt">网站第三方许可证</a></div></div></footer>
+</body>
+</html>
