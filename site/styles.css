@@ -27,7 +27,17 @@ button { font: inherit; }
 .header nav, .footer-links { display: flex; flex-wrap: wrap; align-items: center; gap: clamp(12px, 3vw, 35px); color: #c9d7e7; font-size: .88rem; }
 .wordmark { display: inline-flex; align-items: center; gap: 10px; font-weight: 750; letter-spacing: -.035em; }
 .wordmark strong { color: var(--cyan); }
-.mark { display: grid; place-items: center; width: 31px; height: 31px; border: 1px solid #5bb4df; border-radius: 5px; color: #a0e6ff; background: linear-gradient(155deg, #27516b, #142a3d); font: 700 20px/1 var(--mono); }
+.mark { display: block; flex: none; width: 38px; height: 38px; }
+.header .wordmark:is(:hover, :focus-visible) .mark { filter: drop-shadow(0 0 6px #5bcfff70); }
+
+@media (prefers-reduced-motion: no-preference) {
+  .header .wordmark:is(:hover, :focus-visible) .mark { animation: mark-engage 420ms ease-out; }
+  @keyframes mark-engage {
+    0%, 100% { transform: none; }
+    36% { transform: rotate(-9deg) scale(1.08); }
+    68% { transform: rotate(3deg) scale(1.02); }
+  }
+}
 
 .hero { position: relative; isolation: isolate; overflow: hidden; background: radial-gradient(ellipse at 73% 47%, #143d61 0%, #102842 34%, transparent 64%), linear-gradient(135deg, #142538, #101c2c 50%, #0d1a29); }
 .hero::before { content: ""; position: absolute; z-index: -1; inset: 0; opacity: .28; background: repeating-linear-gradient(90deg, #69b7e218 0 1px, transparent 1px 64px), repeating-linear-gradient(0deg, #69b7e218 0 1px, transparent 1px 64px); mask-image: linear-gradient(90deg, transparent 15%, #000 85%); }
@@ -275,7 +285,7 @@ code { color: #b7e5ff; overflow-wrap: anywhere; }
   .frame { width: calc(100% - 36px); }
   .header-inner { min-height: 58px; gap: 8px; }
   .wordmark { font-size: .8rem; gap: 5px; }
-  .mark { width: 25px; height: 25px; font-size: 16px; }
+  .mark { width: 30px; height: 30px; }
   .header nav { gap: 10px; font-size: .73rem; }
   .hero-inner { grid-template-columns: minmax(0, 1fr); }
   .hero-copy { padding-block: 43px 8px; }

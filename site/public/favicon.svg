@@ -1,4 +1,26 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
-  <rect x="1" y="1" width="30" height="30" rx="5" fill="#18364c" stroke="#5bb4df"/>
-  <path d="M10 22 22 10m-9 0h9v9" fill="none" stroke="#a0e6ff" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <defs>
+    <linearGradient id="housing" x2="0" y2="1">
+      <stop stop-color="#193953"/>
+      <stop offset="1" stop-color="#0b192b"/>
+    </linearGradient>
+    <linearGradient id="rim" x2="1" y2="1">
+      <stop stop-color="#78d4ff"/>
+      <stop offset=".65" stop-color="#315a78"/>
+      <stop offset="1" stop-color="#25455e"/>
+    </linearGradient>
+    <linearGradient id="linkage" x2=".7" y2="1">
+      <stop stop-color="#f0fbff"/>
+      <stop offset="1" stop-color="#76cfff"/>
+    </linearGradient>
+  </defs>
+  <path d="M14 2h36l12 12v36L50 62H14L2 50V14Z" fill="url(#housing)" stroke="url(#rim)" stroke-width="2"/>
+  <path d="M8 24v-7l9-9h8M39 56h8l9-9v-7" fill="none" stroke="#75cafa" stroke-opacity=".26" stroke-width="1.5"/>
+  <path d="m11 37 9 4 12-18 14 11-19 15a8 8 0 0 1-8 1l-9-4" fill="url(#linkage)"/>
+  <circle cx="41" cy="23" r="13" fill="url(#linkage)"/>
+  <circle cx="41" cy="23" r="8.5" fill="#11263c"/>
+  <circle cx="41" cy="23" r="4.5" fill="#5fcaff"/>
+  <circle cx="23" cy="43" r="8" fill="url(#linkage)"/>
+  <circle cx="23" cy="43" r="4.5" fill="#11263c"/>
+  <path d="M46 41v10m-5-5h10" fill="none" stroke="#71e8da" stroke-linecap="round" stroke-width="2.5"/>
 </svg>

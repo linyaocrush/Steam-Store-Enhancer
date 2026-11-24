@@ -5,8 +5,7 @@ on:
     branches: [main]
     paths:
       - 'site/**'
-      - 'src/metadata.txt'
-      - '.github/workflows/pages.yml'
+      - '!site/.gitignore'
   workflow_dispatch:
 
 permissions:
