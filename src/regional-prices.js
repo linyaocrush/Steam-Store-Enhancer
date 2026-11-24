@@ -37,7 +37,7 @@
 
   const priceCache = new Map();
   const pendingPrices = new Map();
-  const pendingElements = new WeakSet();
+  const pendingElements = new WeakMap();
   const CACHE_TTL_MS = 5 * 60 * 1000;
   let regionalScope;
   let summaryRevision = 0;
@@ -69,10 +69,22 @@
     };
   }
 
-  async function getAppPrice(appid, cc, currencyFallback) {
+  function requestRegionalPrice(url, signal, pending) {
+    const controller = pending?.queueController;
+    if (pending && !pending.eager && !pending.viewers.size) {
+      throw requestError('aborted', '价格查询已取消');
+    }
+    if (pending) pending.waiting = true;
+    return requestQueue.enqueue(() => {
+      if (pending) pending.waiting = false;
+      // Viewport exits cancel queue entries. In-flight fetches use the feature signal.
+      return gmGet(url, { signal, retries: 2 });
+    }, { signal: controller?.signal ?? signal });
+  }
+
+  async function getAppPrice(appid, cc, currencyFallback, signal = regionalScope?.signal, pending) {
     const url = 'https://store.steampowered.com/api/appdetails?appids=' + appid + '&cc=' + cc + '&filters=price_overview,is_free';
-    const signal = regionalScope?.signal;
-    const text = await requestQueue.enqueue(() => gmGet(url, { signal, retries: 2 }), { signal });
+    const text = await requestRegionalPrice(url, signal, pending);
     const parsed = JSON.parse(text);
     const block = parsed && parsed[String(appid)];
     if (!block || !block.success) return null;
@@ -90,7 +102,7 @@
     });
   }
 
-  async function getPackagePrice(packageid, cc, currencyFallback) {
+  async function getPackagePrice(packageid, cc, currencyFallback, signal = regionalScope?.signal, pending) {
     try {
       const payload = {
         ids: [{ packageid: parseInt(packageid, 10) }],
@@ -98,8 +110,7 @@
         data_request: { include_all_purchase_options: true }
       };
       const url = 'https://api.steampowered.com/IStoreBrowseService/GetItems/v1/?input_json=' + encodeURIComponent(JSON.stringify(payload));
-      const signal = regionalScope?.signal;
-      const text = await requestQueue.enqueue(() => gmGet(url, { signal, retries: 2 }), { signal });
+      const text = await requestRegionalPrice(url, signal, pending);
       const parsed = JSON.parse(text);
       const items = validateStoreItems(parsed);
       if (items && items.length > 0) {
@@ -127,8 +138,7 @@
 
     try {
       const url = 'https://store.steampowered.com/api/packagedetails?packageids=' + packageid + '&cc=' + cc;
-      const signal = regionalScope?.signal;
-      const text = await requestQueue.enqueue(() => gmGet(url, { signal, retries: 2 }), { signal });
+      const text = await requestRegionalPrice(url, signal, pending);
       const parsed = JSON.parse(text);
       const block = parsed && parsed[String(packageid)];
       if (!block || !block.success) return null;
@@ -151,7 +161,7 @@
     }
   }
 
-  async function getBundlePrice(bundleid, cc, currencyFallback) {
+  async function getBundlePrice(bundleid, cc, currencyFallback, signal = regionalScope?.signal, pending) {
     const payload = {
       ids: [{ bundleid: parseInt(bundleid, 10) }],
       context: {
@@ -164,8 +174,7 @@
       }
     };
     const url = 'https://api.steampowered.com/IStoreBrowseService/GetItems/v1/?input_json=' + encodeURIComponent(JSON.stringify(payload));
-    const signal = regionalScope?.signal;
-    const text = await requestQueue.enqueue(() => gmGet(url, { signal, retries: 2 }), { signal });
+    const text = await requestRegionalPrice(url, signal, pending);
     const parsed = JSON.parse(text);
     const items = validateStoreItems(parsed);
     if (!items || !items.length) return null;
@@ -193,7 +202,7 @@
       initialFormatted: po.formatted_original_price || po.formatted_final_price,
       discountPercent: po.discount_pct
     });
-    return personalizeRegionalBundle(bundleid, cc, currencyFallback, po, fullPrice);
+    return personalizeRegionalBundle(bundleid, cc, currencyFallback, po, fullPrice, signal);
   }
 
   let bundleCartRevision = 0;
@@ -204,16 +213,36 @@
       (isCartPage() ? 'cart:' + bundleCartRevision : 'store');
   }
 
-  function getPriceForItem(item, region) {
+  function getPriceForItem(item, region, viewer) {
+    if (viewer?.aborted) return Promise.reject(requestError('aborted', '价格查询已取消'));
     const key = regionalPriceKey(item, region);
-    if (pendingPrices.has(key)) { regionalLog.debug('price.join', '复用进行中的价格查询', { item: key }); return pendingPrices.get(key); }
-    const pending = fetchPriceForItem(item, region).finally(() => { if (pendingPrices.get(key) === pending) pendingPrices.delete(key); });
-    pendingPrices.set(key, pending);
-    return pending;
+    let pending = pendingPrices.get(key);
+    if (pending) regionalLog.debug('price.join', '复用进行中的价格查询', { item: key });
+    else {
+      pending = { viewers: new Map(), eager: false, waiting: false, queueController: new AbortController() };
+      pendingPrices.set(key, pending);
+    }
+    if (!viewer) pending.eager = true;
+    else if (!pending.viewers.has(viewer)) {
+      const leave = () => {
+        pending.viewers.delete(viewer);
+        if (pending.waiting && !pending.eager && !pending.viewers.size) {
+          if (pendingPrices.get(key) === pending) pendingPrices.delete(key);
+          pending.queueController.abort();
+        }
+      };
+      pending.viewers.set(viewer, leave);
+      viewer.addEventListener('abort', leave, { once: true });
+    }
+    pending.promise ??= fetchPriceForItem(item, region, key, pending).finally(() => {
+      if (pendingPrices.get(key) === pending) pendingPrices.delete(key);
+      for (const [signal, leave] of pending.viewers) signal.removeEventListener('abort', leave);
+      pending.viewers.clear();
+    });
+    return pending.promise;
   }
 
-  async function fetchPriceForItem(item, region) {
-    const key = regionalPriceKey(item, region);
+  async function fetchPriceForItem(item, region, key, pending) {
     const cached = cacheGet(key);
     if (cached !== undefined) { regionalLog.debug('cache.hit', '命中价格缓存', { item: key }); return cached; }
     const task = regionalLog.begin('price.fetch', { item: key });
@@ -224,9 +253,9 @@
       try {
         if (scope?.active === false) throw requestError('aborted', '价格查询已取消');
         let res = null;
-        if (item.type === 'app') res = await getAppPrice(item.id, cc, region.currency);
-        else if (item.type === 'package') res = await getPackagePrice(item.id, cc, region.currency);
-        else if (item.type === 'bundle') res = await getBundlePrice(item.id, cc, region.currency);
+        if (item.type === 'app') res = await getAppPrice(item.id, cc, region.currency, scope?.signal, pending);
+        else if (item.type === 'package') res = await getPackagePrice(item.id, cc, region.currency, scope?.signal, pending);
+        else if (item.type === 'bundle') res = await getBundlePrice(item.id, cc, region.currency, scope?.signal, pending);
         if (scope?.active === false) throw requestError('aborted', '价格查询已取消');
         if (res && res.ok) {
           if (item.type === 'bundle' || !res.currency || res.currency === region.currency) {
@@ -314,9 +343,8 @@
     return inferItemFromScope(priceEl);
   }
 
-  async function enhancePriceElement(priceEl, forceType = 'auto') {
-    if (!priceEl || priceEl.nodeType !== 1 || priceEl.classList.contains(EXTRA_CLASS)) return;
-    if (pendingElements.has(priceEl)) return;
+  async function enhancePriceElement(priceEl, forceType = 'auto', viewer) {
+    if (viewer?.aborted || !priceEl || priceEl.nodeType !== 1 || priceEl.classList.contains(EXTRA_CLASS)) return;
     const txt = priceEl.textContent.trim();
     if (!txt || /^-\d+%$/.test(txt) || txt.length > 120) return;
     const region = getTargetRegion();
@@ -332,13 +360,16 @@
     const locked = priceEl.querySelector('.sapx-region-locked');
     if (locked && locked.getAttribute(MARK_ATTR) === region.id) return;
 
-    pendingElements.add(priceEl);
     const scope = regionalScope;
+    const previous = pendingElements.get(priceEl);
+    if (previous && previous.scope === scope && previous.identity === identity && previous.viewer === viewer) return;
+    const attempt = { scope, identity, viewer };
+    pendingElements.set(priceEl, attempt);
     const wantInitial = forceType === 'initial' || (forceType === 'auto' && isOriginalPriceElement(priceEl));
     let price, formatted;
     try {
-      price = await getPriceForItem(item, region);
-      if (!priceEl.isConnected || scope?.active === false) return;
+      price = await getPriceForItem(item, region, viewer);
+      if (!priceEl.isConnected || scope?.active === false || viewer?.aborted) return;
       if (price?.ok) {
         formatted = wantInitial ? (price.initialFormatted || price.finalFormatted) : price.finalFormatted;
         if (formatted && !price.free) {
@@ -346,8 +377,8 @@
         }
       }
     }
-    finally { pendingElements.delete(priceEl); }
-    if (!priceEl.isConnected || scope?.active === false || getTargetRegion().id !== region.id) return;
+    finally { if (pendingElements.get(priceEl) === attempt) pendingElements.delete(priceEl); }
+    if (!priceEl.isConnected || scope?.active === false || viewer?.aborted || getTargetRegion().id !== region.id) return;
     const current = inferRegionalPriceItem(priceEl);
     if (!current || regionalPriceKey(current, region) !== identity) { scheduleScan(); return; }
     enhancedItems.set(priceEl, identity);
@@ -529,6 +560,7 @@
     const scope = regionalScope = createFeatureScope('regional-prices');
     scope.own(() => {
       summaryRevision++;
+      for (const pending of pendingPrices.values()) pending.queueController.abort();
       pendingPrices.clear();
       bundleCartCache.clear();
       bundleOwnershipCache.clear();
@@ -537,14 +569,21 @@
       cartSummaryRetry = null;
       document.querySelectorAll('.' + EXTRA_CLASS + ', .sapx-region-locked, #' + CART_SUMMARY_ID).forEach(node => node.remove());
     });
-    const safeEnhance = (el, type) => enhancePriceElement(el, type).catch(error => {
-      if (scope.active) regionalLog.debug('price.unconfirmed', '价格暂时无法确认', { error });
+    const safeEnhance = (el, type, viewer) => enhancePriceElement(el, type, viewer).catch(error => {
+      if (scope.active && error.kind !== 'aborted') regionalLog.debug('price.unconfirmed', '价格暂时无法确认', { error });
     });
     regionalScanner = createDomScanner({ scope, name: 'regional-prices', attributes: ITEM_ATTRIBUTES,
       selector: PRICE_SELECTORS + ',' + PAGE_ADAPTERS.wishlist.rows + ',' + PAGE_ADAPTERS.cart.rows,
-      process: elements => {
-        for (const el of elements) if (el.matches(PRICE_SELECTORS)) safeEnhance(el);
-        if (isWishlistPage()) scanWishlistFallback(elements.filter(el => el.matches(PAGE_ADAPTERS.wishlist.rows)), safeEnhance);
+      intersection: isCartPage() ? undefined : { rootMargin: '200px' },
+      process: (elements, visibilitySignal) => {
+        for (const el of elements) if (el.matches(PRICE_SELECTORS)) safeEnhance(el, 'auto', visibilitySignal?.(el));
+        if (isWishlistPage()) for (const row of elements) {
+          if (row.matches(PAGE_ADAPTERS.wishlist.rows)) {
+            scanWishlistFallback([row], (el, type) => {
+              if (!visibilitySignal || !el.matches(PRICE_SELECTORS)) safeEnhance(el, type, visibilitySignal?.(row));
+            });
+          }
+        }
         if (isCartPage()) scanCartFallback(elements.filter(el => el.matches(PAGE_ADAPTERS.cart.rows)), safeEnhance);
       },
       changed: () => {

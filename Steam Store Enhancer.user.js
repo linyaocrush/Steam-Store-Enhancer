@@ -5,7 +5,7 @@
 // @homepageURL  https://github.com/linyaocrush/Steam-Store-Enhancer
 // @downloadURL  https://raw.githubusercontent.com/linyaocrush/Steam-Store-Enhancer/main/Steam%20Store%20Enhancer.user.js
 // @updateURL    https://raw.githubusercontent.com/linyaocrush/Steam-Store-Enhancer/main/Steam%20Store%20Enhancer.user.js
-// @version      1.12.1
+// @version      1.13.0
 // @description  Steam 额外地区价格、汇率转换、悬停游戏详情、快速加购、愿望单及商店列表折扣倒计时、购物车批量管理与家庭库游戏标记。
 // @author       linyaocrush, marioplus, Chr_, Cliencer Goge, Miku39
 // @license      AGPL-3.0
@@ -380,7 +380,7 @@
   // One observer per feature, bounded to changed subtrees. Ancestors are only
   // matched, never searched recursively for each mutation.
   function createDomScanner({ scope, selector, process, changed, removed, delay = 200,
-    attributes = [], root = document.body, name = 'dom', initial = true }) {
+    attributes = [], root = document.body, name = 'dom', initial = true, intersection }) {
     const log = diagnostics.scope(name);
     const pending = new Set();
     const metrics = { fullScans: 0, batches: 0, candidates: 0, mutations: 0, durationMs: 0 };
@@ -389,6 +389,37 @@
     let lost = false;
     const removedNodes = new Set();
     const owned = node => Boolean(node?.matches?.(SCRIPT_OWNED_SELECTOR) || node?.closest?.(SCRIPT_OWNED_SELECTOR));
+    const visibility = new Map();
+    const visibilitySignal = node => visibility.get(node)?.signal;
+    const viewport = intersection && typeof IntersectionObserver === 'function'
+      ? new IntersectionObserver(onIntersection, intersection) : null;
+    function unobserve(node) {
+      visibility.get(node)?.abort();
+      visibility.delete(node);
+      viewport.unobserve(node);
+    }
+    async function processTargets(targets) {
+      try { await process(targets, viewport ? visibilitySignal : undefined); }
+      catch (error) { if (scope.active) log.error('scan.failed', '动态节点处理失败', { error }); }
+    }
+    function onIntersection(entries) {
+      if (!scope.active) return;
+      const states = new Map(entries.map(entry => [entry.target, entry.isIntersecting]));
+      const entered = [];
+      for (const [node, isIntersecting] of states) {
+        if (!visibility.has(node)) continue;
+        if (node.isConnected === false) { unobserve(node); continue; }
+        const controller = visibility.get(node);
+        if (isIntersecting && !controller) {
+          visibility.set(node, new AbortController());
+          entered.push(node);
+        } else if (!isIntersecting && controller) {
+          controller.abort();
+          visibility.set(node, null);
+        }
+      }
+      if (entered.length) processTargets(entered);
+    }
     function collect(node, descendants = true) {
       if (!node || owned(node)) return;
       if (node.nodeType === 3) node = node.parentElement;
@@ -415,7 +446,13 @@
       try {
         if (hadRemovals) removed?.(detachedNodes);
         if (hadChanges) changed?.();
-        if (targets.length) await process(targets);
+        const ready = viewport ? targets.filter(node => {
+          if (visibility.has(node)) return Boolean(visibility.get(node));
+          visibility.set(node, null);
+          viewport.observe(node);
+          return false;
+        }) : targets;
+        if (ready.length) await processTargets(ready);
       } catch (error) { if (scope.active) log.error('scan.failed', '动态节点处理失败', { error }); }
       metrics.batches++;
       metrics.candidates += targets.length;
@@ -425,6 +462,7 @@
     function schedule() { if (!cancelTimer) cancelTimer = scope.timeout(flush, delay); }
     function notify(mutations) {
       const visited = new Set();
+      let detachedElements = false;
       const collectOnce = (node, descendants) => {
         if (!node) return;
         const key = descendants ? node : null;
@@ -445,10 +483,16 @@
           additions.filter(external).forEach(node => collectOnce(node, true));
           if (removals.some(external)) {
             lost = true;
-            removals.filter(external).forEach(node => removedNodes.add(node));
+            for (const node of removals.filter(external)) {
+              removedNodes.add(node);
+              if (node.nodeType === 1 && node.isConnected === false) detachedElements = true;
+            }
           }
         } else collectOnce(mutation.target, mutation.type === 'attributes');
         dirty = true;
+      }
+      if (viewport && detachedElements) {
+        for (const node of visibility.keys()) if (node.isConnected === false) unobserve(node);
       }
       if (dirty) schedule();
     }
@@ -456,6 +500,11 @@
     observer.observe(root, { childList: true, subtree: true, characterData: true,
       ...(attributes.length ? { attributes: true, attributeFilter: attributes } : {}) });
     scope.own(() => { observer.disconnect(); cancelTimer?.(); pending.clear(); removedNodes.clear(); });
+    if (viewport) scope.own(() => {
+      viewport.disconnect();
+      for (const controller of visibility.values()) controller?.abort();
+      visibility.clear();
+    });
     const scan = () => {
       metrics.fullScans++;
       if (root === document.body && document.querySelectorAll) {
@@ -1193,12 +1242,11 @@
       completion: true, excluded: data.m_rgItems.length - remaining.length, remaining: remaining.length };
   }
 
-  async function personalizeRegionalBundle(bundleid, cc, currency, option, fullPrice) {
+  async function personalizeRegionalBundle(bundleid, cc, currency, option, fullPrice, signal = regionalScope?.signal) {
     if (option.must_purchase_as_set === true) return fullPrice;
     const session = regionalBundleSession();
     if (!session.steamid || session.steamid === '0') return fullPrice;
     if (option.must_purchase_as_set !== false) throw invalidResponse('捆绑包未返回补齐类型');
-    const signal = regionalScope?.signal;
     if (await bundlePurchaseMode(bundleid, session, signal) === 'gift') {
       // A recipient's library is not the buyer's library.
       return { ...fullPrice, fullBundle: true };
@@ -1258,7 +1306,7 @@
 
   const priceCache = new Map();
   const pendingPrices = new Map();
-  const pendingElements = new WeakSet();
+  const pendingElements = new WeakMap();
   const CACHE_TTL_MS = 5 * 60 * 1000;
   let regionalScope;
   let summaryRevision = 0;
@@ -1290,10 +1338,22 @@
     };
   }
 
-  async function getAppPrice(appid, cc, currencyFallback) {
+  function requestRegionalPrice(url, signal, pending) {
+    const controller = pending?.queueController;
+    if (pending && !pending.eager && !pending.viewers.size) {
+      throw requestError('aborted', '价格查询已取消');
+    }
+    if (pending) pending.waiting = true;
+    return requestQueue.enqueue(() => {
+      if (pending) pending.waiting = false;
+      // Viewport exits cancel queue entries. In-flight fetches use the feature signal.
+      return gmGet(url, { signal, retries: 2 });
+    }, { signal: controller?.signal ?? signal });
+  }
+
+  async function getAppPrice(appid, cc, currencyFallback, signal = regionalScope?.signal, pending) {
     const url = 'https://store.steampowered.com/api/appdetails?appids=' + appid + '&cc=' + cc + '&filters=price_overview,is_free';
-    const signal = regionalScope?.signal;
-    const text = await requestQueue.enqueue(() => gmGet(url, { signal, retries: 2 }), { signal });
+    const text = await requestRegionalPrice(url, signal, pending);
     const parsed = JSON.parse(text);
     const block = parsed && parsed[String(appid)];
     if (!block || !block.success) return null;
@@ -1311,7 +1371,7 @@
     });
   }
 
-  async function getPackagePrice(packageid, cc, currencyFallback) {
+  async function getPackagePrice(packageid, cc, currencyFallback, signal = regionalScope?.signal, pending) {
     try {
       const payload = {
         ids: [{ packageid: parseInt(packageid, 10) }],
@@ -1319,8 +1379,7 @@
         data_request: { include_all_purchase_options: true }
       };
       const url = 'https://api.steampowered.com/IStoreBrowseService/GetItems/v1/?input_json=' + encodeURIComponent(JSON.stringify(payload));
-      const signal = regionalScope?.signal;
-      const text = await requestQueue.enqueue(() => gmGet(url, { signal, retries: 2 }), { signal });
+      const text = await requestRegionalPrice(url, signal, pending);
       const parsed = JSON.parse(text);
       const items = validateStoreItems(parsed);
       if (items && items.length > 0) {
@@ -1348,8 +1407,7 @@
 
     try {
       const url = 'https://store.steampowered.com/api/packagedetails?packageids=' + packageid + '&cc=' + cc;
-      const signal = regionalScope?.signal;
-      const text = await requestQueue.enqueue(() => gmGet(url, { signal, retries: 2 }), { signal });
+      const text = await requestRegionalPrice(url, signal, pending);
       const parsed = JSON.parse(text);
       const block = parsed && parsed[String(packageid)];
       if (!block || !block.success) return null;
@@ -1372,7 +1430,7 @@
     }
   }
 
-  async function getBundlePrice(bundleid, cc, currencyFallback) {
+  async function getBundlePrice(bundleid, cc, currencyFallback, signal = regionalScope?.signal, pending) {
     const payload = {
       ids: [{ bundleid: parseInt(bundleid, 10) }],
       context: {
@@ -1385,8 +1443,7 @@
       }
     };
     const url = 'https://api.steampowered.com/IStoreBrowseService/GetItems/v1/?input_json=' + encodeURIComponent(JSON.stringify(payload));
-    const signal = regionalScope?.signal;
-    const text = await requestQueue.enqueue(() => gmGet(url, { signal, retries: 2 }), { signal });
+    const text = await requestRegionalPrice(url, signal, pending);
     const parsed = JSON.parse(text);
     const items = validateStoreItems(parsed);
     if (!items || !items.length) return null;
@@ -1414,7 +1471,7 @@
       initialFormatted: po.formatted_original_price || po.formatted_final_price,
       discountPercent: po.discount_pct
     });
-    return personalizeRegionalBundle(bundleid, cc, currencyFallback, po, fullPrice);
+    return personalizeRegionalBundle(bundleid, cc, currencyFallback, po, fullPrice, signal);
   }
 
   let bundleCartRevision = 0;
@@ -1425,16 +1482,36 @@
       (isCartPage() ? 'cart:' + bundleCartRevision : 'store');
   }
 
-  function getPriceForItem(item, region) {
+  function getPriceForItem(item, region, viewer) {
+    if (viewer?.aborted) return Promise.reject(requestError('aborted', '价格查询已取消'));
     const key = regionalPriceKey(item, region);
-    if (pendingPrices.has(key)) { regionalLog.debug('price.join', '复用进行中的价格查询', { item: key }); return pendingPrices.get(key); }
-    const pending = fetchPriceForItem(item, region).finally(() => { if (pendingPrices.get(key) === pending) pendingPrices.delete(key); });
-    pendingPrices.set(key, pending);
-    return pending;
+    let pending = pendingPrices.get(key);
+    if (pending) regionalLog.debug('price.join', '复用进行中的价格查询', { item: key });
+    else {
+      pending = { viewers: new Map(), eager: false, waiting: false, queueController: new AbortController() };
+      pendingPrices.set(key, pending);
+    }
+    if (!viewer) pending.eager = true;
+    else if (!pending.viewers.has(viewer)) {
+      const leave = () => {
+        pending.viewers.delete(viewer);
+        if (pending.waiting && !pending.eager && !pending.viewers.size) {
+          if (pendingPrices.get(key) === pending) pendingPrices.delete(key);
+          pending.queueController.abort();
+        }
+      };
+      pending.viewers.set(viewer, leave);
+      viewer.addEventListener('abort', leave, { once: true });
+    }
+    pending.promise ??= fetchPriceForItem(item, region, key, pending).finally(() => {
+      if (pendingPrices.get(key) === pending) pendingPrices.delete(key);
+      for (const [signal, leave] of pending.viewers) signal.removeEventListener('abort', leave);
+      pending.viewers.clear();
+    });
+    return pending.promise;
   }
 
-  async function fetchPriceForItem(item, region) {
-    const key = regionalPriceKey(item, region);
+  async function fetchPriceForItem(item, region, key, pending) {
     const cached = cacheGet(key);
     if (cached !== undefined) { regionalLog.debug('cache.hit', '命中价格缓存', { item: key }); return cached; }
     const task = regionalLog.begin('price.fetch', { item: key });
@@ -1445,9 +1522,9 @@
       try {
         if (scope?.active === false) throw requestError('aborted', '价格查询已取消');
         let res = null;
-        if (item.type === 'app') res = await getAppPrice(item.id, cc, region.currency);
-        else if (item.type === 'package') res = await getPackagePrice(item.id, cc, region.currency);
-        else if (item.type === 'bundle') res = await getBundlePrice(item.id, cc, region.currency);
+        if (item.type === 'app') res = await getAppPrice(item.id, cc, region.currency, scope?.signal, pending);
+        else if (item.type === 'package') res = await getPackagePrice(item.id, cc, region.currency, scope?.signal, pending);
+        else if (item.type === 'bundle') res = await getBundlePrice(item.id, cc, region.currency, scope?.signal, pending);
         if (scope?.active === false) throw requestError('aborted', '价格查询已取消');
         if (res && res.ok) {
           if (item.type === 'bundle' || !res.currency || res.currency === region.currency) {
@@ -1535,9 +1612,8 @@
     return inferItemFromScope(priceEl);
   }
 
-  async function enhancePriceElement(priceEl, forceType = 'auto') {
-    if (!priceEl || priceEl.nodeType !== 1 || priceEl.classList.contains(EXTRA_CLASS)) return;
-    if (pendingElements.has(priceEl)) return;
+  async function enhancePriceElement(priceEl, forceType = 'auto', viewer) {
+    if (viewer?.aborted || !priceEl || priceEl.nodeType !== 1 || priceEl.classList.contains(EXTRA_CLASS)) return;
     const txt = priceEl.textContent.trim();
     if (!txt || /^-\d+%$/.test(txt) || txt.length > 120) return;
     const region = getTargetRegion();
@@ -1553,13 +1629,16 @@
     const locked = priceEl.querySelector('.sapx-region-locked');
     if (locked && locked.getAttribute(MARK_ATTR) === region.id) return;
 
-    pendingElements.add(priceEl);
     const scope = regionalScope;
+    const previous = pendingElements.get(priceEl);
+    if (previous && previous.scope === scope && previous.identity === identity && previous.viewer === viewer) return;
+    const attempt = { scope, identity, viewer };
+    pendingElements.set(priceEl, attempt);
     const wantInitial = forceType === 'initial' || (forceType === 'auto' && isOriginalPriceElement(priceEl));
     let price, formatted;
     try {
-      price = await getPriceForItem(item, region);
-      if (!priceEl.isConnected || scope?.active === false) return;
+      price = await getPriceForItem(item, region, viewer);
+      if (!priceEl.isConnected || scope?.active === false || viewer?.aborted) return;
       if (price?.ok) {
         formatted = wantInitial ? (price.initialFormatted || price.finalFormatted) : price.finalFormatted;
         if (formatted && !price.free) {
@@ -1567,8 +1646,8 @@
         }
       }
     }
-    finally { pendingElements.delete(priceEl); }
-    if (!priceEl.isConnected || scope?.active === false || getTargetRegion().id !== region.id) return;
+    finally { if (pendingElements.get(priceEl) === attempt) pendingElements.delete(priceEl); }
+    if (!priceEl.isConnected || scope?.active === false || viewer?.aborted || getTargetRegion().id !== region.id) return;
     const current = inferRegionalPriceItem(priceEl);
     if (!current || regionalPriceKey(current, region) !== identity) { scheduleScan(); return; }
     enhancedItems.set(priceEl, identity);
@@ -1750,6 +1829,7 @@
     const scope = regionalScope = createFeatureScope('regional-prices');
     scope.own(() => {
       summaryRevision++;
+      for (const pending of pendingPrices.values()) pending.queueController.abort();
       pendingPrices.clear();
       bundleCartCache.clear();
       bundleOwnershipCache.clear();
@@ -1758,14 +1838,21 @@
       cartSummaryRetry = null;
       document.querySelectorAll('.' + EXTRA_CLASS + ', .sapx-region-locked, #' + CART_SUMMARY_ID).forEach(node => node.remove());
     });
-    const safeEnhance = (el, type) => enhancePriceElement(el, type).catch(error => {
-      if (scope.active) regionalLog.debug('price.unconfirmed', '价格暂时无法确认', { error });
+    const safeEnhance = (el, type, viewer) => enhancePriceElement(el, type, viewer).catch(error => {
+      if (scope.active && error.kind !== 'aborted') regionalLog.debug('price.unconfirmed', '价格暂时无法确认', { error });
     });
     regionalScanner = createDomScanner({ scope, name: 'regional-prices', attributes: ITEM_ATTRIBUTES,
       selector: PRICE_SELECTORS + ',' + PAGE_ADAPTERS.wishlist.rows + ',' + PAGE_ADAPTERS.cart.rows,
-      process: elements => {
-        for (const el of elements) if (el.matches(PRICE_SELECTORS)) safeEnhance(el);
-        if (isWishlistPage()) scanWishlistFallback(elements.filter(el => el.matches(PAGE_ADAPTERS.wishlist.rows)), safeEnhance);
+      intersection: isCartPage() ? undefined : { rootMargin: '200px' },
+      process: (elements, visibilitySignal) => {
+        for (const el of elements) if (el.matches(PRICE_SELECTORS)) safeEnhance(el, 'auto', visibilitySignal?.(el));
+        if (isWishlistPage()) for (const row of elements) {
+          if (row.matches(PAGE_ADAPTERS.wishlist.rows)) {
+            scanWishlistFallback([row], (el, type) => {
+              if (!visibilitySignal || !el.matches(PRICE_SELECTORS)) safeEnhance(el, type, visibilitySignal?.(row));
+            });
+          }
+        }
         if (isCartPage()) scanCartFallback(elements.filter(el => el.matches(PAGE_ADAPTERS.cart.rows)), safeEnhance);
       },
       changed: () => {

@@ -129,6 +129,93 @@ test('temporary regional network failure is not cached or labeled as confirmed u
   await settle();
 });
 
+test('regional prices only queue near the viewport and keep shared requests while a viewer remains', async () => {
+  let viewport;
+  const requests = [];
+  const { context, document, time, observers } = await harness(['network.js', 'bundle-prices.js', 'regional-prices.js'], {
+    isCartPage: () => false, isWishlistPage: () => false,
+    getTargetRegion: () => ({ id: 'USD', currency: 'USD', ccCandidates: ['US'] }),
+    EXTRA_CLASS: 'sapx-extra-price', MARK_ATTR: 'data-region', getShowRegionCode: () => false,
+    IntersectionObserver: class {
+      targets = new Set();
+      constructor(callback, options) { this.callback = callback; this.options = options; viewport = this; }
+      observe(node) { this.targets.add(node); }
+      unobserve(node) { this.targets.delete(node); }
+      disconnect() { this.targets.clear(); }
+      report(nodes, isIntersecting) { this.callback(nodes.map(target => ({ target, isIntersecting }))); }
+    },
+    GM_xmlhttpRequest({ url, onload }) {
+      const id = new URL(url).searchParams.get('appids');
+      requests.push({ id, finish: () => onload({ status: 200, responseText: JSON.stringify({
+        [id]: { success: true, data: { is_free: true } }
+      }) }) });
+    }
+  });
+  context.window.getComputedStyle = () => ({});
+  context.location.pathname = '/search/';
+  const selector = vm.runInContext('PRICE_SELECTORS', context);
+  const priceElement = id => ({
+    nodeType: 1, isConnected: true, appId: String(id), textContent: '$10.00',
+    classList: { contains: () => false }, matches: value => value.includes('.discount_final_price'),
+    closest(value) { return value === 'a[href]' ? { getAttribute: () => '/app/' + this.appId + '/' } : null; },
+    querySelector(value) { return value === '.sapx-extra-price' ? this.extra : null; },
+    querySelectorAll() { return []; }, appendChild(node) { this.extra = node; }
+  });
+  const prices = Array.from({ length: 200 }, (_, index) => priceElement(index + 1));
+  const duplicate = priceElement(5);
+  document.querySelectorAll = value => value.startsWith(selector) ? [...prices, duplicate] : [];
+  document.createElement = () => ({ style: {}, setAttribute() {} });
+  const scope = context.startObserver();
+  await time.advance(200);
+  assert.equal(viewport.options.rootMargin, '200px');
+  assert.equal(viewport.targets.size, 201);
+  viewport.report(prices.slice(6), false);
+  await settle();
+  assert.equal(requests.length, 0);
+
+  viewport.report([...prices.slice(0, 6), duplicate], true);
+  await settle();
+  const waiting = () => vm.runInContext('requestQueue.queue.length', context);
+  assert.deepEqual(requests.map(request => request.id), ['1', '2', '3', '4']);
+  assert.equal(waiting(), 2);
+  viewport.report([prices[0], prices[4], prices[5]], false);
+  assert.equal(waiting(), 1);
+  requests[0].finish();
+  await settle();
+  assert.equal(requests.at(-1).id, '5');
+  assert.equal(prices[0].extra, undefined);
+  requests.at(-1).finish();
+  await settle();
+  assert.equal(duplicate.extra.textContent, '(Free)');
+  assert.equal(prices[4].extra, undefined);
+
+  viewport.report([prices[0], prices[5]], true);
+  await settle();
+  assert.equal(prices[0].extra.textContent, '(Free)');
+  assert.deepEqual(requests.map(request => request.id), ['1', '2', '3', '4', '5', '6']);
+  viewport.report([prices[6]], true);
+  assert.equal(waiting(), 1);
+  prices[6].isConnected = false;
+  observers[0].callback([{ type: 'childList', target: document.body, removedNodes: [prices[6]] }]);
+  assert.equal(waiting(), 0);
+  assert.equal(viewport.targets.has(prices[6]), false);
+
+  prices[1].appId = '200';
+  requests[1].finish();
+  await settle();
+  assert.equal(prices[1].extra, undefined);
+  await time.advance(200);
+  const replacement = requests.filter(request => request.id === '200');
+  assert.equal(replacement.length, 1);
+  replacement[0].finish();
+  await settle();
+  assert.equal(prices[1].extra.textContent, '(Free)');
+
+  scope.dispose();
+  await settle();
+  assert.equal(viewport.targets.size, 0);
+});
+
 test('extra cart price is rendered for an ambiguous bundle and follows a replaced capsule', async () => {
   let row = cartRow('/bundle/42/');
   let extra;

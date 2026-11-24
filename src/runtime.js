@@ -64,7 +64,7 @@
   // One observer per feature, bounded to changed subtrees. Ancestors are only
   // matched, never searched recursively for each mutation.
   function createDomScanner({ scope, selector, process, changed, removed, delay = 200,
-    attributes = [], root = document.body, name = 'dom', initial = true }) {
+    attributes = [], root = document.body, name = 'dom', initial = true, intersection }) {
     const log = diagnostics.scope(name);
     const pending = new Set();
     const metrics = { fullScans: 0, batches: 0, candidates: 0, mutations: 0, durationMs: 0 };
@@ -73,6 +73,37 @@
     let lost = false;
     const removedNodes = new Set();
     const owned = node => Boolean(node?.matches?.(SCRIPT_OWNED_SELECTOR) || node?.closest?.(SCRIPT_OWNED_SELECTOR));
+    const visibility = new Map();
+    const visibilitySignal = node => visibility.get(node)?.signal;
+    const viewport = intersection && typeof IntersectionObserver === 'function'
+      ? new IntersectionObserver(onIntersection, intersection) : null;
+    function unobserve(node) {
+      visibility.get(node)?.abort();
+      visibility.delete(node);
+      viewport.unobserve(node);
+    }
+    async function processTargets(targets) {
+      try { await process(targets, viewport ? visibilitySignal : undefined); }
+      catch (error) { if (scope.active) log.error('scan.failed', '动态节点处理失败', { error }); }
+    }
+    function onIntersection(entries) {
+      if (!scope.active) return;
+      const states = new Map(entries.map(entry => [entry.target, entry.isIntersecting]));
+      const entered = [];
+      for (const [node, isIntersecting] of states) {
+        if (!visibility.has(node)) continue;
+        if (node.isConnected === false) { unobserve(node); continue; }
+        const controller = visibility.get(node);
+        if (isIntersecting && !controller) {
+          visibility.set(node, new AbortController());
+          entered.push(node);
+        } else if (!isIntersecting && controller) {
+          controller.abort();
+          visibility.set(node, null);
+        }
+      }
+      if (entered.length) processTargets(entered);
+    }
     function collect(node, descendants = true) {
       if (!node || owned(node)) return;
       if (node.nodeType === 3) node = node.parentElement;
@@ -99,7 +130,13 @@
       try {
         if (hadRemovals) removed?.(detachedNodes);
         if (hadChanges) changed?.();
-        if (targets.length) await process(targets);
+        const ready = viewport ? targets.filter(node => {
+          if (visibility.has(node)) return Boolean(visibility.get(node));
+          visibility.set(node, null);
+          viewport.observe(node);
+          return false;
+        }) : targets;
+        if (ready.length) await processTargets(ready);
       } catch (error) { if (scope.active) log.error('scan.failed', '动态节点处理失败', { error }); }
       metrics.batches++;
       metrics.candidates += targets.length;
@@ -109,6 +146,7 @@
     function schedule() { if (!cancelTimer) cancelTimer = scope.timeout(flush, delay); }
     function notify(mutations) {
       const visited = new Set();
+      let detachedElements = false;
       const collectOnce = (node, descendants) => {
         if (!node) return;
         const key = descendants ? node : null;
@@ -129,10 +167,16 @@
           additions.filter(external).forEach(node => collectOnce(node, true));
           if (removals.some(external)) {
             lost = true;
-            removals.filter(external).forEach(node => removedNodes.add(node));
+            for (const node of removals.filter(external)) {
+              removedNodes.add(node);
+              if (node.nodeType === 1 && node.isConnected === false) detachedElements = true;
+            }
           }
         } else collectOnce(mutation.target, mutation.type === 'attributes');
         dirty = true;
+      }
+      if (viewport && detachedElements) {
+        for (const node of visibility.keys()) if (node.isConnected === false) unobserve(node);
       }
       if (dirty) schedule();
     }
@@ -140,6 +184,11 @@
     observer.observe(root, { childList: true, subtree: true, characterData: true,
       ...(attributes.length ? { attributes: true, attributeFilter: attributes } : {}) });
     scope.own(() => { observer.disconnect(); cancelTimer?.(); pending.clear(); removedNodes.clear(); });
+    if (viewport) scope.own(() => {
+      viewport.disconnect();
+      for (const controller of visibility.values()) controller?.abort();
+      visibility.clear();
+    });
     const scan = () => {
       metrics.fullScans++;
       if (root === document.body && document.querySelectorAll) {

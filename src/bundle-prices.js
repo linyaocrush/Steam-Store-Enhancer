@@ -140,12 +140,11 @@
       completion: true, excluded: data.m_rgItems.length - remaining.length, remaining: remaining.length };
   }
 
-  async function personalizeRegionalBundle(bundleid, cc, currency, option, fullPrice) {
+  async function personalizeRegionalBundle(bundleid, cc, currency, option, fullPrice, signal = regionalScope?.signal) {
     if (option.must_purchase_as_set === true) return fullPrice;
     const session = regionalBundleSession();
     if (!session.steamid || session.steamid === '0') return fullPrice;
     if (option.must_purchase_as_set !== false) throw invalidResponse('捆绑包未返回补齐类型');
-    const signal = regionalScope?.signal;
     if (await bundlePurchaseMode(bundleid, session, signal) === 'gift') {
       // A recipient's library is not the buyer's library.
       return { ...fullPrice, fullBundle: true };
