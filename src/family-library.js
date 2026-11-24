@@ -397,10 +397,6 @@
           host.prepend(banner);
         }
       }
-      if (location.hostname === 'steamdb.keylol.com') {
-        const id = location.hash.match(/app\/(\d+)/)?.[1]; const game = cache.apps[id]; const host = document.querySelector('#game_score');
-        if (game && !game.owners.includes(cache.steamid) && host && !document.querySelector('.sse-family-banner')) host.after(createElement('div', '家庭组：' + gameDescription(game), 'sse-family-banner'));
-      }
     }
     if (enabled) {
       createDomScanner({ scope, name: 'family', selector: targets + ',' + PAGE_ADAPTERS.family.anchors, process: nodes => {

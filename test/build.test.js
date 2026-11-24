@@ -10,6 +10,17 @@ test('installable userscript is generated from all source modules', async () => 
   for (const source of sources) assert.ok(generated.includes(`// ---- ${source} ----`));
 });
 
+test('userscript runs only on supported Steam pages', async () => {
+  const generated = await build();
+  const metadata = generated.split('// ==/UserScript==')[0];
+  const includes = Array.from(metadata.matchAll(/^\/\/\s+@(?:match|include)\s+(\S+)/gm), match => match[1]);
+  assert.deepEqual(includes.sort(), [
+    'https://checkout.steampowered.com/checkout/*',
+    'https://steamcommunity.com/*',
+    'https://store.steampowered.com/*',
+  ]);
+});
+
 test('shared session and DOM helpers are used by feature modules', async () => {
   const shared = await readFile(new URL('../src/shared.js', import.meta.url), 'utf8');
   const family = await readFile(new URL('../src/family-library.js', import.meta.url), 'utf8');
