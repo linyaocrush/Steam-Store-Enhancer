@@ -367,7 +367,7 @@
       createDomScanner({ scope, name: 'family', selector: targets + ',' + PAGE_ADAPTERS.family.anchors, process: nodes => {
         if (nodes.some(node => node.matches(PAGE_ADAPTERS.family.anchors))) { ensureFamilyNav(); updateBanner(); }
         updateMarks(nodes.filter(node => node.matches(targets)));
-      }, attributes: ITEM_ATTRIBUTES,
+      }, attributes: ITEM_ATTRIBUTES, removalSelector: '[data-sse-family-app]',
         removed: nodes => {
           for (const removed of nodes) {
             const candidates = [removed, ...(removed.querySelectorAll?.('[data-sse-family-app]') || [])];

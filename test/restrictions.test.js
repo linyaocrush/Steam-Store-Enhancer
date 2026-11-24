@@ -151,7 +151,7 @@ test('badge mounts next to game title, updates recycled AppIDs and ignores its o
   observer([{ type: 'childList', target: title, addedNodes: [{ nodeType: 1, matches: () => true }], removedNodes: [] }]);
   assert.equal(scheduled, null);
   id = '20';
-  observer([{ type: 'attributes', target: row }]);
+  observer([{ type: 'attributes', target: row, attributeName: 'data-ds-appid' }]);
   scheduled(); scheduled = null;
   await flush();
   assert.equal(badges.length, 1);

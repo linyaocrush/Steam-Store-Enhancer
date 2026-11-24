@@ -522,7 +522,7 @@ targets = new Map([
     const exchangerManager = ConverterManager.instance;
     const selector = exchangerManager.getSelector();
     const scope = conversionScope || (conversionScope = createFeatureScope('conversion'));
-    const scanner = createDomScanner({ scope, selector, name: 'conversion', initial: false,
+    const scanner = createDomScanner({ scope, selector, name: 'conversion', initial: false, characterData: true,
       process: nodes => exchangerManager.convert(nodes) });
     scanner.scan();
     await scanner.flush();

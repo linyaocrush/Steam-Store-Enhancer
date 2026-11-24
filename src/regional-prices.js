@@ -572,9 +572,13 @@
     const safeEnhance = (el, type, viewer) => enhancePriceElement(el, type, viewer).catch(error => {
       if (scope.active && error.kind !== 'aborted') regionalLog.debug('price.unconfirmed', '价格暂时无法确认', { error });
     });
+    const cartPage = isCartPage();
+    const wishlistPage = isWishlistPage();
+    const prices = PRICE_SELECTORS + (cartPage ? ',.i1XZFikuzME-' : '');
     regionalScanner = createDomScanner({ scope, name: 'regional-prices', attributes: ITEM_ATTRIBUTES,
-      selector: PRICE_SELECTORS + ',' + PAGE_ADAPTERS.wishlist.rows + ',' + PAGE_ADAPTERS.cart.rows,
-      intersection: isCartPage() ? undefined : { rootMargin: '200px' },
+      selector: prices + ',' + PAGE_ADAPTERS.wishlist.rows + ',' + PAGE_ADAPTERS.cart.rows,
+      characterData: prices + (cartPage ? ',' + CART_ITEM_PRICES : '') + (wishlistPage ? ',' + PAGE_ADAPTERS.wishlist.rows : ''),
+      intersection: cartPage ? undefined : { rootMargin: '200px' },
       process: (elements, visibilitySignal) => {
         for (const el of elements) if (el.matches(PRICE_SELECTORS)) safeEnhance(el, 'auto', visibilitySignal?.(el));
         if (isWishlistPage()) for (const row of elements) {

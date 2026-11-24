@@ -343,8 +343,12 @@
       for (const badge of badges) if (!badge.isConnected) badges.delete(badge);
     }
 
-    const scanner = createDomScanner({ scope, selector: PAGE_ADAPTERS.wishlist.rows + ',' + PAGE_ADAPTERS.storeSale.rows, process: scan,
-      attributes: ITEM_ATTRIBUTES, name: 'wishlist-sale', removed: pruneRows, delay: 300 });
+    const saleRows = PAGE_ADAPTERS.wishlist.rows + ',' + PAGE_ADAPTERS.storeSale.rows;
+    const scanner = createDomScanner({ scope, selector: saleRows, process: scan,
+      attributes: ITEM_ATTRIBUTES,
+      characterData: '.discount_pct, :is(' + saleRows + ') a[href*="/app/"] :is(div, span), ' +
+        'a[href*="/app/"]:is(' + saleRows + ') :is(div, span)',
+      name: 'wishlist-sale', removed: pruneRows, delay: 300 });
     const homeTabs = document.querySelector('#home_tabs_row');
     if (homeTabs) {
       // Steam switches tabs by changing the existing panels' inline display styles.

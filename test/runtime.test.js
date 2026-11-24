@@ -75,18 +75,80 @@ test('100 mutations process only one new price instead of rescanning 1000 existi
 test('attribute changes collect descendants and ancestor rows; removal invokes housekeeping', async () => {
   const processed = [];
   let removed = 0;
-  const { context, time, observers } = await harness([], { process: nodes => processed.push(...nodes), removed: () => removed++ });
+  const { context, document, time, observers } = await harness([], { process: nodes => processed.push(...nodes), removed: () => removed++ });
   vm.runInContext(`globalThis.scope = createFeatureScope('recycle');
-    createDomScanner({ scope, selector: '.row, .price', process, removed, initial: false });`, context);
+    createDomScanner({ scope, selector: '.row, .price', process, removed, attributes: ['href'], initial: false });`, context);
   const row = { nodeType: 1, isConnected: true, matches: selector => selector === '.row, .price', closest: () => null, querySelectorAll: () => [child] };
   const child = { nodeType: 1, isConnected: true, matches: selector => selector === '.row, .price', closest: () => null, parentElement: row };
   row.closest = selector => selector === '.row, .price' ? row : null;
-  observers[0].callback([{ type: 'attributes', target: row }]);
+  observers[0].callback([{ type: 'attributes', target: row, attributeName: 'href' }]);
   await time.advance(200);
   assert.deepEqual(processed, [row, child]);
-  observers[0].callback([{ type: 'childList', target: row, addedNodes: [], removedNodes: [{ nodeType: 1 }] }]);
+  observers[0].callback([{ type: 'childList', target: document.body, removedNodes: [row] }]);
   await time.advance(200);
   assert.equal(removed, 1);
+});
+
+test('scanners share one body observer and only buffer relevant mutations', async () => {
+  const processed = [];
+  const { context, document, time, observers } = await harness([], {
+    record: (feature, nodes) => processed.push([feature, ...nodes.map(node => node.id)])
+  });
+  vm.runInContext(`globalThis.priceScope = createFeatureScope('price');
+    globalThis.cardScope = createFeatureScope('card');
+    globalThis.summaryScope = createFeatureScope('summary');
+    createDomScanner({ scope: priceScope, selector: '.price', initial: false, characterData: true,
+      attributes: ['data-price'], process: nodes => record('price', nodes) });
+    createDomScanner({ scope: cardScope, selector: '.card', initial: false,
+      attributes: ['href'], process: nodes => record('card', nodes) });
+    createDomScanner({ scope: summaryScope, selector: '.summary', initial: false, process() {},
+      characterData: '.total', changed: () => record('summary', []) });`, context);
+  assert.equal(observers.length, 1);
+  const [observer] = observers;
+  assert.equal(observer.root, document.body);
+  assert.equal(observer.options.characterData, true);
+  assert.deepEqual([...observer.options.attributeFilter], ['data-price', 'href']);
+
+  const element = id => ({ id, nodeType: 1, matches: selector => selector === '.' + id });
+  const price = element('price'), card = element('card');
+  price.parentElement = { closest: selector => card.matches(selector) ? card : null };
+  const text = { nodeType: 3, parentElement: price };
+  const branch = element('branch');
+  const queries = [];
+  branch.querySelectorAll = selector => { queries.push(selector); return [card, price]; };
+  observer.callback(Array.from({ length: 30 }, () => ({ type: 'childList', target: document.body, addedNodes: [branch] })));
+  await time.advance(200);
+  assert.equal(queries.length, 1);
+  assert.deepEqual(processed.splice(0), [['price', 'price'], ['card', 'card']]);
+
+  observer.callback([{ type: 'characterData', target: text }]);
+  await time.advance(200);
+  assert.deepEqual(processed.splice(0), [['price', 'price']]);
+  const total = { ...element('total'), closest: selector => selector === '.total' ? total : null,
+    parentElement: { closest: selector => selector === '.summary' ? element('summary') : null } };
+  observer.callback([{ type: 'characterData', target: { nodeType: 3, parentElement: total } }]);
+  await time.advance(200);
+  assert.deepEqual(processed.splice(0), [['summary']]);
+  observer.callback([{ type: 'attributes', target: price, attributeName: 'href' }]);
+  await time.advance(200);
+  assert.deepEqual(processed.splice(0), [['card', 'card']]);
+  observer.callback([{ type: 'childList', target: document.body, addedNodes: [element('unrelated')] }]);
+  assert.equal(time.size, 0);
+
+  observer.records.push({ type: 'attributes', target: card, attributeName: 'href' });
+  context.priceScope.dispose();
+  assert.equal(observer.disconnected, false);
+  assert.equal(observer.options.characterData, true);
+  assert.deepEqual([...observer.options.attributeFilter], ['href']);
+  await time.advance(200);
+  assert.deepEqual(processed.splice(0), [['card', 'card']]);
+  observer.callback([{ type: 'childList', target: document.body, removedNodes: [element('summary')] }]);
+  await time.advance(200);
+  assert.deepEqual(processed, [['summary']]);
+  context.summaryScope.dispose();
+  assert.equal(observer.options.characterData, false);
+  context.cardScope.dispose();
+  assert.equal(observer.disconnected, true);
 });
 
 test('runtime handles SPA routing, feature switches, repeated startup and page teardown', async () => {

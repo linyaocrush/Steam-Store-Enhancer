@@ -458,6 +458,8 @@
       if (nodes.some(node => node.matches(PAGE_ADAPTERS.cart.anchors))) mountPanel();
       scanQuickButtons(nodes.filter(node => node.matches(quickSelector)));
     }, name: 'cart', attributes: ITEM_ATTRIBUTES,
+      characterData: '.wishlist_row :is(button, a), [data-rfd-draggable-id^="WishlistItem-"] :is(button, a)',
+      removalSelector: '.sse-native-cart',
       removed: nodes => {
         for (const node of nodes) {
           const candidates = [node, ...(node.querySelectorAll?.('.sse-native-cart') || [])];

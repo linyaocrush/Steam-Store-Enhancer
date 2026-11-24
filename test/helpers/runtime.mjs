@@ -62,8 +62,10 @@ export async function harness(files = [], extra = {}) {
     GM_getValue: (_, fallback) => fallback, GM_setValue() {}, GM_deleteValue() {},
     conversion: { setting: { regionalDisplayCurrency: '' } },
     MutationObserver: class {
+      records = [];
       constructor(callback) { this.callback = callback; this.disconnected = false; observers.push(this); }
-      observe() {}
+      observe(root, options) { this.root = root; this.options = options; }
+      takeRecords() { return this.records.splice(0); }
       disconnect() { this.disconnected = true; }
     }, ...extra
   });

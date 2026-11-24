@@ -76,4 +76,7 @@ test('replacing a cart price text node triggers conversion again without duplica
   assert.equal(element.textContent, '$2.09(￥16.72)');
   await notify([{ type: 'characterData', target: element.text }]);
   assert.equal(element.textContent, '$2.09(￥16.72)');
+  element.text.nodeValue = '$3.00';
+  await notify([{ type: 'characterData', target: element.text }]);
+  assert.equal(element.textContent, '$3.00(￥24)');
 });

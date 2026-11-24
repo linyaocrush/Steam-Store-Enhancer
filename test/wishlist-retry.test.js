@@ -47,7 +47,7 @@ test('wishlist retries without DOM changes, deduplicates pending apps and contin
   assert.equal(rows[0].badge?.isConnected, true);
   assert.equal(rows[0].badge?.textContent.includes('剩余'), true);
   const before = calls.length;
-  observers[0].callback([{ type: 'attributes', target: rows[0] }]);
+  observers[0].callback([{ type: 'attributes', target: rows[0], attributeName: 'data-ds-appid' }]);
   await time.advance(500);
   assert.equal(calls.length, before);
   vm.runInContext("featureScopes.get('wishlist-sale').dispose()", context);
@@ -77,7 +77,7 @@ test('wishlist query claims all AppIDs while awaiting a response', async () => {
   await time.advance(500);
   assert.equal(count, 1);
   for (let i = 0; i < 5; i++) {
-    observers[0].callback([{ type: 'attributes', target: row }]);
+    observers[0].callback([{ type: 'attributes', target: row, attributeName: 'data-ds-appid' }]);
     await time.advance(500);
   }
   assert.equal(count, 1);

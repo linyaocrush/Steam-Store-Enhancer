@@ -5,7 +5,7 @@
 // @homepageURL  https://github.com/linyaocrush/Steam-Store-Enhancer
 // @downloadURL  https://raw.githubusercontent.com/linyaocrush/Steam-Store-Enhancer/main/Steam%20Store%20Enhancer.user.js
 // @updateURL    https://raw.githubusercontent.com/linyaocrush/Steam-Store-Enhancer/main/Steam%20Store%20Enhancer.user.js
-// @version      1.13.0
+// @version      1.14.0
 // @description  Steam 额外地区价格、汇率转换、悬停游戏详情、快速加购、愿望单及商店列表折扣倒计时、购物车批量管理与家庭库游戏标记。
 // @author       linyaocrush, marioplus, Chr_, Cliencer Goge, Miku39
 // @license      AGPL-3.0
@@ -377,18 +377,123 @@
     return result.concat(Array.from(root.querySelectorAll?.(selector) || []));
   }
 
-  // One observer per feature, bounded to changed subtrees. Ancestors are only
-  // matched, never searched recursively for each mutation.
+  const mutationHubs = new WeakMap();
+  const isScriptOwned = node => Boolean(node?.closest?.(SCRIPT_OWNED_SELECTOR) || node?.matches?.(SCRIPT_OWNED_SELECTOR));
+
+  function dispatchDomMutations(records, subscriptions, direct = false) {
+    if (!subscriptions.length) return;
+    const shallow = new Map();
+    const subtrees = new Map();
+    const removals = new Set();
+    const textTargets = new Set();
+    const batches = new Map(subscriptions.map(sub => [sub, { targets: new Set(), removals: [] }]));
+    const ownership = new Map();
+    const owned = node => {
+      if (!ownership.has(node)) ownership.set(node, isScriptOwned(node));
+      return ownership.get(node);
+    };
+    const external = node => node.nodeType === 3 || (node.nodeType === 1 && !owned(node));
+    function collect(map, node, interested) {
+      if (!node || owned(node) || !interested.length) return;
+      if (!map.has(node)) map.set(node, new Set());
+      for (const sub of interested) map.get(node).add(sub);
+    }
+    for (const record of records) {
+      const target = record.target.nodeType === 3 ? record.target.parentElement : record.target;
+      if (!target || owned(target)) continue;
+      if (record.type === 'childList') {
+        const added = Array.from(record.addedNodes || []);
+        const removed = Array.from(record.removedNodes || []);
+        const additions = added.filter(external);
+        const detached = removed.filter(external);
+        if ((added.length || removed.length) && !additions.length && !detached.length) continue;
+        collect(shallow, target, subscriptions);
+        for (const node of additions) {
+          collect(node.nodeType === 3 ? shallow : subtrees, node.nodeType === 3 ? target : node, subscriptions);
+        }
+        for (const node of detached) removals.add(node);
+      } else if (record.type === 'attributes') {
+        collect(subtrees, target, direct ? subscriptions : subscriptions.filter(sub => sub.attributes.includes(record.attributeName)));
+      } else if (record.type === 'characterData') {
+        textTargets.add(target);
+      }
+    }
+
+    const textSubscriptions = subscriptions.filter(sub => sub.characterData);
+    for (const target of textTargets) {
+      collect(shallow, target, textSubscriptions.filter(sub => sub.characterData === true || target.closest?.(sub.characterData)));
+    }
+    for (const [node, interested] of subtrees) collect(shallow, node, [...interested]);
+    for (const [node, interested] of shallow) for (const sub of interested) {
+      const { targets } = batches.get(sub);
+      if (node.matches?.(sub.selector)) targets.add(node);
+      const ancestor = node.parentElement?.closest?.(sub.selector);
+      if (ancestor && !owned(ancestor)) targets.add(ancestor);
+    }
+    // Search each changed subtree once with the union of interested selectors.
+    for (const [node, interested] of subtrees) {
+      const selector = [...new Set([...interested].map(sub => sub.selector))].join(',');
+      for (const match of node.querySelectorAll?.(selector) || []) {
+        if (owned(match)) continue;
+        for (const sub of interested) {
+          if (interested.size === 1 || match.matches(sub.selector)) {
+            batches.get(sub).targets.add(match);
+          }
+        }
+      }
+    }
+    const detached = [...removals].some(node => node.nodeType === 1 && node.isConnected === false);
+    for (const [sub, batch] of batches) {
+      if (sub.removalSelector) for (const node of removals) {
+        if (node.matches?.(sub.removalSelector) || node.querySelector?.(sub.removalSelector)) batch.removals.push(node);
+      }
+      const pruneVisibility = sub.trackVisibility && detached;
+      if (batch.targets.size || batch.removals.length || pruneVisibility) sub.receive(batch, pruneVisibility);
+    }
+  }
+
+  function subscribeDomMutations(root, subscription) {
+    let hub = mutationHubs.get(root);
+    if (!hub) {
+      const subscriptions = new Set();
+      const dispatch = records => dispatchDomMutations(records, [...subscriptions].filter(sub => sub.scope.active));
+      const observer = new MutationObserver(dispatch);
+      hub = { subscriptions, observer, dispatch, optionsKey: null };
+      mutationHubs.set(root, hub);
+    }
+    function updateOptions() {
+      const subscriptions = [...hub.subscriptions];
+      const attributes = [...new Set(subscriptions.flatMap(sub => sub.attributes))].sort();
+      const characterData = subscriptions.some(sub => sub.characterData);
+      const key = JSON.stringify([characterData, attributes]);
+      if (key === hub.optionsKey) return;
+      hub.optionsKey = key;
+      hub.observer.observe(root, { childList: true, subtree: true, characterData,
+        ...(attributes.length ? { attributes: true, attributeFilter: attributes } : {}) });
+    }
+    const drain = () => {
+      const records = hub.observer.takeRecords?.();
+      if (records?.length) hub.dispatch(records);
+    };
+    if (hub.subscriptions.size) drain();
+    hub.subscriptions.add(subscription);
+    updateOptions();
+    return () => {
+      hub.subscriptions.delete(subscription);
+      if (hub.subscriptions.size) { drain(); updateOptions(); }
+      else { hub.observer.disconnect(); mutationHubs.delete(root); }
+    };
+  }
+
   function createDomScanner({ scope, selector, process, changed, removed, delay = 200,
-    attributes = [], root = document.body, name = 'dom', initial = true, intersection }) {
+    attributes = [], characterData = false, removalSelector = selector, root = document.body,
+    name = 'dom', initial = true, intersection }) {
     const log = diagnostics.scope(name);
     const pending = new Set();
-    const metrics = { fullScans: 0, batches: 0, candidates: 0, mutations: 0, durationMs: 0 };
+    const metrics = { fullScans: 0, batches: 0, candidates: 0, durationMs: 0 };
     let cancelTimer;
     let dirty = false;
-    let lost = false;
     const removedNodes = new Set();
-    const owned = node => Boolean(node?.matches?.(SCRIPT_OWNED_SELECTOR) || node?.closest?.(SCRIPT_OWNED_SELECTOR));
     const visibility = new Map();
     const visibilitySignal = node => visibility.get(node)?.signal;
     const viewport = intersection && typeof IntersectionObserver === 'function'
@@ -420,17 +525,6 @@
       }
       if (entered.length) processTargets(entered);
     }
-    function collect(node, descendants = true) {
-      if (!node || owned(node)) return;
-      if (node.nodeType === 3) node = node.parentElement;
-      if (!node) return;
-      if (node.matches?.(selector)) pending.add(node);
-      const parent = node.parentElement?.closest?.(selector);
-      if (parent && !owned(parent)) pending.add(parent);
-      if (descendants) for (const match of node.querySelectorAll?.(selector) || []) {
-        if (!owned(match)) pending.add(match);
-      }
-    }
     async function flush() {
       const cancel = cancelTimer;
       cancelTimer = null;
@@ -438,13 +532,13 @@
       if (!scope.active) return;
       const targets = [...pending].filter(node => node.isConnected !== false);
       pending.clear();
-      const hadChanges = dirty, hadRemovals = lost;
+      const hadChanges = dirty;
       const detachedNodes = [...removedNodes];
       removedNodes.clear();
-      dirty = lost = false;
+      dirty = false;
       const start = Date.now();
       try {
-        if (hadRemovals) removed?.(detachedNodes);
+        if (detachedNodes.length) removed?.(detachedNodes);
         if (hadChanges) changed?.();
         const ready = viewport ? targets.filter(node => {
           if (visibility.has(node)) return Boolean(visibility.get(node));
@@ -460,46 +554,21 @@
       log.debug('scan.batch', '局部扫描完成', { ...metrics, targets: targets.length });
     }
     function schedule() { if (!cancelTimer) cancelTimer = scope.timeout(flush, delay); }
-    function notify(mutations) {
-      const visited = new Set();
-      let detachedElements = false;
-      const collectOnce = (node, descendants) => {
-        if (!node) return;
-        const key = descendants ? node : null;
-        if (key && visited.has(key)) return;
-        if (key) visited.add(key);
-        collect(node, descendants);
-      };
-      for (const mutation of mutations) {
-        if (owned(mutation.target.nodeType === 3 ? mutation.target.parentElement : mutation.target)) continue;
-        metrics.mutations++;
-        if (mutation.type === 'childList') {
-          const additions = Array.from(mutation.addedNodes || []);
-          const removals = Array.from(mutation.removedNodes || []);
-          const external = node => node.nodeType === 3 || (node.nodeType === 1 && !owned(node));
-          const externalChange = [...additions, ...removals].some(external);
-          if (!externalChange && (additions.length || removals.length)) continue;
-          collect(mutation.target, false);
-          additions.filter(external).forEach(node => collectOnce(node, true));
-          if (removals.some(external)) {
-            lost = true;
-            for (const node of removals.filter(external)) {
-              removedNodes.add(node);
-              if (node.nodeType === 1 && node.isConnected === false) detachedElements = true;
-            }
-          }
-        } else collectOnce(mutation.target, mutation.type === 'attributes');
+    const subscription = { scope, selector, attributes, characterData,
+      removalSelector: removed || changed ? removalSelector : null, trackVisibility: Boolean(viewport),
+      receive({ targets, removals }, detached) {
+        if (detached) {
+          for (const node of visibility.keys()) if (node.isConnected === false) unobserve(node);
+        }
+        if (!targets.size && !removals.length) return;
+        for (const node of targets) pending.add(node);
+        for (const node of removals) removedNodes.add(node);
         dirty = true;
-      }
-      if (viewport && detachedElements) {
-        for (const node of visibility.keys()) if (node.isConnected === false) unobserve(node);
-      }
-      if (dirty) schedule();
-    }
-    const observer = new MutationObserver(notify);
-    observer.observe(root, { childList: true, subtree: true, characterData: true,
-      ...(attributes.length ? { attributes: true, attributeFilter: attributes } : {}) });
-    scope.own(() => { observer.disconnect(); cancelTimer?.(); pending.clear(); removedNodes.clear(); });
+        schedule();
+      } };
+    const unsubscribe = subscribeDomMutations(root, subscription);
+    const notify = records => { if (scope.active) dispatchDomMutations(records, [subscription], true); };
+    scope.own(() => { unsubscribe(); cancelTimer?.(); pending.clear(); removedNodes.clear(); });
     if (viewport) scope.own(() => {
       viewport.disconnect();
       for (const controller of visibility.values()) controller?.abort();
@@ -508,8 +577,8 @@
     const scan = () => {
       metrics.fullScans++;
       if (root === document.body && document.querySelectorAll) {
-        for (const match of document.querySelectorAll(selector)) if (!owned(match)) pending.add(match);
-      } else collect(root);
+        for (const match of document.querySelectorAll(selector)) if (!isScriptOwned(match)) pending.add(match);
+      } else for (const match of queryIncluding(root, selector)) if (!isScriptOwned(match)) pending.add(match);
       dirty = true;
       schedule();
     };
@@ -1841,9 +1910,13 @@
     const safeEnhance = (el, type, viewer) => enhancePriceElement(el, type, viewer).catch(error => {
       if (scope.active && error.kind !== 'aborted') regionalLog.debug('price.unconfirmed', '价格暂时无法确认', { error });
     });
+    const cartPage = isCartPage();
+    const wishlistPage = isWishlistPage();
+    const prices = PRICE_SELECTORS + (cartPage ? ',.i1XZFikuzME-' : '');
     regionalScanner = createDomScanner({ scope, name: 'regional-prices', attributes: ITEM_ATTRIBUTES,
-      selector: PRICE_SELECTORS + ',' + PAGE_ADAPTERS.wishlist.rows + ',' + PAGE_ADAPTERS.cart.rows,
-      intersection: isCartPage() ? undefined : { rootMargin: '200px' },
+      selector: prices + ',' + PAGE_ADAPTERS.wishlist.rows + ',' + PAGE_ADAPTERS.cart.rows,
+      characterData: prices + (cartPage ? ',' + CART_ITEM_PRICES : '') + (wishlistPage ? ',' + PAGE_ADAPTERS.wishlist.rows : ''),
+      intersection: cartPage ? undefined : { rootMargin: '200px' },
       process: (elements, visibilitySignal) => {
         for (const el of elements) if (el.matches(PRICE_SELECTORS)) safeEnhance(el, 'auto', visibilitySignal?.(el));
         if (isWishlistPage()) for (const row of elements) {
@@ -2660,7 +2733,7 @@ targets = new Map([
     const exchangerManager = ConverterManager.instance;
     const selector = exchangerManager.getSelector();
     const scope = conversionScope || (conversionScope = createFeatureScope('conversion'));
-    const scanner = createDomScanner({ scope, selector, name: 'conversion', initial: false,
+    const scanner = createDomScanner({ scope, selector, name: 'conversion', initial: false, characterData: true,
       process: nodes => exchangerManager.convert(nodes) });
     scanner.scan();
     await scanner.flush();
@@ -3104,7 +3177,7 @@ targets = new Map([
       createDomScanner({ scope, name: 'family', selector: targets + ',' + PAGE_ADAPTERS.family.anchors, process: nodes => {
         if (nodes.some(node => node.matches(PAGE_ADAPTERS.family.anchors))) { ensureFamilyNav(); updateBanner(); }
         updateMarks(nodes.filter(node => node.matches(targets)));
-      }, attributes: ITEM_ATTRIBUTES,
+      }, attributes: ITEM_ATTRIBUTES, removalSelector: '[data-sse-family-app]',
         removed: nodes => {
           for (const removed of nodes) {
             const candidates = [removed, ...(removed.querySelectorAll?.('[data-sse-family-app]') || [])];
@@ -3584,6 +3657,8 @@ targets = new Map([
       if (nodes.some(node => node.matches(PAGE_ADAPTERS.cart.anchors))) mountPanel();
       scanQuickButtons(nodes.filter(node => node.matches(quickSelector)));
     }, name: 'cart', attributes: ITEM_ATTRIBUTES,
+      characterData: '.wishlist_row :is(button, a), [data-rfd-draggable-id^="WishlistItem-"] :is(button, a)',
+      removalSelector: '.sse-native-cart',
       removed: nodes => {
         for (const node of nodes) {
           const candidates = [node, ...(node.querySelectorAll?.('.sse-native-cart') || [])];
@@ -4676,8 +4751,12 @@ targets = new Map([
       for (const badge of badges) if (!badge.isConnected) badges.delete(badge);
     }
 
-    const scanner = createDomScanner({ scope, selector: PAGE_ADAPTERS.wishlist.rows + ',' + PAGE_ADAPTERS.storeSale.rows, process: scan,
-      attributes: ITEM_ATTRIBUTES, name: 'wishlist-sale', removed: pruneRows, delay: 300 });
+    const saleRows = PAGE_ADAPTERS.wishlist.rows + ',' + PAGE_ADAPTERS.storeSale.rows;
+    const scanner = createDomScanner({ scope, selector: saleRows, process: scan,
+      attributes: ITEM_ATTRIBUTES,
+      characterData: '.discount_pct, :is(' + saleRows + ') a[href*="/app/"] :is(div, span), ' +
+        'a[href*="/app/"]:is(' + saleRows + ') :is(div, span)',
+      name: 'wishlist-sale', removed: pruneRows, delay: 300 });
     const homeTabs = document.querySelector('#home_tabs_row');
     if (homeTabs) {
       // Steam switches tabs by changing the existing panels' inline display styles.
