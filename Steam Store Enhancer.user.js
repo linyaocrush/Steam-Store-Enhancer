@@ -5,7 +5,7 @@
 // @homepageURL  https://github.com/linyaocrush/Steam-Store-Enhancer
 // @downloadURL  https://raw.githubusercontent.com/linyaocrush/Steam-Store-Enhancer/main/Steam%20Store%20Enhancer.user.js
 // @updateURL    https://raw.githubusercontent.com/linyaocrush/Steam-Store-Enhancer/main/Steam%20Store%20Enhancer.user.js
-// @version      1.15.0
+// @version      1.15.2
 // @description  Steam 额外地区价格、汇率转换、悬停游戏详情、快速加购、愿望单及商店列表折扣倒计时、购物车批量管理与家庭库游戏标记。
 // @author       linyaocrush, marioplus, Chr_, Cliencer Goge, Miku39
 // @license      AGPL-3.0
@@ -2822,6 +2822,7 @@ targets = new Map([
     let scanPromise = null;
     let accountId = '';
     let root = null;
+    let dialog = null;
     let notice = '';
     const style = document.createElement('style');
     style.textContent = `
@@ -2886,7 +2887,14 @@ targets = new Map([
       } catch (error) { task.fail(error); throw error; }
     }
     function refreshNotice() {
-      if (root) renderDialog();
+      if (!dialog) return;
+      const scanning = Boolean(scanPromise);
+      const label = scanning ? '扫描中……' : '现在扫描家庭库';
+      if (dialog.scanButton.textContent !== label) dialog.scanButton.textContent = label;
+      const disabled = !onStore || scanning;
+      if (dialog.scanButton.disabled !== disabled) dialog.scanButton.disabled = disabled;
+      const message = notice || (!onStore ? '请前往 Steam 商店扫描，本站使用已保存的缓存。' : '');
+      if (dialog.notice.textContent !== message) dialog.notice.textContent = message;
     }
     function scan() {
       if (scanPromise) { log.debug('scan.join', '复用当前家庭库扫描'); return scanPromise; }
@@ -2931,6 +2939,7 @@ targets = new Map([
         GM_setValue(KEY, cache);
         task.debug('cache.save', '家庭库缓存已保存', { count: Object.keys(apps).length });
         notice = '扫描完成，已缓存 ' + Object.keys(apps).length + ' 个家庭库游戏。';
+        refreshLibrary();
         updateMarks();
         updateBanner();
         task.end(notice, { games: Object.keys(apps).length, members: members.length });
@@ -2949,15 +2958,14 @@ targets = new Map([
     function open() {
       if (!scope.active) return;
       log.debug('panel.open', '打开家庭库管理');
-      if (!root) {
-        root = createElement('div');
-        root.id = 'sse-family-dialog';
-        root.addEventListener('click', event => { if (event.target === root) close(); });
-        document.documentElement.appendChild(root);
-      }
-      renderDialog();
+      if (root) return;
+      root = createElement('div');
+      root.id = 'sse-family-dialog';
+      root.addEventListener('click', event => { if (event.target === root) close(); });
+      document.documentElement.appendChild(root);
+      mountDialog();
     }
-    function close() { if (root) log.debug('panel.close', '关闭家庭库管理'); hideChartTooltip(); root?.remove(); root = null; }
+    function close() { if (root) log.debug('panel.close', '关闭家庭库管理'); hideChartTooltip(); root?.remove(); root = null; dialog = null; }
     let chartTooltip = null;
     let tooltipSize;
     let tooltipContent;
@@ -3039,25 +3047,62 @@ targets = new Map([
       control.title = '查看家庭库贡献统计、最近购入与扫描管理';
     }
     scope.listen(window, 'keydown', event => { if (event.key === 'Escape') close(); });
-    function renderDialog() {
-      if (!root) return;
-      hideChartTooltip();
+    function mountDialog() {
       const panel = createElement('div', undefined, 'sse-family-window');
       panel.setAttribute('role', 'dialog'); panel.setAttribute('aria-modal', 'true'); panel.setAttribute('aria-label', 'Steam 家庭库');
       panel.append(createElement('h2', 'Steam 家庭库'));
-      const scanButton = action(scanPromise ? '扫描中……' : '现在扫描家庭库', scan);
-      scanButton.disabled = !onStore || Boolean(scanPromise);
+      const scanButton = action('现在扫描家庭库', scan);
       panel.append(scanButton, action('清空缓存', () => {
         if (scanPromise) { notice = '请等待扫描完成后再清空缓存。'; refreshNotice(); return; }
         if (!window.confirm('确定清空本脚本保存的家庭库记录？')) return;
-        GM_deleteValue(KEY); cache = null; validatedCache = undefined; notice = '家庭库缓存已清空。'; updateMarks(); updateBanner(); renderDialog();
+        GM_deleteValue(KEY); cache = null; validatedCache = undefined; notice = '家庭库缓存已清空。';
+        refreshLibrary(); refreshNotice(); updateMarks(); updateBanner();
         log.info('cache.clear', '家庭库缓存已清空');
       }), action('关闭', close));
-      const summary = validCache() ? cache.name + ' · ' + Object.keys(cache.apps).length + ' 个游戏 · 上次扫描：' + new Date(cache.updated).toLocaleString() : '暂无当前账号的家庭库缓存。';
-      panel.append(createElement('div', summary + '\n' + (notice || (!onStore ? '请前往 Steam 商店扫描，本站使用已保存的缓存。' : '')), 'sse-family-status'));
-      if (validCache()) {
+      const status = createElement('div', undefined, 'sse-family-status');
+      const summary = createElement('div');
+      const message = createElement('div');
+      message.setAttribute('role', 'status');
+      status.append(summary, message);
+      const chart = createElement('div');
+      const library = createElement('div');
+      library.append(createElement('h3', '最近购入的游戏'));
+      library.append(createElement('div', '按接口记录的最早购入时间排序；绿色表示最近 30 天购入且仅一位成员拥有。', 'sse-family-status'));
+      const search = createElement('input'); search.placeholder = '搜索游戏或贡献者'; search.setAttribute('aria-label', '搜索家庭库游戏');
+      const scroll = createElement('div', undefined, 'sse-family-scroll');
+      const table = createElement('table'); const header = createElement('tr');
+      ['游戏名称', '记录的最早购入时间', '贡献者'].forEach(value => header.appendChild(createElement('th', value)));
+      const head = createElement('thead'); head.appendChild(header); table.appendChild(head);
+      const body = createElement('tbody');
+      search.addEventListener('input', () => filterGames(search, body));
+      table.appendChild(body); scroll.appendChild(table); library.append(search, scroll);
+      panel.append(status, chart, library);
+      dialog = { panel, scanButton, summary, notice: message, chart, library, search, scroll, body };
+      root.appendChild(panel);
+      refreshLibrary();
+      refreshNotice();
+    }
+
+    function filterGames(search, body) {
+      const value = search.value.toLocaleLowerCase();
+      for (const row of body.rows) row.hidden = !row.textContent.toLocaleLowerCase().includes(value);
+    }
+
+    function refreshLibrary() {
+      if (!dialog) return;
+      const { panel, summary, chart, library, search, scroll, body } = dialog;
+      const panelTop = panel.scrollTop;
+      const tableTop = scroll.scrollTop;
+      const tableLeft = scroll.scrollLeft;
+      const cacheValid = Boolean(validCache());
+      summary.textContent = cacheValid ? cache.name + ' · ' + Object.keys(cache.apps).length + ' 个游戏 · 上次扫描：' + new Date(cache.updated).toLocaleString() : '暂无当前账号的家庭库缓存。';
+      library.hidden = !cacheValid;
+      hideChartTooltip();
+      const statistics = document.createDocumentFragment();
+      const gameRows = document.createDocumentFragment();
+      if (cacheValid) {
         log.debug('panel.statistics', '渲染家庭库统计', { games: Object.keys(cache.apps).length, members: cache.members.length });
-        panel.append(createElement('h3', '家庭成员贡献统计'));
+        statistics.append(createElement('h3', '家庭成员贡献统计'));
         const games = Object.values(cache.apps);
         const totalsById = new Map(cache.members.map(id => [id, 0]));
         const ownershipBands = new Map(cache.members.map(id => [id, Array(cache.members.length).fill(0)]));
@@ -3090,28 +3135,22 @@ targets = new Map([
             segment.addEventListener('blur', hideChartTooltip);
             bar.appendChild(segment);
           });
-          row.append(createElement('span', ownerName(id)), bar, createElement('span', String(totals[index]))); panel.appendChild(row);
+          row.append(createElement('span', ownerName(id)), bar, createElement('span', String(totals[index]))); statistics.appendChild(row);
         });
-        panel.append(createElement('div', '柱条按拥有同一游戏的成员人数分段；悬停查看数量。统计包含当前账号，不代表家庭实际可用的同时游玩份数。', 'sse-family-status'));
-        panel.append(createElement('h3', '最近购入的游戏'));
-        panel.append(createElement('div', '按接口记录的最早购入时间排序；绿色表示最近 30 天购入且仅一位成员拥有。', 'sse-family-status'));
-        const search = createElement('input'); search.placeholder = '搜索游戏或贡献者'; search.setAttribute('aria-label', '搜索家庭库游戏'); panel.appendChild(search);
-        const scroll = createElement('div', undefined, 'sse-family-scroll');
-        const table = createElement('table'); const header = createElement('tr');
-        ['游戏名称', '记录的最早购入时间', '贡献者'].forEach(value => header.appendChild(createElement('th', value)));
-        const head = createElement('thead'); head.appendChild(header); table.appendChild(head);
-        const body = createElement('tbody');
+        statistics.append(createElement('div', '柱条按拥有同一游戏的成员人数分段；悬停查看数量。统计包含当前账号，不代表家庭实际可用的同时游玩份数。', 'sse-family-status'));
         Object.entries(cache.apps).sort((a, b) => b[1].time - a[1].time).forEach(([id, game]) => {
           const row = createElement('tr');
           if (game.time * 1000 >= Date.now() - 30 * DAY && game.owners.length === 1) row.className = 'sse-family-recent';
           const cell = createElement('td'); const link = createElement('a', game.name); link.href = 'https://store.steampowered.com/app/' + id; link.target = '_blank'; link.rel = 'noopener noreferrer'; cell.appendChild(link);
-          row.append(cell, createElement('td', game.time ? new Date(game.time * 1000).toLocaleDateString() : '未知'), createElement('td', game.owners.map(ownerName).join('、'))); body.appendChild(row);
+          row.append(cell, createElement('td', game.time ? new Date(game.time * 1000).toLocaleDateString() : '未知'), createElement('td', game.owners.map(ownerName).join('、'))); gameRows.appendChild(row);
         });
-        search.addEventListener('input', () => { const value = search.value.toLocaleLowerCase(); [...body.rows].forEach(row => { row.hidden = !row.textContent.toLocaleLowerCase().includes(value); }); });
-        table.appendChild(body); scroll.appendChild(table); panel.appendChild(scroll);
       }
-      root.replaceChildren(panel);
-      log.debug('panel.render', '家庭库面板已更新', { cacheValid: Boolean(validCache()), scanning: Boolean(scanPromise) });
+      chart.replaceChildren(statistics);
+      body.replaceChildren(gameRows);
+      filterGames(search, body);
+      scroll.scrollTop = tableTop;
+      scroll.scrollLeft = tableLeft;
+      panel.scrollTop = panelTop;
     }
 
     const targets = PAGE_ADAPTERS.family.rows;
@@ -4499,13 +4538,13 @@ targets = new Map([
     return { container: row, className: '', compact: false };
   }
 
-  function positionSearchSaleBadge(badge, row, price) {
+  function measureSearchSaleBadge(row, price) {
     const rowRect = row.getBoundingClientRect();
     const priceRect = price.getBoundingClientRect();
-    const badgeRect = badge.getBoundingClientRect();
-    const left = priceRect.right - rowRect.left - (row.clientLeft || 0) - badgeRect.width;
-    badge.style.top = `${priceRect.bottom - rowRect.top - (row.clientTop || 0)}px`;
-    badge.style.left = `${Math.max(0, left)}px`;
+    return {
+      top: `${priceRect.bottom - rowRect.top - row.clientTop}px`,
+      right: `${rowRect.left + row.clientLeft + row.clientWidth - priceRect.right}px`
+    };
   }
 
   function storeSaleAppId(row) {
@@ -4539,11 +4578,73 @@ targets = new Map([
     const retryByApp = new Map();
     const refreshedAt = new Map();
     const rowIds = new WeakMap();
-    const badges = new Set();
+    const badges = new Map();
+    const searchBadges = new Map();
+    const layoutTargets = new Map();
+    const pendingLayout = new Set();
+    let layoutFrame = null;
+    const resizeObserver = typeof ResizeObserver === 'function' ? new ResizeObserver(entries => {
+      for (const { target } of entries) {
+        const badge = layoutTargets.get(target);
+        if (badge) scheduleSearchLayout(badge);
+      }
+    }) : null;
     let cancelRetry;
     let cancelHydration;
     let flushTimer = null;
     const hydrationWaitStarted = Date.now();
+
+    function scheduleSearchLayout(badge) {
+      pendingLayout.add(badge);
+      if (layoutFrame !== null || document.hidden) return;
+      layoutFrame = window.requestAnimationFrame(() => {
+        layoutFrame = null;
+        const layouts = [];
+        for (const badge of pendingLayout) {
+          const state = badges.get(badge);
+          if (badge.isConnected && state?.anchor?.isConnected) {
+            layouts.push([badge, measureSearchSaleBadge(state.row, state.anchor)]);
+          }
+        }
+        pendingLayout.clear();
+        for (const [badge, layout] of layouts) {
+          for (const [property, value] of Object.entries(layout)) {
+            if (badge.style[property] !== value) badge.style[property] = value;
+          }
+        }
+      });
+    }
+
+    function trackSearchBadge(badge, state, anchor) {
+      if (state.anchor !== anchor) {
+        if (state.anchor) {
+          resizeObserver?.unobserve(state.anchor);
+          layoutTargets.delete(state.anchor);
+        } else {
+          searchBadges.set(state.row, badge);
+          layoutTargets.set(state.row, badge);
+          resizeObserver?.observe(state.row);
+        }
+        state.anchor = anchor;
+        layoutTargets.set(anchor, badge);
+        resizeObserver?.observe(anchor);
+      }
+      scheduleSearchLayout(badge);
+    }
+
+    function removeBadge(badge) {
+      const state = badges.get(badge);
+      if (state?.anchor) {
+        for (const target of [state.row, state.anchor]) {
+          resizeObserver?.unobserve(target);
+          layoutTargets.delete(target);
+        }
+        searchBadges.delete(state.row);
+        pendingLayout.delete(badge);
+      }
+      badges.delete(badge);
+      badge.remove();
+    }
 
     if (!document.getElementById('sse-store-sale-style')) {
       const style = document.createElement('style');
@@ -4557,13 +4658,15 @@ targets = new Map([
       return Boolean(findWishlistSalePrice(row));
     }
 
-    function renderExpiry(appId) {
+    function renderExpiry(appId, rows = rowsByApp.get(appId)) {
       if (!scope.active) return;
       const endTime = expiryByApp.get(appId);
-      const rows = rowsByApp.get(appId);
       if (!rows) return;
       if (!endTime) {
-        if (expiryByApp.has(appId)) for (const row of rows) row.querySelector('.sse-wishlist-sale-expiration')?.remove();
+        if (expiryByApp.has(appId)) for (const row of rows) {
+          const badge = row.querySelector('.sse-wishlist-sale-expiration');
+          if (badge) removeBadge(badge);
+        }
         return;
       }
       for (const row of rows) {
@@ -4575,47 +4678,47 @@ targets = new Map([
           : findStoreSaleBadgePosition(row);
         if (!position?.container) continue;
         const existing = row.querySelector('.sse-wishlist-sale-expiration');
-        if (existing && existing.dataset.endTime === String(endTime) && existing.parentElement === position.container) continue;
-        existing?.remove();
+        const state = badges.get(existing);
+        if (state?.endTime === endTime && existing.parentElement === position.container) {
+          if (position.anchor && state.anchor !== position.anchor) trackSearchBadge(existing, state, position.anchor);
+          continue;
+        }
+        if (existing) removeBadge(existing);
         const badge = document.createElement('span');
         badge.className = 'sse-wishlist-sale-expiration' + (position.className ? ' ' + position.className : '');
         badge.dataset.endTime = String(endTime);
         if (position.anchor) {
           if (getComputedStyle(position.container).position === 'static') position.container.style.position = 'relative';
+          // Let CSS keep the right edge aligned as the countdown text changes width.
+          badge.style.left = 'auto';
         }
-        badges.add(badge);
+        const endDate = new Date(endTime);
+        const dateText = `${endDate.getFullYear()}年${endDate.getMonth() + 1}月${endDate.getDate()}日 ${endDate.getHours().toString().padStart(2, '0')}:${endDate.getMinutes().toString().padStart(2, '0')}`;
+        badge.title = `折扣结束时间：${endDate.toLocaleString()}`;
+        const next = { row, endTime, dateText, compact: position.compact, search: Boolean(position.anchor) };
+        badges.set(badge, next);
         position.container.insertBefore(badge, position.reference || null);
+        if (position.anchor) trackSearchBadge(badge, next, position.anchor);
       }
     }
 
     function updateCountdowns() {
       const now = Date.now();
       if (document.hidden) return;
-      for (const badge of badges) {
-        if (!badge.isConnected) { badges.delete(badge); continue; }
-        const endTime = Number(badge.dataset.endTime);
-        const remaining = endTime - now;
-        const endDate = new Date(endTime);
-        const dateText = Number.isFinite(endTime) ? `${endDate.getFullYear()}年${endDate.getMonth() + 1}月${endDate.getDate()}日 ${endDate.getHours().toString().padStart(2, '0')}:${endDate.getMinutes().toString().padStart(2, '0')}` : '';
-        const homeCompact = badge.classList.contains?.('sse-home-sale-expiration');
-        const searchCompact = badge.classList.contains?.('sse-search-sale-expiration');
-        const prefix = homeCompact || searchCompact ? '' : `折扣结束：${dateText} · `;
-        if (remaining <= 0) {
-          const text = `${prefix}${searchCompact ? `已结束 · ${dateText}` : '已结束'}`;
-          if (badge.textContent !== text) badge.textContent = text;
-          badge.classList.add('sse-sale-ended');
-          badge.classList.remove('sse-ending-soon');
-        } else {
-          const text = `${prefix}剩余 ${formatWishlistSaleCountdown(remaining)}`;
-          if (badge.textContent !== text) badge.textContent = text;
-          badge.classList.toggle('sse-ending-soon', remaining <= 3600000);
-          badge.classList.remove('sse-sale-ended');
-        }
-        badge.title = `折扣结束时间：${endDate.toLocaleString()}`;
-        if (searchCompact) {
-          const row = badge.closest('.search_result_row');
-          const price = row?.querySelector('.discount_block');
-          if (price) positionSearchSaleBadge(badge, row, price);
+      for (const [badge, state] of badges) {
+        if (!badge.isConnected) { removeBadge(badge); continue; }
+        const remaining = state.endTime - now;
+        const ended = remaining <= 0;
+        const prefix = state.compact ? '' : `折扣结束：${state.dateText} · `;
+        const text = prefix + (ended ? (state.search ? `已结束 · ${state.dateText}` : '已结束')
+          : `剩余 ${formatWishlistSaleCountdown(remaining)}`);
+        if (badge.textContent !== text) badge.textContent = text;
+        const endingSoon = !ended && remaining <= 3600000;
+        if (state.ended !== ended || state.endingSoon !== endingSoon) {
+          badge.classList.toggle('sse-sale-ended', ended);
+          badge.classList.toggle('sse-ending-soon', endingSoon);
+          state.ended = ended;
+          state.endingSoon = endingSoon;
         }
       }
     }
@@ -4693,7 +4796,7 @@ targets = new Map([
       fetchExpirations(appIds).catch(error => { if (scope.active) log.error('expiry.unexpected', '折扣处理异常', { error }); });
     }
 
-    function scan(rows) {
+    function scan(rows, layoutChanged = true) {
       if (isWishlistPage() && page.SSR && !page.SSR.hydrated && Date.now() - hydrationWaitStarted < 15000) {
         if (!cancelHydration) cancelHydration = scope.timeout(() => { cancelHydration = null; scanner.scan(); }, 500);
         return;
@@ -4709,17 +4812,19 @@ targets = new Map([
         const previous = rowIds.get(row);
         if (previous && previous !== appId) {
           rowsByApp.get(previous)?.delete(row);
-          row.querySelectorAll('.sse-wishlist-sale-expiration').forEach(node => node.remove());
+          row.querySelectorAll('.sse-wishlist-sale-expiration').forEach(removeBadge);
         }
         rowIds.set(row, appId);
         if (!appId) continue;
         if (!isDiscounted(row)) {
-          row.querySelectorAll('.sse-wishlist-sale-expiration').forEach(element => element.remove());
+          row.querySelectorAll('.sse-wishlist-sale-expiration').forEach(removeBadge);
           continue;
         }
         if (!rowsByApp.has(appId)) rowsByApp.set(appId, new Set());
         rowsByApp.get(appId).add(row);
-        if (expiryByApp.has(appId)) renderExpiry(appId);
+        if (expiryByApp.has(appId)) renderExpiry(appId, [row]);
+        const badge = searchBadges.get(row);
+        if (layoutChanged && badge) scheduleSearchLayout(badge);
         const expires = expiryByApp.get(appId) || 0;
         const ttl = expires ? 300000 : 60000;
         if ((!refreshedAt.has(appId) || Date.now() - refreshedAt.get(appId) >= ttl) && !pendingApps.has(appId)) queuedApps.add(appId);
@@ -4735,24 +4840,24 @@ targets = new Map([
           const id = rowIds.get(row);
           if (!id || row.isConnected) continue;
           rowsByApp.get(id)?.delete(row);
-          row.querySelectorAll?.('.sse-wishlist-sale-expiration').forEach(badge => { badges.delete(badge); badge.remove(); });
+          row.querySelectorAll?.('.sse-wishlist-sale-expiration').forEach(removeBadge);
           rowIds.delete(row);
         }
       }
       for (const [appId, appRows] of rowsByApp) {
         for (const row of appRows) if (storeSaleAppId(row) !== appId || !isDiscounted(row)) {
           appRows.delete(row);
-          row.querySelectorAll('.sse-wishlist-sale-expiration').forEach(badge => badges.delete(badge));
+          row.querySelectorAll('.sse-wishlist-sale-expiration').forEach(removeBadge);
         }
         if (!appRows.size) {
           rowsByApp.delete(appId); expiryByApp.delete(appId); refreshedAt.delete(appId); retryByApp.delete(appId); queuedApps.delete(appId);
         }
       }
-      for (const badge of badges) if (!badge.isConnected) badges.delete(badge);
+      for (const badge of badges.keys()) if (!badge.isConnected) removeBadge(badge);
     }
 
     const saleRows = PAGE_ADAPTERS.wishlist.rows + ',' + PAGE_ADAPTERS.storeSale.rows;
-    const scanner = createDomScanner({ scope, selector: saleRows, process: scan,
+    const scanner = createDomScanner({ scope, selector: saleRows, process: rows => scan(rows),
       attributes: ITEM_ATTRIBUTES,
       characterData: '.discount_pct, :is(' + saleRows + ') a[href*="/app/"] :is(div, span), ' +
         'a[href*="/app/"]:is(' + saleRows + ') :is(div, span)',
@@ -4764,11 +4869,19 @@ targets = new Map([
       observer.observe(homeTabs, { subtree: true, attributes: true, attributeFilter: ['style', 'hidden'] });
       scope.own(() => observer.disconnect());
     }
+    const refreshSearchLayout = () => { for (const badge of searchBadges.values()) scheduleSearchLayout(badge); };
+    scope.listen(window, 'resize', refreshSearchLayout, { passive: true });
     scope.interval(updateCountdowns, 1000);
-    scope.interval(() => { if (!document.hidden) scan([...rowsByApp.values()].flatMap(rows => [...rows])); }, 60000);
-    scope.listen(document, 'visibilitychange', () => { if (!document.hidden) { updateCountdowns(); scanner.scan(); } });
+    scope.interval(() => { if (!document.hidden) scan([...rowsByApp.values()].flatMap(rows => [...rows]), false); }, 60000);
+    scope.listen(document, 'visibilitychange', () => {
+      if (!document.hidden) { updateCountdowns(); refreshSearchLayout(); scanner.scan(); }
+    });
     scope.own(() => {
-      badges.forEach(badge => badge.remove()); badges.clear(); rowsByApp.clear(); queuedApps.clear(); pendingApps.clear();
+      resizeObserver?.disconnect();
+      if (layoutFrame !== null) window.cancelAnimationFrame(layoutFrame);
+      pendingLayout.clear(); layoutTargets.clear(); searchBadges.clear();
+      for (const badge of badges.keys()) badge.remove();
+      badges.clear(); rowsByApp.clear(); queuedApps.clear(); pendingApps.clear();
     });
     log.info('initialize', '愿望单及商店列表折扣结束时间和倒计时已启用');
   }

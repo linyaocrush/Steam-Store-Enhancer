@@ -91,13 +91,13 @@
     return { container: row, className: '', compact: false };
   }
 
-  function positionSearchSaleBadge(badge, row, price) {
+  function measureSearchSaleBadge(row, price) {
     const rowRect = row.getBoundingClientRect();
     const priceRect = price.getBoundingClientRect();
-    const badgeRect = badge.getBoundingClientRect();
-    const left = priceRect.right - rowRect.left - (row.clientLeft || 0) - badgeRect.width;
-    badge.style.top = `${priceRect.bottom - rowRect.top - (row.clientTop || 0)}px`;
-    badge.style.left = `${Math.max(0, left)}px`;
+    return {
+      top: `${priceRect.bottom - rowRect.top - row.clientTop}px`,
+      right: `${rowRect.left + row.clientLeft + row.clientWidth - priceRect.right}px`
+    };
   }
 
   function storeSaleAppId(row) {
@@ -131,11 +131,73 @@
     const retryByApp = new Map();
     const refreshedAt = new Map();
     const rowIds = new WeakMap();
-    const badges = new Set();
+    const badges = new Map();
+    const searchBadges = new Map();
+    const layoutTargets = new Map();
+    const pendingLayout = new Set();
+    let layoutFrame = null;
+    const resizeObserver = typeof ResizeObserver === 'function' ? new ResizeObserver(entries => {
+      for (const { target } of entries) {
+        const badge = layoutTargets.get(target);
+        if (badge) scheduleSearchLayout(badge);
+      }
+    }) : null;
     let cancelRetry;
     let cancelHydration;
     let flushTimer = null;
     const hydrationWaitStarted = Date.now();
+
+    function scheduleSearchLayout(badge) {
+      pendingLayout.add(badge);
+      if (layoutFrame !== null || document.hidden) return;
+      layoutFrame = window.requestAnimationFrame(() => {
+        layoutFrame = null;
+        const layouts = [];
+        for (const badge of pendingLayout) {
+          const state = badges.get(badge);
+          if (badge.isConnected && state?.anchor?.isConnected) {
+            layouts.push([badge, measureSearchSaleBadge(state.row, state.anchor)]);
+          }
+        }
+        pendingLayout.clear();
+        for (const [badge, layout] of layouts) {
+          for (const [property, value] of Object.entries(layout)) {
+            if (badge.style[property] !== value) badge.style[property] = value;
+          }
+        }
+      });
+    }
+
+    function trackSearchBadge(badge, state, anchor) {
+      if (state.anchor !== anchor) {
+        if (state.anchor) {
+          resizeObserver?.unobserve(state.anchor);
+          layoutTargets.delete(state.anchor);
+        } else {
+          searchBadges.set(state.row, badge);
+          layoutTargets.set(state.row, badge);
+          resizeObserver?.observe(state.row);
+        }
+        state.anchor = anchor;
+        layoutTargets.set(anchor, badge);
+        resizeObserver?.observe(anchor);
+      }
+      scheduleSearchLayout(badge);
+    }
+
+    function removeBadge(badge) {
+      const state = badges.get(badge);
+      if (state?.anchor) {
+        for (const target of [state.row, state.anchor]) {
+          resizeObserver?.unobserve(target);
+          layoutTargets.delete(target);
+        }
+        searchBadges.delete(state.row);
+        pendingLayout.delete(badge);
+      }
+      badges.delete(badge);
+      badge.remove();
+    }
 
     if (!document.getElementById('sse-store-sale-style')) {
       const style = document.createElement('style');
@@ -149,13 +211,15 @@
       return Boolean(findWishlistSalePrice(row));
     }
 
-    function renderExpiry(appId) {
+    function renderExpiry(appId, rows = rowsByApp.get(appId)) {
       if (!scope.active) return;
       const endTime = expiryByApp.get(appId);
-      const rows = rowsByApp.get(appId);
       if (!rows) return;
       if (!endTime) {
-        if (expiryByApp.has(appId)) for (const row of rows) row.querySelector('.sse-wishlist-sale-expiration')?.remove();
+        if (expiryByApp.has(appId)) for (const row of rows) {
+          const badge = row.querySelector('.sse-wishlist-sale-expiration');
+          if (badge) removeBadge(badge);
+        }
         return;
       }
       for (const row of rows) {
@@ -167,47 +231,47 @@
           : findStoreSaleBadgePosition(row);
         if (!position?.container) continue;
         const existing = row.querySelector('.sse-wishlist-sale-expiration');
-        if (existing && existing.dataset.endTime === String(endTime) && existing.parentElement === position.container) continue;
-        existing?.remove();
+        const state = badges.get(existing);
+        if (state?.endTime === endTime && existing.parentElement === position.container) {
+          if (position.anchor && state.anchor !== position.anchor) trackSearchBadge(existing, state, position.anchor);
+          continue;
+        }
+        if (existing) removeBadge(existing);
         const badge = document.createElement('span');
         badge.className = 'sse-wishlist-sale-expiration' + (position.className ? ' ' + position.className : '');
         badge.dataset.endTime = String(endTime);
         if (position.anchor) {
           if (getComputedStyle(position.container).position === 'static') position.container.style.position = 'relative';
+          // Let CSS keep the right edge aligned as the countdown text changes width.
+          badge.style.left = 'auto';
         }
-        badges.add(badge);
+        const endDate = new Date(endTime);
+        const dateText = `${endDate.getFullYear()}年${endDate.getMonth() + 1}月${endDate.getDate()}日 ${endDate.getHours().toString().padStart(2, '0')}:${endDate.getMinutes().toString().padStart(2, '0')}`;
+        badge.title = `折扣结束时间：${endDate.toLocaleString()}`;
+        const next = { row, endTime, dateText, compact: position.compact, search: Boolean(position.anchor) };
+        badges.set(badge, next);
         position.container.insertBefore(badge, position.reference || null);
+        if (position.anchor) trackSearchBadge(badge, next, position.anchor);
       }
     }
 
     function updateCountdowns() {
       const now = Date.now();
       if (document.hidden) return;
-      for (const badge of badges) {
-        if (!badge.isConnected) { badges.delete(badge); continue; }
-        const endTime = Number(badge.dataset.endTime);
-        const remaining = endTime - now;
-        const endDate = new Date(endTime);
-        const dateText = Number.isFinite(endTime) ? `${endDate.getFullYear()}年${endDate.getMonth() + 1}月${endDate.getDate()}日 ${endDate.getHours().toString().padStart(2, '0')}:${endDate.getMinutes().toString().padStart(2, '0')}` : '';
-        const homeCompact = badge.classList.contains?.('sse-home-sale-expiration');
-        const searchCompact = badge.classList.contains?.('sse-search-sale-expiration');
-        const prefix = homeCompact || searchCompact ? '' : `折扣结束：${dateText} · `;
-        if (remaining <= 0) {
-          const text = `${prefix}${searchCompact ? `已结束 · ${dateText}` : '已结束'}`;
-          if (badge.textContent !== text) badge.textContent = text;
-          badge.classList.add('sse-sale-ended');
-          badge.classList.remove('sse-ending-soon');
-        } else {
-          const text = `${prefix}剩余 ${formatWishlistSaleCountdown(remaining)}`;
-          if (badge.textContent !== text) badge.textContent = text;
-          badge.classList.toggle('sse-ending-soon', remaining <= 3600000);
-          badge.classList.remove('sse-sale-ended');
-        }
-        badge.title = `折扣结束时间：${endDate.toLocaleString()}`;
-        if (searchCompact) {
-          const row = badge.closest('.search_result_row');
-          const price = row?.querySelector('.discount_block');
-          if (price) positionSearchSaleBadge(badge, row, price);
+      for (const [badge, state] of badges) {
+        if (!badge.isConnected) { removeBadge(badge); continue; }
+        const remaining = state.endTime - now;
+        const ended = remaining <= 0;
+        const prefix = state.compact ? '' : `折扣结束：${state.dateText} · `;
+        const text = prefix + (ended ? (state.search ? `已结束 · ${state.dateText}` : '已结束')
+          : `剩余 ${formatWishlistSaleCountdown(remaining)}`);
+        if (badge.textContent !== text) badge.textContent = text;
+        const endingSoon = !ended && remaining <= 3600000;
+        if (state.ended !== ended || state.endingSoon !== endingSoon) {
+          badge.classList.toggle('sse-sale-ended', ended);
+          badge.classList.toggle('sse-ending-soon', endingSoon);
+          state.ended = ended;
+          state.endingSoon = endingSoon;
         }
       }
     }
@@ -285,7 +349,7 @@
       fetchExpirations(appIds).catch(error => { if (scope.active) log.error('expiry.unexpected', '折扣处理异常', { error }); });
     }
 
-    function scan(rows) {
+    function scan(rows, layoutChanged = true) {
       if (isWishlistPage() && page.SSR && !page.SSR.hydrated && Date.now() - hydrationWaitStarted < 15000) {
         if (!cancelHydration) cancelHydration = scope.timeout(() => { cancelHydration = null; scanner.scan(); }, 500);
         return;
@@ -301,17 +365,19 @@
         const previous = rowIds.get(row);
         if (previous && previous !== appId) {
           rowsByApp.get(previous)?.delete(row);
-          row.querySelectorAll('.sse-wishlist-sale-expiration').forEach(node => node.remove());
+          row.querySelectorAll('.sse-wishlist-sale-expiration').forEach(removeBadge);
         }
         rowIds.set(row, appId);
         if (!appId) continue;
         if (!isDiscounted(row)) {
-          row.querySelectorAll('.sse-wishlist-sale-expiration').forEach(element => element.remove());
+          row.querySelectorAll('.sse-wishlist-sale-expiration').forEach(removeBadge);
           continue;
         }
         if (!rowsByApp.has(appId)) rowsByApp.set(appId, new Set());
         rowsByApp.get(appId).add(row);
-        if (expiryByApp.has(appId)) renderExpiry(appId);
+        if (expiryByApp.has(appId)) renderExpiry(appId, [row]);
+        const badge = searchBadges.get(row);
+        if (layoutChanged && badge) scheduleSearchLayout(badge);
         const expires = expiryByApp.get(appId) || 0;
         const ttl = expires ? 300000 : 60000;
         if ((!refreshedAt.has(appId) || Date.now() - refreshedAt.get(appId) >= ttl) && !pendingApps.has(appId)) queuedApps.add(appId);
@@ -327,24 +393,24 @@
           const id = rowIds.get(row);
           if (!id || row.isConnected) continue;
           rowsByApp.get(id)?.delete(row);
-          row.querySelectorAll?.('.sse-wishlist-sale-expiration').forEach(badge => { badges.delete(badge); badge.remove(); });
+          row.querySelectorAll?.('.sse-wishlist-sale-expiration').forEach(removeBadge);
           rowIds.delete(row);
         }
       }
       for (const [appId, appRows] of rowsByApp) {
         for (const row of appRows) if (storeSaleAppId(row) !== appId || !isDiscounted(row)) {
           appRows.delete(row);
-          row.querySelectorAll('.sse-wishlist-sale-expiration').forEach(badge => badges.delete(badge));
+          row.querySelectorAll('.sse-wishlist-sale-expiration').forEach(removeBadge);
         }
         if (!appRows.size) {
           rowsByApp.delete(appId); expiryByApp.delete(appId); refreshedAt.delete(appId); retryByApp.delete(appId); queuedApps.delete(appId);
         }
       }
-      for (const badge of badges) if (!badge.isConnected) badges.delete(badge);
+      for (const badge of badges.keys()) if (!badge.isConnected) removeBadge(badge);
     }
 
     const saleRows = PAGE_ADAPTERS.wishlist.rows + ',' + PAGE_ADAPTERS.storeSale.rows;
-    const scanner = createDomScanner({ scope, selector: saleRows, process: scan,
+    const scanner = createDomScanner({ scope, selector: saleRows, process: rows => scan(rows),
       attributes: ITEM_ATTRIBUTES,
       characterData: '.discount_pct, :is(' + saleRows + ') a[href*="/app/"] :is(div, span), ' +
         'a[href*="/app/"]:is(' + saleRows + ') :is(div, span)',
@@ -356,11 +422,19 @@
       observer.observe(homeTabs, { subtree: true, attributes: true, attributeFilter: ['style', 'hidden'] });
       scope.own(() => observer.disconnect());
     }
+    const refreshSearchLayout = () => { for (const badge of searchBadges.values()) scheduleSearchLayout(badge); };
+    scope.listen(window, 'resize', refreshSearchLayout, { passive: true });
     scope.interval(updateCountdowns, 1000);
-    scope.interval(() => { if (!document.hidden) scan([...rowsByApp.values()].flatMap(rows => [...rows])); }, 60000);
-    scope.listen(document, 'visibilitychange', () => { if (!document.hidden) { updateCountdowns(); scanner.scan(); } });
+    scope.interval(() => { if (!document.hidden) scan([...rowsByApp.values()].flatMap(rows => [...rows]), false); }, 60000);
+    scope.listen(document, 'visibilitychange', () => {
+      if (!document.hidden) { updateCountdowns(); refreshSearchLayout(); scanner.scan(); }
+    });
     scope.own(() => {
-      badges.forEach(badge => badge.remove()); badges.clear(); rowsByApp.clear(); queuedApps.clear(); pendingApps.clear();
+      resizeObserver?.disconnect();
+      if (layoutFrame !== null) window.cancelAnimationFrame(layoutFrame);
+      pendingLayout.clear(); layoutTargets.clear(); searchBadges.clear();
+      for (const badge of badges.keys()) badge.remove();
+      badges.clear(); rowsByApp.clear(); queuedApps.clear(); pendingApps.clear();
     });
     log.info('initialize', '愿望单及商店列表折扣结束时间和倒计时已启用');
   }

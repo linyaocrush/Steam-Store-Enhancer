@@ -12,6 +12,7 @@
     let scanPromise = null;
     let accountId = '';
     let root = null;
+    let dialog = null;
     let notice = '';
     const style = document.createElement('style');
     style.textContent = `
@@ -76,7 +77,14 @@
       } catch (error) { task.fail(error); throw error; }
     }
     function refreshNotice() {
-      if (root) renderDialog();
+      if (!dialog) return;
+      const scanning = Boolean(scanPromise);
+      const label = scanning ? '扫描中……' : '现在扫描家庭库';
+      if (dialog.scanButton.textContent !== label) dialog.scanButton.textContent = label;
+      const disabled = !onStore || scanning;
+      if (dialog.scanButton.disabled !== disabled) dialog.scanButton.disabled = disabled;
+      const message = notice || (!onStore ? '请前往 Steam 商店扫描，本站使用已保存的缓存。' : '');
+      if (dialog.notice.textContent !== message) dialog.notice.textContent = message;
     }
     function scan() {
       if (scanPromise) { log.debug('scan.join', '复用当前家庭库扫描'); return scanPromise; }
@@ -121,6 +129,7 @@
         GM_setValue(KEY, cache);
         task.debug('cache.save', '家庭库缓存已保存', { count: Object.keys(apps).length });
         notice = '扫描完成，已缓存 ' + Object.keys(apps).length + ' 个家庭库游戏。';
+        refreshLibrary();
         updateMarks();
         updateBanner();
         task.end(notice, { games: Object.keys(apps).length, members: members.length });
@@ -139,15 +148,14 @@
     function open() {
       if (!scope.active) return;
       log.debug('panel.open', '打开家庭库管理');
-      if (!root) {
-        root = createElement('div');
-        root.id = 'sse-family-dialog';
-        root.addEventListener('click', event => { if (event.target === root) close(); });
-        document.documentElement.appendChild(root);
-      }
-      renderDialog();
+      if (root) return;
+      root = createElement('div');
+      root.id = 'sse-family-dialog';
+      root.addEventListener('click', event => { if (event.target === root) close(); });
+      document.documentElement.appendChild(root);
+      mountDialog();
     }
-    function close() { if (root) log.debug('panel.close', '关闭家庭库管理'); hideChartTooltip(); root?.remove(); root = null; }
+    function close() { if (root) log.debug('panel.close', '关闭家庭库管理'); hideChartTooltip(); root?.remove(); root = null; dialog = null; }
     let chartTooltip = null;
     let tooltipSize;
     let tooltipContent;
@@ -229,25 +237,62 @@
       control.title = '查看家庭库贡献统计、最近购入与扫描管理';
     }
     scope.listen(window, 'keydown', event => { if (event.key === 'Escape') close(); });
-    function renderDialog() {
-      if (!root) return;
-      hideChartTooltip();
+    function mountDialog() {
       const panel = createElement('div', undefined, 'sse-family-window');
       panel.setAttribute('role', 'dialog'); panel.setAttribute('aria-modal', 'true'); panel.setAttribute('aria-label', 'Steam 家庭库');
       panel.append(createElement('h2', 'Steam 家庭库'));
-      const scanButton = action(scanPromise ? '扫描中……' : '现在扫描家庭库', scan);
-      scanButton.disabled = !onStore || Boolean(scanPromise);
+      const scanButton = action('现在扫描家庭库', scan);
       panel.append(scanButton, action('清空缓存', () => {
         if (scanPromise) { notice = '请等待扫描完成后再清空缓存。'; refreshNotice(); return; }
         if (!window.confirm('确定清空本脚本保存的家庭库记录？')) return;
-        GM_deleteValue(KEY); cache = null; validatedCache = undefined; notice = '家庭库缓存已清空。'; updateMarks(); updateBanner(); renderDialog();
+        GM_deleteValue(KEY); cache = null; validatedCache = undefined; notice = '家庭库缓存已清空。';
+        refreshLibrary(); refreshNotice(); updateMarks(); updateBanner();
         log.info('cache.clear', '家庭库缓存已清空');
       }), action('关闭', close));
-      const summary = validCache() ? cache.name + ' · ' + Object.keys(cache.apps).length + ' 个游戏 · 上次扫描：' + new Date(cache.updated).toLocaleString() : '暂无当前账号的家庭库缓存。';
-      panel.append(createElement('div', summary + '\n' + (notice || (!onStore ? '请前往 Steam 商店扫描，本站使用已保存的缓存。' : '')), 'sse-family-status'));
-      if (validCache()) {
+      const status = createElement('div', undefined, 'sse-family-status');
+      const summary = createElement('div');
+      const message = createElement('div');
+      message.setAttribute('role', 'status');
+      status.append(summary, message);
+      const chart = createElement('div');
+      const library = createElement('div');
+      library.append(createElement('h3', '最近购入的游戏'));
+      library.append(createElement('div', '按接口记录的最早购入时间排序；绿色表示最近 30 天购入且仅一位成员拥有。', 'sse-family-status'));
+      const search = createElement('input'); search.placeholder = '搜索游戏或贡献者'; search.setAttribute('aria-label', '搜索家庭库游戏');
+      const scroll = createElement('div', undefined, 'sse-family-scroll');
+      const table = createElement('table'); const header = createElement('tr');
+      ['游戏名称', '记录的最早购入时间', '贡献者'].forEach(value => header.appendChild(createElement('th', value)));
+      const head = createElement('thead'); head.appendChild(header); table.appendChild(head);
+      const body = createElement('tbody');
+      search.addEventListener('input', () => filterGames(search, body));
+      table.appendChild(body); scroll.appendChild(table); library.append(search, scroll);
+      panel.append(status, chart, library);
+      dialog = { panel, scanButton, summary, notice: message, chart, library, search, scroll, body };
+      root.appendChild(panel);
+      refreshLibrary();
+      refreshNotice();
+    }
+
+    function filterGames(search, body) {
+      const value = search.value.toLocaleLowerCase();
+      for (const row of body.rows) row.hidden = !row.textContent.toLocaleLowerCase().includes(value);
+    }
+
+    function refreshLibrary() {
+      if (!dialog) return;
+      const { panel, summary, chart, library, search, scroll, body } = dialog;
+      const panelTop = panel.scrollTop;
+      const tableTop = scroll.scrollTop;
+      const tableLeft = scroll.scrollLeft;
+      const cacheValid = Boolean(validCache());
+      summary.textContent = cacheValid ? cache.name + ' · ' + Object.keys(cache.apps).length + ' 个游戏 · 上次扫描：' + new Date(cache.updated).toLocaleString() : '暂无当前账号的家庭库缓存。';
+      library.hidden = !cacheValid;
+      hideChartTooltip();
+      const statistics = document.createDocumentFragment();
+      const gameRows = document.createDocumentFragment();
+      if (cacheValid) {
         log.debug('panel.statistics', '渲染家庭库统计', { games: Object.keys(cache.apps).length, members: cache.members.length });
-        panel.append(createElement('h3', '家庭成员贡献统计'));
+        statistics.append(createElement('h3', '家庭成员贡献统计'));
         const games = Object.values(cache.apps);
         const totalsById = new Map(cache.members.map(id => [id, 0]));
         const ownershipBands = new Map(cache.members.map(id => [id, Array(cache.members.length).fill(0)]));
@@ -280,28 +325,22 @@
             segment.addEventListener('blur', hideChartTooltip);
             bar.appendChild(segment);
           });
-          row.append(createElement('span', ownerName(id)), bar, createElement('span', String(totals[index]))); panel.appendChild(row);
+          row.append(createElement('span', ownerName(id)), bar, createElement('span', String(totals[index]))); statistics.appendChild(row);
         });
-        panel.append(createElement('div', '柱条按拥有同一游戏的成员人数分段；悬停查看数量。统计包含当前账号，不代表家庭实际可用的同时游玩份数。', 'sse-family-status'));
-        panel.append(createElement('h3', '最近购入的游戏'));
-        panel.append(createElement('div', '按接口记录的最早购入时间排序；绿色表示最近 30 天购入且仅一位成员拥有。', 'sse-family-status'));
-        const search = createElement('input'); search.placeholder = '搜索游戏或贡献者'; search.setAttribute('aria-label', '搜索家庭库游戏'); panel.appendChild(search);
-        const scroll = createElement('div', undefined, 'sse-family-scroll');
-        const table = createElement('table'); const header = createElement('tr');
-        ['游戏名称', '记录的最早购入时间', '贡献者'].forEach(value => header.appendChild(createElement('th', value)));
-        const head = createElement('thead'); head.appendChild(header); table.appendChild(head);
-        const body = createElement('tbody');
+        statistics.append(createElement('div', '柱条按拥有同一游戏的成员人数分段；悬停查看数量。统计包含当前账号，不代表家庭实际可用的同时游玩份数。', 'sse-family-status'));
         Object.entries(cache.apps).sort((a, b) => b[1].time - a[1].time).forEach(([id, game]) => {
           const row = createElement('tr');
           if (game.time * 1000 >= Date.now() - 30 * DAY && game.owners.length === 1) row.className = 'sse-family-recent';
           const cell = createElement('td'); const link = createElement('a', game.name); link.href = 'https://store.steampowered.com/app/' + id; link.target = '_blank'; link.rel = 'noopener noreferrer'; cell.appendChild(link);
-          row.append(cell, createElement('td', game.time ? new Date(game.time * 1000).toLocaleDateString() : '未知'), createElement('td', game.owners.map(ownerName).join('、'))); body.appendChild(row);
+          row.append(cell, createElement('td', game.time ? new Date(game.time * 1000).toLocaleDateString() : '未知'), createElement('td', game.owners.map(ownerName).join('、'))); gameRows.appendChild(row);
         });
-        search.addEventListener('input', () => { const value = search.value.toLocaleLowerCase(); [...body.rows].forEach(row => { row.hidden = !row.textContent.toLocaleLowerCase().includes(value); }); });
-        table.appendChild(body); scroll.appendChild(table); panel.appendChild(scroll);
       }
-      root.replaceChildren(panel);
-      log.debug('panel.render', '家庭库面板已更新', { cacheValid: Boolean(validCache()), scanning: Boolean(scanPromise) });
+      chart.replaceChildren(statistics);
+      body.replaceChildren(gameRows);
+      filterGames(search, body);
+      scroll.scrollTop = tableTop;
+      scroll.scrollLeft = tableLeft;
+      panel.scrollTop = panelTop;
     }
 
     const targets = PAGE_ADAPTERS.family.rows;

@@ -168,17 +168,93 @@ test('search countdown fits below the actual price inside the clipped result row
   const source = await readFile(new URL('../src/wishlist-sale.js', import.meta.url), 'utf8');
   const context = vm.createContext({});
   vm.runInContext(source, context);
-  const badge = { style: {}, getBoundingClientRect: () => ({ width: 103, height: 15.4 }) };
-  const row = { clientLeft: 1, clientTop: 1, getBoundingClientRect: () => ({ left: 395.5, top: 452, bottom: 524 }) };
+  const row = { clientLeft: 1, clientTop: 1, clientWidth: 820, getBoundingClientRect: () => ({ left: 395.5, top: 452, bottom: 524 }) };
   const price = { getBoundingClientRect: () => ({ right: 1183.5625, bottom: 504 }) };
-  context.positionSearchSaleBadge(badge, row, price);
-  assert.equal(badge.style.top, '51px');
-  assert.equal(badge.style.left, '684.0625px');
-  assert.ok(452 + 1 + parseFloat(badge.style.top) + 15.4 < 524);
+  const layout = context.measureSearchSaleBadge(row, price);
+  assert.equal(layout.top, '51px');
+  assert.equal(layout.right, '32.9375px');
+  assert.ok(452 + 1 + parseFloat(layout.top) + 15.4 < 524);
   price.getBoundingClientRect = () => ({ right: 1200, bottom: 500 });
-  context.positionSearchSaleBadge(badge, row, price);
-  assert.equal(badge.style.top, '47px');
-  assert.equal(badge.style.left, '700.5px');
+  const resized = context.measureSearchSaleBadge(row, price);
+  assert.equal(resized.top, '47px');
+  assert.equal(resized.right, '16.5px');
+});
+
+test('search countdown positioning is measured on layout changes, not every tick', async () => {
+  let resizeObserver;
+  const { context, document, time, window, observers } = await harness(['wishlist-sale.js'], {
+    isWishlistPage: () => false,
+    readStoreSession: () => ({}), requestQueue: { enqueue: task => task() },
+    getComputedStyle: () => ({ position: 'relative' }),
+    gmGet: async () => JSON.stringify({ response: { store_items: [{ appid: 10, discount_end_date: 2000000 }] } }),
+    ResizeObserver: class {
+      targets = new Set();
+      constructor(callback) { this.callback = callback; resizeObserver = this; }
+      observe(node) { this.targets.add(node); }
+      unobserve(node) { this.targets.delete(node); }
+      disconnect() { this.targets.clear(); }
+    }
+  });
+  document.head = { appendChild() {} };
+  const scheduledFrames = new Map();
+  let frameId = 0;
+  window.requestAnimationFrame = callback => { const id = ++frameId; scheduledFrames.set(id, callback); return id; };
+  window.cancelAnimationFrame = id => scheduledFrames.delete(id);
+  const runFrame = () => {
+    const callbacks = [...scheduledFrames.values()];
+    scheduledFrames.clear();
+    callbacks.forEach(callback => callback());
+  };
+  let measurements = 0;
+  let styleWrites = 0;
+  const price = { isConnected: true, getAttribute: () => '20', getBoundingClientRect() { measurements++; return { right: 400, bottom: 200 }; } };
+  const badge = {
+    dataset: {}, isConnected: false, className: '', title: '', textContent: '',
+    style: new Proxy({}, { set(target, property, value) { styleWrites++; target[property] = value; return true; } }),
+    classList: { toggle() {} },
+    remove() { this.isConnected = false; }
+  };
+  const row = {
+    nodeType: 1, isConnected: true,
+    matches: selector => selector === '.search_result_row' || selector.includes('a.search_result_row'),
+    getClientRects: () => [{}], getBoundingClientRect: () => ({ left: 0, top: 100 }), clientLeft: 0, clientTop: 0, clientWidth: 500,
+    getAttribute: name => name === 'data-ds-appid' ? '10' : null,
+    querySelector(selector) { return selector === '.discount_block' ? price : selector === '.sse-wishlist-sale-expiration' && badge.isConnected ? badge : null; },
+    querySelectorAll: selector => selector === '.discount_block' ? [price] : [],
+    insertBefore(node) { node.parentElement = row; node.isConnected = true; }
+  };
+  document.getElementById = () => null;
+  document.createElement = tag => tag === 'style' ? { remove() {} } : badge;
+  document.querySelector = () => null;
+  document.querySelectorAll = () => [row];
+  vm.runInContext('initializeStoreSaleCountdown()', context);
+  await time.advance(500);
+  runFrame();
+  assert.equal(measurements, 1);
+  assert.equal(badge.style.right, '100px');
+  assert.equal(badge.style.top, '100px');
+  assert.deepEqual([...resizeObserver.targets], [row, price]);
+  const initialWrites = styleWrites;
+  const text = badge.textContent;
+  await time.advance(5000);
+  assert.equal(measurements, 1);
+  assert.equal(styleWrites, initialWrites);
+  assert.notEqual(badge.textContent, text);
+  assert.equal(scheduledFrames.size, 0);
+  window.emit('resize');
+  resizeObserver.callback([{ target: row }, { target: price }]);
+  assert.equal(scheduledFrames.size, 1);
+  runFrame();
+  assert.equal(measurements, 2);
+  assert.equal(styleWrites, initialWrites);
+  observers[0].callback([{ type: 'childList', target: row }]);
+  await time.advance(300);
+  runFrame();
+  assert.equal(measurements, 3);
+  window.emit('resize');
+  vm.runInContext("featureScopes.get('wishlist-sale').dispose()", context);
+  assert.equal(scheduledFrames.size, 0);
+  assert.equal(resizeObserver.targets.size, 0);
 });
 
 test('wishlist sale badge is placed after the price/cart area, outside its inner flex card', async () => {
