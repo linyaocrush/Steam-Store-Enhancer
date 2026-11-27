@@ -116,6 +116,28 @@ test('cart summary distinguishes unidentified rows, failed queries, and actual z
   assert.equal(removed, true);
 });
 
+test('regional app prices recognize free games without a price overview', async () => {
+  const { context } = await harness(['network.js', 'regional-prices.js'], {
+    GM_xmlhttpRequest({ url, onload }) {
+      const params = new URL(url).searchParams;
+      const hasBasic = params.get('filters')?.split(',').includes('basic');
+      const block = params.get('cc') === 'CN' ? { success: false } : {
+        success: true, data: hasBasic ? { is_free: true } : []
+      };
+      onload({ status: 200, responseText: JSON.stringify({ [params.get('appids')]: block }) });
+    }
+  });
+  const item = { type: 'app', id: '1599340' };
+  const us = { id: 'USD', currency: 'USD', ccCandidates: ['US'] };
+  const cn = { id: 'CNY', currency: 'CNY', ccCandidates: ['CN'] };
+
+  const price = await context.getPriceForItem(item, us);
+  assert.equal(price?.ok, true);
+  assert.equal(price.free, true);
+  assert.deepEqual([price.initial, price.final, price.finalFormatted], [0, 0, 'Free']);
+  assert.equal(await context.getPriceForItem(item, cn), null);
+});
+
 test('temporary regional network failure is not cached or labeled as confirmed unavailability', async () => {
   let calls = 0;
   const { context } = await harness(['network.js', 'bundle-prices.js', 'regional-prices.js']);

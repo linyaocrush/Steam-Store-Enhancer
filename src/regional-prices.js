@@ -83,13 +83,14 @@
   }
 
   async function getAppPrice(appid, cc, currencyFallback, signal = regionalScope?.signal, pending) {
-    const url = 'https://store.steampowered.com/api/appdetails?appids=' + appid + '&cc=' + cc + '&filters=price_overview,is_free';
+    // Steam returns is_free under the basic filter and omits price_overview for free apps.
+    const url = 'https://store.steampowered.com/api/appdetails?appids=' + appid + '&cc=' + cc + '&filters=basic,price_overview';
     const text = await requestRegionalPrice(url, signal, pending);
     const parsed = JSON.parse(text);
     const block = parsed && parsed[String(appid)];
     if (!block || !block.success) return null;
     const data = block.data || {};
-    if (data.is_free) return { ...normalizePrice({ currency: currencyFallback, final: 0, initial: 0, finalFormatted: 'Free', initialFormatted: 'Free' }), free: true };
+    if (data.is_free === true) return { ...normalizePrice({ currency: currencyFallback, final: 0, initial: 0, finalFormatted: 'Free', initialFormatted: 'Free' }), free: true };
     const po = data.price_overview;
     if (!po) return null;
     return normalizePrice({

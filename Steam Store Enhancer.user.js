@@ -5,7 +5,7 @@
 // @homepageURL  https://github.com/linyaocrush/Steam-Store-Enhancer
 // @downloadURL  https://raw.githubusercontent.com/linyaocrush/Steam-Store-Enhancer/main/Steam%20Store%20Enhancer.user.js
 // @updateURL    https://raw.githubusercontent.com/linyaocrush/Steam-Store-Enhancer/main/Steam%20Store%20Enhancer.user.js
-// @version      1.15.3
+// @version      1.15.4
 // @description  Steam 额外地区价格、汇率转换、悬停游戏详情、快速加购、愿望单及商店列表折扣倒计时、购物车批量管理与家庭库游戏标记。
 // @author       linyaocrush, marioplus, Chr_, Cliencer Goge, Miku39
 // @license      AGPL-3.0
@@ -1419,13 +1419,14 @@
   }
 
   async function getAppPrice(appid, cc, currencyFallback, signal = regionalScope?.signal, pending) {
-    const url = 'https://store.steampowered.com/api/appdetails?appids=' + appid + '&cc=' + cc + '&filters=price_overview,is_free';
+    // Steam returns is_free under the basic filter and omits price_overview for free apps.
+    const url = 'https://store.steampowered.com/api/appdetails?appids=' + appid + '&cc=' + cc + '&filters=basic,price_overview';
     const text = await requestRegionalPrice(url, signal, pending);
     const parsed = JSON.parse(text);
     const block = parsed && parsed[String(appid)];
     if (!block || !block.success) return null;
     const data = block.data || {};
-    if (data.is_free) return { ...normalizePrice({ currency: currencyFallback, final: 0, initial: 0, finalFormatted: 'Free', initialFormatted: 'Free' }), free: true };
+    if (data.is_free === true) return { ...normalizePrice({ currency: currencyFallback, final: 0, initial: 0, finalFormatted: 'Free', initialFormatted: 'Free' }), free: true };
     const po = data.price_overview;
     if (!po) return null;
     return normalizePrice({
